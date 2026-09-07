@@ -30,6 +30,24 @@ from .settings import (
 )
 from .translation import LocalEnglishChineseTranslator
 
+# C# Overlay 每次 AI 请求会把实际发送的系统提示词推回来（PromptFeed → /api/ai/prompt），
+# 供设置页回显与手机端复用；桌面未触发过 AI 时回落到 effective_system_prompt() 计算。
+last_ai_prompt: dict[str, str] = {"prompt": ""}
+
+
+def effective_system_prompt() -> str:
+    """当前实际生效的字幕 AI 系统提示词：优先用桌面端最近一次真实发送的；
+    没有则按「完全自定义 > 自定义内置模板 > 系统默认」即时计算（含简历/JD 上下文）。"""
+    pushed = last_ai_prompt["prompt"].strip()
+    if pushed:
+        return pushed
+    from .settings import builtin_prompts
+
+    prompts = builtin_prompts()
+    if prompts.get("overridePrompt"):
+        return prompts["overridePrompt"]
+    return prompts["modes"]["auto"]
+
 
 def _ask_ai_blocking(prompt: str, question: str, settings: dict, api_key: str) -> dict:
     """回答效果测试的阻塞调用：真实系统提示词 + 模拟问题，返回答案/实际模型/耗时。"""
@@ -155,7 +173,6 @@ def create_app(config: AppConfig) -> FastAPI:
     phone_relay.desktop_publisher = hub.publish
     hub.listeners.append(phone_relay.publish_event)
     hub.listeners.append(session_recorder.on_event)
-    last_ai_prompt: dict[str, str] = {"prompt": ""}
     records_root = APP_DIR / "records"
 
     async def restart_engine(language: str) -> None:
@@ -382,12 +399,7 @@ def create_app(config: AppConfig) -> FastAPI:
             raise HTTPException(status_code=400, detail="请先输入测试问题")
         if len(question) > 4000:
             question = question[:4000]
-        prompt = last_ai_prompt["prompt"].strip()
-        if not prompt:
-            raise HTTPException(
-                status_code=400,
-                detail="还没有可用的内部提示词：先在桌面设置窗（Ctrl+Alt+O → 翻译/AI）点一次「发送测试问题」或「测试连接」",
-            )
+        prompt = effective_system_prompt()
         settings = await asyncio.to_thread(load_settings)
         api_key = await asyncio.to_thread(load_api_key)
         if not api_key:

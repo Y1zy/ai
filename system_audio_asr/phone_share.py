@@ -620,6 +620,12 @@ class PhoneRelay:
                     asyncio.ensure_future(self._capture_and_push())
                 elif kind == "solve":
                     asyncio.ensure_future(self._handle_solve())
+                elif kind == "ask":
+                    phone_text = str(payload.get("text", ""))[:4000]
+                    if phone_text:
+                        asyncio.ensure_future(self._handle_ask(phone_text))
+                elif kind == "get_prompt":
+                    asyncio.ensure_future(self._handle_get_prompt())
                 elif kind == "auto":
                     self._set_auto(bool(payload.get("on")), payload.get("interval"))
                 elif kind == "clipboard":
@@ -633,6 +639,37 @@ class PhoneRelay:
 
     async def _handle_solve(self) -> None:
         await asyncio.to_thread(self.request_solve)
+
+    async def _handle_ask(self, question: str) -> None:
+        """手机文字提问：走与字幕 AI 相同的真实管线（提示词+简历/JD 上下文）。"""
+        from .server import _ask_ai_blocking, effective_system_prompt
+        from .settings import load_settings, load_api_key
+
+        settings = await asyncio.to_thread(load_settings)
+        api_key = await asyncio.to_thread(load_api_key)
+        if not api_key:
+            self.schedule_json({"type": "ai", "text": "电脑端尚未配置 AI 接口 API Key", "done": True, "source": "ask"})
+            return
+        prompt = effective_system_prompt()
+        if not prompt:
+            self.schedule_json({"type": "ai", "text": "系统提示词为空，请检查设置页", "done": True, "source": "ask"})
+            return
+
+        def run():
+            return _ask_ai_blocking(prompt, question, settings, api_key)
+
+        try:
+            result = await asyncio.to_thread(run)
+            self.schedule_json({"type": "ai", "text": result["answer"], "done": True, "source": "ask"})
+        except Exception as exc:
+            self.schedule_json({"type": "ai", "text": f"请求失败：{exc}", "done": True, "source": "ask"})
+
+    async def _handle_get_prompt(self) -> None:
+        from .server import effective_system_prompt
+
+        prompt = effective_system_prompt()
+        if prompt:
+            self.schedule_json({"type": "prompt", "prompt": prompt})
 
     async def _handle_clipboard(self, text: str) -> None:
         handler = self.clipboard_handler

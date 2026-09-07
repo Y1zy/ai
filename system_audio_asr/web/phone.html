@@ -50,6 +50,11 @@ main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
   <div class="tip hidden" id="save-tip">提示：iOS 浏览器长按图片也可保存</div>
   <div id="partial" class="partial hidden"></div>
   <div id="ai-card" class="card hidden"><div class="q">🤖 AI 回答</div><div id="ai-body"></div></div>
+  <div id="ask-card" class="card">
+    <div class="q">💬 文字提问 AI</div>
+    <div class="actions" style="margin:8px 0"><input id="ask-input" type="text" placeholder="输入问题，如：RAG 系统要看哪些指标？"><button id="ask-send" class="btn btn-primary">发送</button></div>
+    <details id="prompt-detail"><summary style="color:#7dd3fc;cursor:pointer">查看内部系统提示词</summary><pre id="prompt-body" style="white-space:pre-wrap;color:#94a3b8;font-size:12px;margin-top:8px"></pre></details>
+  </div>
   <div id="clipboard-card" class="card hidden">
     <div class="q">📋 剪贴板双向同步（自动）</div>
     <div id="pc-clip" style="color:#cbd5e1"></div>
@@ -74,6 +79,8 @@ var $imgWrap = document.getElementById("img-wrap");
 var $partial = document.getElementById("partial");
 var $aiCard = document.getElementById("ai-card");
 var $aiBody = document.getElementById("ai-body");
+var $askInput = document.getElementById("ask-input");
+var $promptBody = document.getElementById("prompt-body");
 var $feed = document.getElementById("feed");
 var $err = document.getElementById("err");
 var $banner = document.getElementById("banner");
@@ -95,7 +102,7 @@ function connect(){
     + "/relay?role=phone&sid=" + encodeURIComponent(sid) + "&t=" + encodeURIComponent(tok);
   try { ws = new WebSocket(wsUrl); } catch(e){ setErr("连接失败"); return; }
   ws.binaryType = "arraybuffer";
-  ws.addEventListener("open", function(){ setStatus(true); setErr(""); });
+  ws.addEventListener("open", function(){ setStatus(true); setErr(""); send({ type:"get_prompt" }); });
   ws.addEventListener("close", function(){ setStatus(false); setTimeout(connect, 2000); });
   ws.addEventListener("error", function(){});
   ws.addEventListener("message", function(e){
@@ -150,7 +157,7 @@ function handleText(raw){
     case "status":
       break;
     case "ai":
-      if (msg.source === "solve" || $aiCard.classList.contains("hidden") === false) {
+      if (msg.source === "solve" || msg.source === "ask" || $aiCard.classList.contains("hidden") === false) {
         if (msg.text) {
           $aiCard.classList.remove("hidden");
           $aiBody.textContent = stripMarkdown(msg.text);
@@ -160,6 +167,9 @@ function handleText(raw){
           $aiBody.textContent = "";
         }
       }
+      break;
+    case "prompt":
+      if (msg.prompt) $promptBody.textContent = msg.prompt;
       break;
     case "error":
       setErr(msg.message || "");
@@ -205,6 +215,14 @@ document.getElementById("solve-btn").onclick = function(){
   $aiBody.textContent = "正在截屏解题…";
   if (send({ type:"solve" })) setErr("");
 };
+document.getElementById("ask-send").onclick = function(){
+  var q = $askInput.value.trim();
+  if (!q) return;
+  $aiCard.classList.remove("hidden");
+  $aiBody.textContent = "正在思考…";
+  if (send({ type:"ask", text:q })) { setErr(""); $askInput.value = ""; }
+};
+$askInput.addEventListener("keydown", function(e){ if (e.key === "Enter") document.getElementById("ask-send").click(); });
 document.getElementById("save-btn").onclick = saveScreenshot;
 document.getElementById("auto").onchange = function(e){
   send({ type:"auto", on: e.target.checked, interval: 3000 });
