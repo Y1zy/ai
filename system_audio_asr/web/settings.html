@@ -70,7 +70,7 @@
       <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><h2>本地实时翻译</h2><span id="translationBadge" class="badge">未加载</span></div>
       <div class="row two"><label for="asrLanguage">识别语言</label><select id="asrLanguage"><option value="zh">中文 · Paraformer Streaming</option><option value="en">英文 · Faster-Whisper</option></select></div>
       <label class="switch"><input id="hotwordEnabled" type="checkbox" checked>启用热词纠正（从简历/JD 自动提取技术词，减少 Kafka→卡夫卡 等错误）</label>
-      <div class="row two"><label for="hotwordExtra">补充热词（每行一个，填中文项目代号也行）</label><textarea id="hotwordExtra" placeholder="如：雪球系统&#10;OceanBase"></textarea></div>
+      <div class="row two"><label for="hotwordExtra">补充热词（每行一个，填中文项目代号也行）</label><div><textarea id="hotwordExtra" placeholder="如：雪球系统&#10;OceanBase"></textarea><div style="font-size:12px;margin-top:4px;color:#91a1b8" id="hotwordExtraState">当前为空 = 仅使用内置词库与简历/JD 自动提取</div></div></div>
       <label class="switch"><input id="liveTranslateEnabled" type="checkbox">启用英文 → 中文实时翻译（本地模型，不使用 DeepSeek）</label>
       <p class="hint">英文模式使用约 78 MB 的 Faster-Whisper 英文模型；每次 partial 再由本机 OPUS-MT 翻译，final 到达后稳定定稿。模型下载后可离线使用。原英文直接显示，中文结果标为“译文”。</p>
       <div style="display:flex;justify-content:flex-end"><button id="warmTranslation" type="button">下载并预热翻译模型</button></div>
@@ -80,7 +80,7 @@
       <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><h2>AI 助手（OpenAI 兼容格式）</h2><span id="keyBadge" class="badge">检查中</span></div>
       <label class="switch"><input id="aiEnabled" type="checkbox">启用 AI 助手：字幕停顿后处理本轮 final 文本</label>
       <p class="hint">任意 OpenAI 兼容接口均可（DeepSeek、通义、GLM、OpenAI 等）。API Key 使用 Windows DPAPI 按当前 Windows 用户加密；设置 API 不会返回已保存 Key 的明文。每段 final 与 AI 回复会连续追加成聊天记录；SSE 内容经过打字机缓冲，每次显示 1–2 个字，并携带最近多轮上下文。</p>
-      <div class="row two"><label for="apiKey">AI 接口 API Key</label><div style="display:flex;gap:8px"><input id="apiKey" type="password" autocomplete="off" placeholder="留空表示不修改已保存的 Key"><button id="toggleKey" type="button">显示</button><button id="clearKey" class="danger" type="button">清除</button></div></div>
+      <div class="row two"><label for="apiKey">AI 接口 API Key</label><div><div style="display:flex;gap:8px"><input id="apiKey" type="password" autocomplete="off" placeholder="留空表示不修改已保存的 Key"><button id="toggleKey" type="button">显示</button><button id="clearKey" class="danger" type="button">清除</button></div><div id="keyState" style="font-size:12px;margin-top:4px;color:#91a1b8">检查中…</div></div></div>
       <div class="row two"><label for="aiBaseUrl">接口地址 BaseURL</label><input id="aiBaseUrl" type="text" placeholder="https://api.deepseek.com（不含 /chat/completions）"></div>
       <div class="row two"><label for="aiModel">模型</label><input id="aiModel" type="text" list="aiModelPresets" placeholder="deepseek-v4-flash"><datalist id="aiModelPresets"><option value="deepseek-v4-flash"></option><option value="deepseek-v4-pro"></option></datalist></div>
       <div class="row two"><label for="aiMode">处理模式</label><select id="aiMode"><option value="auto">自动判断：问题则回答，否则总结</option><option value="summary">一句话总结</option><option value="qa">回答问题</option><option value="explain">解释内容</option><option value="translate">中文翻译为英文</option></select></div>
@@ -112,8 +112,8 @@
       OpenAI：<code>https://api.openai.com/v1</code>（模型如 <code>gpt-4o-mini</code>）</p>
       <div class="row two"><label for="visionBaseUrl">BaseURL（含 /v1）</label><input id="visionBaseUrl" type="text" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"></div>
       <div class="row two"><label for="visionModel">模型名</label><input id="visionModel" type="text" placeholder="qwen-vl-plus"></div>
-      <div class="row two"><label for="visionApiKey">API Key</label><div style="display:flex;gap:8px"><input id="visionApiKey" type="password" autocomplete="off" placeholder="留空表示不修改已保存的 Key"><button id="clearVisionKey" class="danger" type="button">清除</button></div></div>
-      <div class="row two"><label for="solvePrompt">解题提示词</label><textarea id="solvePrompt" placeholder="留空使用内置默认：识别图中题目并给出简洁答案与关键步骤。可自定义，例如：只输出选择题答案字母；用英文回答。"></textarea></div>
+      <div class="row two"><label for="visionApiKey">API Key</label><div><div style="display:flex;gap:8px"><input id="visionApiKey" type="password" autocomplete="off" placeholder="留空表示不修改已保存的 Key"><button id="clearVisionKey" class="danger" type="button">清除</button></div><div id="visionKeyState" style="font-size:12px;margin-top:4px;color:#91a1b8">检查中…</div></div></div>
+      <div class="row two"><label for="solvePrompt">解题提示词</label><div><textarea id="solvePrompt" placeholder="留空使用内置默认：识别图中题目并给出简洁答案与关键步骤。可自定义，例如：只输出选择题答案字母；用英文回答。"></textarea><div style="font-size:12px;margin-top:4px;color:#91a1b8" id="solvePromptState">当前为空 = 使用系统内置默认（完整全文见上方「系统内置提示词」区，切到「截图解题」可查看）</div></div></div>
       <div style="display:flex;justify-content:flex-end"><button id="saveVision" type="button">保存视觉模型配置</button></div>
     </section>
     <section class="card wide">
@@ -165,15 +165,27 @@ async function load(){
   try{const data=await fetch('/api/settings').then(r=>{if(!r.ok)throw Error(r.status);return r.json()}); loaded=data.settings;
     for(const id of ids){const el=$(id),v=loaded[id]; if(el.type==='checkbox')el.checked=Boolean(v); else if(id==='opacity'||id==='frameOpacity')el.value=Math.round(Number(v)*100); else if(v!==undefined)el.value=v}
     $('screenName').innerHTML=''; const monitors=data.monitors.length?data.monitors:[loaded.screenName||'默认显示器']; for(const name of monitors){const o=document.createElement('option');o.value=name;o.textContent=name;$('screenName').append(o)} $('screenName').value=loaded.screenName||monitors[0];
-    $('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key'; $('keyBadge').className='badge '+(data.apiKeySet?'ok':''); await refreshTranslationStatus(); updatePreview(); showStatus('设置已加载'); refreshPromptPreview(); loadBuiltinPrompts();
+    $('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key'; $('keyBadge').className='badge '+(data.apiKeySet?'ok':''); $('keyState').dataset.saved=data.apiKeySet?'1':'0'; refreshMainKeyState(); refreshHotwordState(); await refreshTranslationStatus(); updatePreview(); showStatus('设置已加载'); refreshPromptPreview(); loadBuiltinPrompts();
   }catch(e){showStatus('加载失败：'+e.message,true)}
 }
 function collect(){return {fontSize:Number($('fontSize').value),opacity:Number($('opacity').value)/100,fontFamily:$('fontFamily').value,textColor:$('textColor').value,frameMode:$('frameMode').value,frameColor:$('frameColor').value,frameOpacity:Number($('frameOpacity').value)/100,screenName:$('screenName').value,locked:$('locked').checked,asrLanguage:$('asrLanguage').value,hotwordEnabled:$('hotwordEnabled').checked,hotwordExtra:$('hotwordExtra').value.trim(),liveTranslateEnabled:$('liveTranslateEnabled').checked,aiEnabled:$('aiEnabled').checked,aiBaseUrl:$('aiBaseUrl').value.trim(),aiModel:$('aiModel').value.trim(),aiMode:$('aiMode').value,aiSilenceSeconds:Number($('aiSilenceSeconds').value),aiSystemPrompt:$('aiSystemPrompt').value,aiOverridePrompt:$('aiOverridePrompt').value}}
 async function refreshTranslationStatus(){try{const s=await fetch('/api/translate/status').then(r=>r.json());$('translationBadge').textContent=s.loaded?`已加载 · ${s.device||'本机'}${s.lastLatencyMs?` · ${s.lastLatencyMs} ms`:''}`:'尚未加载';$('translationBadge').className='badge '+(s.loaded?'ok':'')}catch{$('translationBadge').textContent='状态未知'}}
 async function save(){
-  $('save').disabled=true; showStatus('正在保存…'); try{const payload={settings:collect(),clearApiKey:clearRequested}; if($('apiKey').value.trim())payload.apiKey=$('apiKey').value.trim(); const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const data=await r.json(); if(!r.ok)throw Error(data.detail||r.status); clearRequested=false;$('apiKey').value='';$('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key';$('keyBadge').className='badge '+(data.apiKeySet?'ok':'');showStatus(data.asrRestarted?'已保存，正在切换识别模型…':'已保存，Overlay 将在约 1 秒内应用');return true}catch(e){showStatus('保存失败：'+e.message,true);return false}finally{$('save').disabled=false}
+  $('save').disabled=true; showStatus('正在保存…'); try{const payload={settings:collect(),clearApiKey:clearRequested}; if($('apiKey').value.trim())payload.apiKey=$('apiKey').value.trim(); const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const data=await r.json(); if(!r.ok)throw Error(data.detail||r.status); clearRequested=false;$('apiKey').value='';$('keyState').dataset.saved=data.apiKeySet?'1':'0';refreshMainKeyState();$('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key';$('keyBadge').className='badge '+(data.apiKeySet?'ok':'');showStatus(data.asrRestarted?'已保存，正在切换识别模型…':'已保存，Overlay 将在约 1 秒内应用');return true}catch(e){showStatus('保存失败：'+e.message,true);return false}finally{$('save').disabled=false}
 }
 async function refreshPromptPreview(){try{const d=await fetch('/api/ai/prompt').then(r=>r.json());$('aiPromptPreview').value=d.prompt||'';}catch{}}
+// 「内部系统提示词」打开页面即有内容：接口未推送过时回落为按配置计算的生效提示词（effective fallback）。
+// Key 输入框下方的常驻状态行：解决「加密保存不回显、看不出填没填」的问题。
+function setKeyState(id, ok, text){
+  const el=$(id); el.textContent=text;
+  el.style.color=ok?'#86efac':'#fca5a5';
+}
+function refreshMainKeyState(){
+  if($('apiKey').value.trim())setKeyState('keyState',true,'新 Key 将在保存后替换'+($('keyState').dataset.saved==='1'?'现有 Key':'（当前未保存过）'));
+  else if(clearRequested)setKeyState('keyState',false,'将在保存后清除已保存的 Key');
+  else if($('keyState').dataset.saved==='1')setKeyState('keyState',true,'✓ Key 已保存（加密存储，不会回显）');
+  else setKeyState('keyState',false,'✗ 尚未保存 Key，填写后点「保存并应用」');
+}
 let builtinPrompts=null;
 // 模板类型：builtin = 字幕 AI 内置模板（空 = 用系统默认）；solve = 截图解题提示词（存 solvePrompt）。
 let builtinDirty=false;
@@ -230,7 +242,8 @@ $('save').onclick=save; $('testAi').onclick=async()=>{if(!await save())return;$(
 $('askAi').onclick=async()=>{const q=$('aiTestQuestion').value.trim();if(!q){showStatus('请先输入测试问题',true);return}$('askAi').disabled=true;$('aiTestAnswer').value='正在请求…';try{const r=await fetch('/api/ai/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})}),data=await r.json();if(!r.ok)throw Error(data.detail||r.status);$('aiTestAnswer').value=stripMarkdown(data.answer)+'\n\n—— 实际模型: '+(data.model||'未知')+' · 耗时 '+data.seconds+' 秒';showStatus('回答测试完成')}catch(e){$('aiTestAnswer').value='请求失败：'+e.message;showStatus('回答测试失败',true)}finally{$('askAi').disabled=false;refreshPromptPreview()}};
 $('warmTranslation').onclick=async()=>{$('warmTranslation').disabled=true;showStatus('正在下载并预热本地翻译模型，首次可能需要几分钟…');try{const r=await fetch('/api/translate/warmup',{method:'POST'}),data=await r.json();if(!r.ok)throw Error(data.detail||r.status);await refreshTranslationStatus();showStatus(`翻译模型已就绪：${data.translation}（${data.latencyMs} ms）`)}catch(e){showStatus('翻译模型加载失败：'+e.message,true)}finally{$('warmTranslation').disabled=false}};
 $('toggleKey').onclick=()=>{const input=$('apiKey');input.type=input.type==='password'?'text':'password';$('toggleKey').textContent=input.type==='password'?'显示':'隐藏'};
-$('clearKey').onclick=()=>{if(confirm('清除本机已保存的 DeepSeek API Key？')){clearRequested=true;$('apiKey').value='';$('keyBadge').textContent='保存后清除';$('keyBadge').className='badge'}};
+$('clearKey').onclick=()=>{if(confirm('清除本机已保存的 DeepSeek API Key？')){clearRequested=true;$('apiKey').value='';refreshMainKeyState();$('keyBadge').textContent='保存后清除';$('keyBadge').className='badge'}};
+$('apiKey').addEventListener('input',refreshMainKeyState);
 async function loadPhoneInfo(){
   try{const info=await fetch('/api/phone/info').then(r=>{if(!r.ok)throw Error(r.status);return r.json()});
     $('phoneEnabled').checked=Boolean(info.enabled);
@@ -247,27 +260,53 @@ async function loadPhoneInfo(){
 $('phoneEnabled').onchange=async e=>{try{const r=await fetch('/api/phone/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:e.target.checked})});if(!r.ok)throw Error(r.status);await loadPhoneInfo()}catch(err){$('phoneHint').textContent='切换失败：'+err.message}};
 $('phoneRegen').onclick=async()=>{try{const r=await fetch('/api/phone/regenerate',{method:'POST'});if(!r.ok)throw Error(r.status);await loadPhoneInfo();showStatus('已重新生成配对码，旧二维码立即失效')}catch(e){showStatus('生成失败：'+e.message,true)}};
 $('phoneCopy').onclick=()=>{const url=$('phoneUrl').value;if(url&&url.indexOf('http')===0){navigator.clipboard.writeText(url);showStatus('配对链接已复制')}};
+let clearVisionRequested=false;
+// 视觉 Key 状态行 + 缺项提示（不回写勾选框，勾选状态只由用户和保存结果决定）。
+function refreshVisionKeyState(saved){
+  const el=$('visionKeyState');
+  el.dataset.saved=saved?'1':'0';
+  if($('visionApiKey').value.trim())setKeyState('visionKeyState',true,'新 Key 将在保存后替换'+(saved?'现有 Key':'（当前未保存过）'));
+  else if(clearVisionRequested)setKeyState('visionKeyState',false,'将在保存后清除已保存的 Key');
+  else if(saved)setKeyState('visionKeyState',true,'✓ Key 已保存（加密存储，不会回显）');
+  else setKeyState('visionKeyState',false,'✗ 尚未保存 Key，填写后点「保存视觉模型配置」');
+}
 async function refreshVisionStatus(){try{const s=await fetch('/api/vision/status').then(r=>{if(!r.ok)throw Error(r.status);return r.json()});
-  $('visionEnabled').checked=s.enabled;
-  let badge=s.enabled?'已启用 · ':'未启用 · ';
-  badge+=s.apiKeySet?'Key 已保存':'Key 未设置';
-  if(s.enabled&&(!s.baseUrlSet||!s.modelSet||!s.apiKeySet))badge='配置不完整';
-  $('visionBadge').textContent=badge;$('visionBadge').className='badge '+(s.enabled&&s.apiKeySet&&s.baseUrlSet&&s.modelSet?'ok':'');
+  refreshVisionKeyState(s.apiKeySet);
+  const missing=[];
+  if(!s.baseUrlSet)missing.push('BaseURL');
+  if(!s.modelSet)missing.push('模型名');
+  if(!s.apiKeySet)missing.push('Key');
+  $('visionBadge').textContent=s.enabled?(missing.length?'已启用，缺：'+missing.join(' / '):'已启用，配置齐全'):'未启用';
+  $('visionBadge').className='badge '+((s.enabled&&!missing.length)?'ok':'');
 }catch{$('visionBadge').textContent='状态未知'}}
 async function loadVisionConfig(){try{const data=await fetch('/api/settings').then(r=>{if(!r.ok)throw Error(r.status);return r.json()});
   $('visionBaseUrl').value=data.settings.visionBaseUrl||'';$('visionModel').value=data.settings.visionModel||'';
   $('solvePrompt').value=data.settings.solvePrompt||'';
+  refreshSolvePromptState();
 }catch{}}
+function refreshSolvePromptState(){
+  const has=Boolean($('solvePrompt').value.trim());
+  const el=$('solvePromptState');
+  el.textContent=has?'当前为自定义解题提示词，清空并保存即恢复内置默认':'当前为空 = 使用系统内置默认（完整全文见上方「系统内置提示词」区，切到「截图解题」可查看）';
+  el.style.color=has?'#86efac':'#91a1b8';
+}
+function refreshHotwordState(){
+  const has=Boolean($('hotwordExtra').value.trim());
+  const el=$('hotwordExtraState');
+  el.textContent=has?'当前有自定义热词 '+$('hotwordExtra').value.trim().split(/\n+/).filter(Boolean).length+' 行，与内置词库/简历提取合并生效':'当前为空 = 仅使用内置词库与简历/JD 自动提取';
+  el.style.color=has?'#86efac':'#91a1b8';
+}
+$('hotwordExtra').addEventListener('input',refreshHotwordState);
+$('solvePrompt').addEventListener('input',refreshSolvePromptState);
 $('saveVision').onclick=async()=>{$('saveVision').disabled=true;showStatus('正在保存视觉模型配置…');
   try{const payload={settings:{visionEnabled:$('visionEnabled').checked,visionBaseUrl:$('visionBaseUrl').value.trim(),visionModel:$('visionModel').value.trim(),solvePrompt:$('solvePrompt').value.trim()}};
     if($('visionApiKey').value.trim())payload.visionApiKey=$('visionApiKey').value.trim();
-    if($('clearVisionRequested'))payload.clearVisionApiKey=true;
+    if(clearVisionRequested)payload.clearVisionApiKey=true;
     const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     if(!r.ok)throw Error((await r.json()).detail||r.status);
-    $('visionApiKey').value='';await refreshVisionStatus();loadBuiltinPrompts();showStatus('视觉模型配置已保存');  }catch(e){showStatus('保存失败：'+e.message,true)}finally{$('saveVision').disabled=false}};
-let clearVisionRequested=false;
-$('clearVisionKey').onclick=()=>{clearVisionRequested=true;$('visionApiKey').value='';showStatus('保存后清除视觉模型 Key')};
-$('visionApiKey').addEventListener('input',()=>{clearVisionRequested=false});
+    clearVisionRequested=false;$('visionApiKey').value='';await refreshVisionStatus();loadBuiltinPrompts();showStatus('视觉模型配置已保存');  }catch(e){showStatus('保存失败：'+e.message,true)}finally{$('saveVision').disabled=false}};
+$('clearVisionKey').onclick=()=>{clearVisionRequested=true;$('visionApiKey').value='';refreshVisionKeyState($('visionKeyState').dataset.saved==='1');showStatus('保存后清除视觉模型 Key')};
+$('visionApiKey').addEventListener('input',()=>{clearVisionRequested=false;refreshVisionKeyState($('visionKeyState').dataset.saved==='1')});
 $('visionEnabled').addEventListener('change',refreshVisionStatus);
 loadVisionConfig(); refreshVisionStatus();
 for(const id of ['fontSize','opacity','fontFamily','textColor','frameColor','frameOpacity','aiSilenceSeconds'])$(id).addEventListener('input',updatePreview);

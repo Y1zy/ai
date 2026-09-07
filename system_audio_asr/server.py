@@ -206,20 +206,23 @@ def create_app(config: AppConfig) -> FastAPI:
 
     app = FastAPI(title="WASAPI Paraformer WebSocket", version="0.1.0", lifespan=lifespan)
 
+    def require_local(request: Request) -> None:
+        """本机接口白名单：只允许回环地址访问管理类路由。"""
+        host = request.client.host if request.client else ""
+        if host not in {"127.0.0.1", "::1"}:
+            raise HTTPException(status_code=403, detail="设置接口只允许本机访问")
+
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> str:
         require_local(request)
         return (Path(__file__).parent / "web" / "index.html").read_text(encoding="utf-8")
 
-    def require_local(request: Request) -> None:
-        host = request.client.host if request.client else ""
-        if host not in {"127.0.0.1", "::1"}:
-            raise HTTPException(status_code=403, detail="设置接口只允许本机访问")
-
     @app.get("/settings", response_class=HTMLResponse)
     async def settings_page(request: Request) -> str:
         require_local(request)
-        return (Path(__file__).parent / "web" / "settings.html").read_text(encoding="utf-8")
+        # no-store：页面迭代后浏览器不再拿旧缓存（此前改版后出现过旧页白屏问题）。
+        content = (Path(__file__).parent / "web" / "settings.html").read_text(encoding="utf-8")
+        return HTMLResponse(content=content, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/settings")
     async def get_settings(request: Request) -> dict:
@@ -276,6 +279,14 @@ def create_app(config: AppConfig) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/capture/pause")
+    async def capture_pause(request: Request) -> dict:
+        """桌面字幕窗控制条调用：暂停/恢复音频采集（真·暂停，模型保持常驻）。"""
+        require_local(request)
+        return await asyncio.to_thread(
+            engine.resume if engine.paused else engine.pause
+        )
+
     @app.get("/health")
     async def health(request: Request) -> dict:
         require_local(request)
@@ -285,6 +296,7 @@ def create_app(config: AppConfig) -> FastAPI:
             "error": hub.latest_error,
             "clients": len(hub.clients),
             "language": engine.config.language,
+            "paused": engine.paused,
         }
 
     @app.get("/devices")
@@ -382,7 +394,11 @@ def create_app(config: AppConfig) -> FastAPI:
     @app.get("/api/ai/prompt")
     async def get_ai_prompt(request: Request) -> dict:
         require_local(request)
-        return {"prompt": last_ai_prompt["prompt"] or None}
+        # 优先回显桌面端最近一次真实发送；未触发过时回落为按配置即时计算的生效提示词，
+        # 保证设置页打开即可看到完整系统提示词（不再要求先跑一次 AI）。
+        if last_ai_prompt["prompt"].strip():
+            return {"prompt": last_ai_prompt["prompt"]}
+        return {"prompt": await asyncio.to_thread(effective_system_prompt)}
 
     @app.get("/api/prompts/builtin")
     async def get_builtin_prompts(request: Request) -> dict:

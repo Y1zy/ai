@@ -101,6 +101,7 @@ class TranscriptionEngine:
         self._capture: WasapiLoopbackCapture | None = None
         self._segment_id = 0
         self._last_level = 0.0
+        self._paused = threading.Event()
 
     def start(self) -> None:
         self._worker = threading.Thread(target=self._run, name="paraformer-worker", daemon=True)
@@ -345,6 +346,8 @@ class TranscriptionEngine:
                 self._segment_id += 1
 
     def _on_audio(self, segmenter: SpeechSegmenter, audio: np.ndarray) -> None:
+        if self._gate_paused():
+            return
         level, packets = segmenter.feed(audio)
         now = time.monotonic()
         if now - self._last_level >= 0.1:
@@ -360,3 +363,30 @@ class TranscriptionEngine:
 
     def _on_capture_error(self, exc: BaseException) -> None:
         self.publish({"type": "error", "where": "wasapi", "message": f"{type(exc).__name__}: {exc}"})
+
+    # ---------------------------------------------------------------- 暂停采集
+    # 用 Event 门控而非停线程：暂停瞬间生效、恢复无重启开销（模型常驻内存），
+    # 也避开 SoundCard/COM 在动态重建采集线程上的初始化坑。
+    def pause(self) -> dict:
+        self._paused.set()
+        self.publish({"type": "status", "state": "paused"})
+        return {"paused": True}
+
+    def resume(self) -> dict:
+        self._paused.clear()
+        self.publish({"type": "status", "state": "capturing"})
+        return {"paused": False}
+
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
+
+    def _gate_paused(self) -> bool:
+        """暂停门控：暂停期间丢弃音频块并广播静止电平，保证不采集任何声音。"""
+        if not self._paused.is_set():
+            return False
+        now = time.monotonic()
+        if now - self._last_level >= 0.1:
+            self._last_level = now
+            self.publish({"type": "audio_level", "dbfs": -120.0, "active": False})
+        return True

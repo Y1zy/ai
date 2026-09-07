@@ -1864,15 +1864,17 @@ namespace WasapiParaformerOverlay
     {
         private readonly OverlayWindow overlay;
         private readonly Border resetControl;
+        private readonly Border pauseControl;
         private readonly Border lockControl;
         private readonly Border closeControl;
+        private bool capturePaused;
         internal IntPtr NativeHandle { get; private set; }
 
         internal LockIndicatorWindow(OverlayWindow overlay)
         {
             this.overlay = overlay;
             Title = "字幕位置锁";
-            Width = 102;
+            Width = 136;
             Height = 34;
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
@@ -1888,6 +1890,10 @@ namespace WasapiParaformerOverlay
                 "\uE72C",
                 "清空对话上下文（保留 system 提示词）",
                 Color.FromRgb(96, 165, 250));
+            pauseControl = MakeIconControl(
+                "\uE769",
+                "暂停音频采集（暂停期间的声音不会被录制）",
+                Color.FromRgb(250, 204, 21));
             lockControl = MakeIconControl(
                 "\uE785",
                 "锁定/解锁字幕位置",
@@ -1897,6 +1903,7 @@ namespace WasapiParaformerOverlay
                 "隐藏字幕（使用老板键恢复）",
                 Color.FromRgb(248, 113, 113));
             controls.Children.Add(resetControl);
+            controls.Children.Add(pauseControl);
             controls.Children.Add(lockControl);
             controls.Children.Add(closeControl);
             Content = controls;
@@ -1917,14 +1924,37 @@ namespace WasapiParaformerOverlay
             }
             else if (index == 1)
             {
+                AppLog.Write("control_pause_click paused=" + !capturePaused);
+                ToggleCapturePause();
+            }
+            else if (index == 2)
+            {
                 AppLog.Write("control_lock_click");
                 overlay.TogglePositionLock();
             }
-            else if (index == 2)
+            else if (index == 3)
             {
                 AppLog.Write("control_hide_click");
                 overlay.ToggleBossVisibility();
             }
+        }
+
+        internal void ToggleCapturePause()
+        {
+            capturePaused = !capturePaused;
+            UpdatePauseIcon();
+            overlay.SetCapturePaused(capturePaused);
+        }
+
+        internal void UpdatePauseIcon()
+        {
+            TextBlock icon = pauseControl.Child as TextBlock;
+            if (icon != null) icon.Text = capturePaused ? "\uE768" : "\uE769";
+            pauseControl.ToolTip = capturePaused ? "恢复音频采集" : "暂停音频采集（暂停期间的声音不会被录制）";
+            SolidColorBrush stateBrush = new SolidColorBrush(
+                capturePaused ? Color.FromRgb(250, 204, 21) : Color.FromRgb(225, 235, 247));
+            pauseControl.Tag = stateBrush;
+            if (icon != null && !pauseControl.IsMouseOver) icon.Foreground = stateBrush;
         }
 
         internal int UpdateHoverFromCursor()
@@ -1936,10 +1966,11 @@ namespace WasapiParaformerOverlay
                 && NativeMethods.GetWindowRect(NativeHandle, out rect)
                 && point.X >= rect.Left && point.X <= rect.Right
                 && point.Y >= rect.Top && point.Y <= rect.Bottom)
-                hovered = Math.Max(0, Math.Min(2, (point.X - rect.Left) / 34));
+                hovered = Math.Max(0, Math.Min(3, (point.X - rect.Left) / 34));
             ApplyHover(resetControl, hovered == 0, Color.FromRgb(96, 165, 250));
-            ApplyHover(lockControl, hovered == 1, Color.FromRgb(96, 165, 250));
-            ApplyHover(closeControl, hovered == 2, Color.FromRgb(248, 113, 113));
+            ApplyHover(pauseControl, hovered == 1, Color.FromRgb(250, 204, 21));
+            ApplyHover(lockControl, hovered == 2, Color.FromRgb(96, 165, 250));
+            ApplyHover(closeControl, hovered == 3, Color.FromRgb(248, 113, 113));
             return hovered;
         }
 
@@ -2027,6 +2058,7 @@ namespace WasapiParaformerOverlay
         private bool editMode;
         private bool preview;
         private bool bossHidden;
+        private bool capturePaused;
         private readonly bool demoAllowCapture;
         private int ignoredSpeechSegment = -1;
         internal bool IsClosing { get; private set; }
@@ -2650,12 +2682,33 @@ namespace WasapiParaformerOverlay
 
         internal void RequestSolve()
         {
+            PostLocal("/api/phone/solve", "solve requested via hotkey");
+        }
+
+        // 暂停/恢复音频采集：后端用门控丢弃音频块（模型常驻），恢复即时生效。
+        internal void SetCapturePaused(bool paused)
+        {
+            capturePaused = paused;
+            if (paused)
+            {
+                RefreshText();
+                FadeTo(config.Opacity, 80);
+            }
+            else
+            {
+                RefreshText();
+            }
+            PostLocal("/api/capture/pause", "capture pause toggled paused=" + paused);
+        }
+
+        private void PostLocal(string path, string okLog)
+        {
             try
             {
                 Uri uri = new Uri(config.WebSocketUrl
                     .Replace("wss://", "https://")
                     .Replace("ws://", "http://"));
-                string endpoint = uri.GetLeftPart(UriPartial.Authority) + "/api/phone/solve";
+                string endpoint = uri.GetLeftPart(UriPartial.Authority) + path;
                 new Thread(delegate()
                 {
                     try
@@ -2668,19 +2721,19 @@ namespace WasapiParaformerOverlay
                         request.Timeout = 5000;
                         using (Stream stream = request.GetRequestStream()) stream.Write(empty, 0, empty.Length);
                         using (HttpWebResponse response = (HttpWebResponse)request.GetResponse()) { }
-                        AppLog.Write("solve requested via hotkey");
+                        AppLog.Write(okLog);
                     }
                     catch (Exception error)
                     {
                         // 失败不弹窗，只记日志
-                        AppLog.Write("solve request failed: " + error.Message);
+                        AppLog.Write("local post failed: " + path + " " + error.Message);
                     }
                 })
                 { IsBackground = true }.Start();
             }
             catch (Exception error)
             {
-                AppLog.Write("solve request error: " + error.Message);
+                AppLog.Write("local post error: " + path + " " + error.Message);
             }
         }
 
@@ -2709,6 +2762,14 @@ namespace WasapiParaformerOverlay
             bool keepFollowing = followLatest;
             rebuildingText = true;
             text.Inlines.Clear();
+            if (capturePaused)
+            {
+                Run badge = new Run("⏸ 已暂停采集 · 点控制条 ▶ 恢复");
+                badge.Foreground = new SolidColorBrush(Color.FromRgb(250, 204, 21));
+                badge.FontWeight = FontWeights.SemiBold;
+                text.Inlines.Add(badge);
+                text.Inlines.Add(new LineBreak());
+            }
             if (preview)
             {
                 text.Inlines.Add(new Run("实时字幕预览 · 拖动字幕框调整位置"));
