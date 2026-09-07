@@ -543,6 +543,9 @@ class PhoneRelay:
         self.solve_engine = SolveEngine()
         self.solve_engine.on_delta = self._on_solve_delta
         self.desktop_publisher: Any = None  # callable(payload: dict) 桌面字幕窗分发
+        # 手机端追问上下文：最近的问答对（user/assistant 交替，上限 12 条）。
+        self.phone_chat_history: list[dict] = []
+        self._chat_lock = threading.Lock()
 
     def _on_solve_delta(self, text: str, done: bool) -> None:
         self.schedule_json({"type": "ai", "text": text, "done": done, "source": "solve"})
@@ -624,8 +627,10 @@ class PhoneRelay:
                     phone_text = str(payload.get("text", ""))[:4000]
                     if phone_text:
                         asyncio.ensure_future(self._handle_ask(phone_text))
-                elif kind == "get_prompt":
-                    asyncio.ensure_future(self._handle_get_prompt())
+                elif kind == "clear_chat":
+                    with self._chat_lock:
+                        self.phone_chat_history.clear()
+                    self.schedule_json({"type": "chat_cleared"})
                 elif kind == "auto":
                     self._set_auto(bool(payload.get("on")), payload.get("interval"))
                 elif kind == "clipboard":
@@ -641,7 +646,7 @@ class PhoneRelay:
         await asyncio.to_thread(self.request_solve)
 
     async def _handle_ask(self, question: str) -> None:
-        """手机文字提问：走与字幕 AI 相同的真实管线（提示词+简历/JD 上下文）。"""
+        """手机文字提问：系统提示词 + 最近对话历史（追问）+ 本次问题走真实 AI 管线。"""
         from .server import _ask_ai_blocking, effective_system_prompt
         from .settings import load_settings, load_api_key
 
@@ -654,22 +659,23 @@ class PhoneRelay:
         if not prompt:
             self.schedule_json({"type": "ai", "text": "系统提示词为空，请检查设置页", "done": True, "source": "ask"})
             return
+        with self._chat_lock:
+            history = list(self.phone_chat_history)
 
         def run():
-            return _ask_ai_blocking(prompt, question, settings, api_key)
+            return _ask_ai_blocking(prompt, question, settings, api_key, history=history)
 
         try:
             result = await asyncio.to_thread(run)
-            self.schedule_json({"type": "ai", "text": result["answer"], "done": True, "source": "ask"})
+            answer = result["answer"]
+            with self._chat_lock:
+                self.phone_chat_history.append({"role": "user", "content": question})
+                self.phone_chat_history.append({"role": "assistant", "content": answer})
+                while len(self.phone_chat_history) > 12:
+                    self.phone_chat_history.pop(0)
+            self.schedule_json({"type": "ai", "text": answer, "done": True, "source": "ask"})
         except Exception as exc:
             self.schedule_json({"type": "ai", "text": f"请求失败：{exc}", "done": True, "source": "ask"})
-
-    async def _handle_get_prompt(self) -> None:
-        from .server import effective_system_prompt
-
-        prompt = effective_system_prompt()
-        if prompt:
-            self.schedule_json({"type": "prompt", "prompt": prompt})
 
     async def _handle_clipboard(self, text: str) -> None:
         handler = self.clipboard_handler

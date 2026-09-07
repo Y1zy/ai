@@ -49,8 +49,18 @@ def effective_system_prompt() -> str:
     return prompts["modes"]["auto"]
 
 
-def _ask_ai_blocking(prompt: str, question: str, settings: dict, api_key: str) -> dict:
-    """回答效果测试的阻塞调用：真实系统提示词 + 模拟问题，返回答案/实际模型/耗时。"""
+def _ask_ai_blocking(
+    prompt: str,
+    question: str,
+    settings: dict,
+    api_key: str,
+    history: list[dict] | None = None,
+) -> dict:
+    """阻塞 AI 调用：真实系统提示词 + 可选多轮历史 + 本次问题，返回答案/实际模型/耗时。
+
+    history 为 [{"role": "user"|"assistant", "content": str}, ...]，按时间顺序，
+    供手机端追问使用；桌面字幕 AI 的多轮上下文由 C# 侧自己维护。
+    """
     import json
     import time
 
@@ -59,13 +69,17 @@ def _ask_ai_blocking(prompt: str, question: str, settings: dict, api_key: str) -
     endpoint = settings["aiBaseUrl"].rstrip("/") + "/chat/completions"
     if not endpoint.startswith(("http://", "https://")):
         raise ValueError("接口地址必须以 http:// 或 https:// 开头")
+    messages = [{"role": "system", "content": prompt}]
+    for item in (history or [])[-12:]:
+        role = item.get("role")
+        content = str(item.get("content", "")).strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": question})
     body = json.dumps(
         {
             "model": settings["aiModel"],
-            "messages": [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": "转写文本：\n" + question},
-            ],
+            "messages": messages,
             "stream": False,
             "max_tokens": 500,
             "temperature": 0.3,

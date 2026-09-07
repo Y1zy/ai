@@ -49,11 +49,13 @@ main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
   <div id="img-wrap" class="img-wrap hidden"><img id="img" alt="电脑屏幕截图"></div>
   <div class="tip hidden" id="save-tip">提示：iOS 浏览器长按图片也可保存</div>
   <div id="partial" class="partial hidden"></div>
-  <div id="ai-card" class="card hidden"><div class="q">🤖 AI 回答</div><div id="ai-body"></div></div>
-  <div id="ask-card" class="card">
-    <div class="q">💬 文字提问 AI</div>
-    <div class="actions" style="margin:8px 0"><input id="ask-input" type="text" placeholder="输入问题，如：RAG 系统要看哪些指标？"><button id="ask-send" class="btn btn-primary">发送</button></div>
-    <details id="prompt-detail"><summary style="color:#7dd3fc;cursor:pointer">查看内部系统提示词</summary><pre id="prompt-body" style="white-space:pre-wrap;color:#94a3b8;font-size:12px;margin-top:8px"></pre></details>
+  <div id="chat-card" class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div class="q">💬 AI 对话（支持追问）</div>
+      <button id="chat-clear" class="btn btn-secondary" style="flex:none;padding:4px 10px;font-size:11px">清空</button>
+    </div>
+    <div id="chat-flow" style="display:flex;flex-direction:column;gap:8px;margin:8px 0"></div>
+    <div class="actions" style="margin:8px 0 0"><input id="ask-input" type="text" placeholder="继续追问…"><button id="ask-send" class="btn btn-primary">发送</button></div>
   </div>
   <div id="clipboard-card" class="card hidden">
     <div class="q">📋 剪贴板双向同步（自动）</div>
@@ -77,14 +79,14 @@ var $status = document.getElementById("status");
 var $img = document.getElementById("img");
 var $imgWrap = document.getElementById("img-wrap");
 var $partial = document.getElementById("partial");
-var $aiCard = document.getElementById("ai-card");
-var $aiBody = document.getElementById("ai-body");
+var $chatFlow = document.getElementById("chat-flow");
 var $askInput = document.getElementById("ask-input");
-var $promptBody = document.getElementById("prompt-body");
 var $feed = document.getElementById("feed");
 var $err = document.getElementById("err");
 var $banner = document.getElementById("banner");
 var currentImgUrl = null;
+// 追问流：本机渲染的问答气泡（服务端另有历史供 AI 上下文，刷新页面不回放）。
+var pendingAskText = "";
 
 function setStatus(on){
   $status.className = "badge " + (on ? "b-on" : "b-off");
@@ -102,7 +104,7 @@ function connect(){
     + "/relay?role=phone&sid=" + encodeURIComponent(sid) + "&t=" + encodeURIComponent(tok);
   try { ws = new WebSocket(wsUrl); } catch(e){ setErr("连接失败"); return; }
   ws.binaryType = "arraybuffer";
-  ws.addEventListener("open", function(){ setStatus(true); setErr(""); send({ type:"get_prompt" }); });
+  ws.addEventListener("open", function(){ setStatus(true); setErr(""); });
   ws.addEventListener("close", function(){ setStatus(false); setTimeout(connect, 2000); });
   ws.addEventListener("error", function(){});
   ws.addEventListener("message", function(e){
@@ -157,19 +159,15 @@ function handleText(raw){
     case "status":
       break;
     case "ai":
-      if (msg.source === "solve" || msg.source === "ask" || $aiCard.classList.contains("hidden") === false) {
-        if (msg.text) {
-          $aiCard.classList.remove("hidden");
-          $aiBody.textContent = stripMarkdown(msg.text);
-          $aiCard.classList.toggle("cursor", !msg.done);
-        } else {
-          $aiCard.classList.add("hidden");
-          $aiBody.textContent = "";
-        }
+      if (msg.source === "ask") {
+        appendChat("ai", stripMarkdown(msg.text || ""), !msg.done);
+        if (msg.done) pendingAskText = "";
+      } else if (msg.source === "solve") {
+        appendChat("solve", stripMarkdown(msg.text || ""), !msg.done);
       }
       break;
-    case "prompt":
-      if (msg.prompt) $promptBody.textContent = msg.prompt;
+    case "chat_cleared":
+      $chatFlow.innerHTML = "";
       break;
     case "error":
       setErr(msg.message || "");
@@ -202,6 +200,45 @@ function addTranscript(text){
   window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
 }
 
+// 追问聊天流：me=我的问题（蓝） / ai=AI 回答 / solve=截图解题（绿标记）。
+// 单条气泡原地更新（流式），新气泡追加，历史保留（上限 50 条），不再互相覆盖。
+function appendChat(kind, text, streaming){
+  var last = $chatFlow.lastChild;
+  var expected = kind === "me" ? "chat-me" : (kind === "solve" ? "chat-solve" : "chat-ai");
+  if (streaming && last && last.dataset && last.dataset.kind === expected && last.dataset.open === "1") {
+    last.dataset.open = streaming ? "1" : "0";
+    last.textContent = text + (streaming ? " ▍" : "");
+    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+    return;
+  }
+  var div = document.createElement("div");
+  div.dataset.kind = expected;
+  div.dataset.open = streaming ? "1" : "0";
+  div.style.padding = "8px 10px";
+  div.style.borderRadius = "10px";
+  div.style.whiteSpace = "pre-wrap";
+  div.style.wordBreak = "break-word";
+  div.style.fontSize = "13px";
+  div.style.lineHeight = "1.6";
+  if (kind === "me") {
+    div.style.background = "rgba(96,165,250,.18)";
+    div.style.border = "1px solid rgba(96,165,250,.35)";
+    div.style.alignSelf = "flex-end";
+    div.textContent = "🧑 " + text;
+  } else if (kind === "solve") {
+    div.style.background = "rgba(34,197,94,.10)";
+    div.style.border = "1px solid rgba(34,197,94,.25)";
+    div.textContent = "📸 " + text + (streaming ? " ▍" : "");
+  } else {
+    div.style.background = "rgba(255,255,255,.05)";
+    div.style.border = "1px solid rgba(255,255,255,.10)";
+    div.textContent = "🤖 " + text + (streaming ? " ▍" : "");
+  }
+  $chatFlow.appendChild(div);
+  while ($chatFlow.children.length > 50) $chatFlow.removeChild($chatFlow.firstChild);
+  window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+}
+
 function send(obj){
   if (!ws || ws.readyState !== WebSocket.OPEN) { setErr("连接还没建立，等一秒再试"); return false; }
   try { ws.send(JSON.stringify(obj)); return true; } catch(_){ setErr("发送失败"); return false; }
@@ -211,16 +248,18 @@ document.getElementById("shot-btn").onclick = function(){
   if (send({ type:"trigger" })) setErr("");
 };
 document.getElementById("solve-btn").onclick = function(){
-  $aiCard.classList.remove("hidden");
-  $aiBody.textContent = "正在截屏解题…";
+  appendChat("solve", "正在截屏解题…", true);
   if (send({ type:"solve" })) setErr("");
 };
 document.getElementById("ask-send").onclick = function(){
   var q = $askInput.value.trim();
   if (!q) return;
-  $aiCard.classList.remove("hidden");
-  $aiBody.textContent = "正在思考…";
+  appendChat("me", q, false);
+  pendingAskText = q;
   if (send({ type:"ask", text:q })) { setErr(""); $askInput.value = ""; }
+};
+document.getElementById("chat-clear").onclick = function(){
+  if (send({ type:"clear_chat" })) $chatFlow.innerHTML = "";
 };
 $askInput.addEventListener("keydown", function(e){ if (e.key === "Enter") document.getElementById("ask-send").click(); });
 document.getElementById("save-btn").onclick = saveScreenshot;
