@@ -44,6 +44,8 @@ DEFAULTS: dict[str, Any] = {
     "aiSystemPrompt": "",
     "aiOverridePrompt": "",
     "aiBaseUrl": "https://api.deepseek.com",
+    "hotwordEnabled": True,
+    "hotwordExtra": "",
     "solvePrompt": "",
     "visionEnabled": False,
     "visionBaseUrl": "",
@@ -160,10 +162,11 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(result["frameColor"])):
         result["frameColor"] = "#7DBEFF"
     for key in ("fontFamily", "screenName", "aiSystemPrompt", "aiOverridePrompt", "aiBaseUrl",
-                "solvePrompt", "webSocketUrl",
+                "hotwordExtra", "solvePrompt", "webSocketUrl",
                 "visionBaseUrl", "visionModel"):
         result[key] = str(result[key] or DEFAULTS[key])
     result["visionEnabled"] = bool(result["visionEnabled"])
+    result["hotwordEnabled"] = bool(result.get("hotwordEnabled", True))
     return result
 
 

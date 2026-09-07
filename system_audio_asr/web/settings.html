@@ -69,6 +69,8 @@
     <section class="card wide">
       <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><h2>本地实时翻译</h2><span id="translationBadge" class="badge">未加载</span></div>
       <div class="row two"><label for="asrLanguage">识别语言</label><select id="asrLanguage"><option value="zh">中文 · Paraformer Streaming</option><option value="en">英文 · Faster-Whisper</option></select></div>
+      <label class="switch"><input id="hotwordEnabled" type="checkbox" checked>启用热词纠正（从简历/JD 自动提取技术词，减少 Kafka→卡夫卡 等错误）</label>
+      <div class="row two"><label for="hotwordExtra">补充热词（每行一个，填中文项目代号也行）</label><textarea id="hotwordExtra" placeholder="如：雪球系统&#10;OceanBase"></textarea></div>
       <label class="switch"><input id="liveTranslateEnabled" type="checkbox">启用英文 → 中文实时翻译（本地模型，不使用 DeepSeek）</label>
       <p class="hint">英文模式使用约 78 MB 的 Faster-Whisper 英文模型；每次 partial 再由本机 OPUS-MT 翻译，final 到达后稳定定稿。模型下载后可离线使用。原英文直接显示，中文结果标为“译文”。</p>
       <div style="display:flex;justify-content:flex-end"><button id="warmTranslation" type="button">下载并预热翻译模型</button></div>
@@ -134,7 +136,7 @@
   <div class="actions"><span id="status">正在加载设置…</span><button id="save" class="primary" type="button">保存并应用</button></div>
 </main>
 <script>
-const ids=['fontSize','opacity','fontFamily','textColor','frameMode','frameColor','frameOpacity','screenName','locked','asrLanguage','liveTranslateEnabled','aiEnabled','aiBaseUrl','aiModel','aiMode','aiSilenceSeconds','aiSystemPrompt','aiOverridePrompt'];
+const ids=['fontSize','opacity','fontFamily','textColor','frameMode','frameColor','frameOpacity','screenName','locked','asrLanguage','hotwordEnabled','hotwordExtra','liveTranslateEnabled','aiEnabled','aiBaseUrl','aiModel','aiMode','aiSilenceSeconds','aiSystemPrompt','aiOverridePrompt'];
 const $=id=>document.getElementById(id); let loaded=null, clearRequested=false;
 function stripMarkdown(t){
   if(!t) return t||"";
@@ -157,7 +159,7 @@ async function load(){
     $('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key'; $('keyBadge').className='badge '+(data.apiKeySet?'ok':''); await refreshTranslationStatus(); updatePreview(); showStatus('设置已加载'); refreshPromptPreview();
   }catch(e){showStatus('加载失败：'+e.message,true)}
 }
-function collect(){return {fontSize:Number($('fontSize').value),opacity:Number($('opacity').value)/100,fontFamily:$('fontFamily').value,textColor:$('textColor').value,frameMode:$('frameMode').value,frameColor:$('frameColor').value,frameOpacity:Number($('frameOpacity').value)/100,screenName:$('screenName').value,locked:$('locked').checked,asrLanguage:$('asrLanguage').value,liveTranslateEnabled:$('liveTranslateEnabled').checked,aiEnabled:$('aiEnabled').checked,aiBaseUrl:$('aiBaseUrl').value.trim(),aiModel:$('aiModel').value.trim(),aiMode:$('aiMode').value,aiSilenceSeconds:Number($('aiSilenceSeconds').value),aiSystemPrompt:$('aiSystemPrompt').value,aiOverridePrompt:$('aiOverridePrompt').value}}
+function collect(){return {fontSize:Number($('fontSize').value),opacity:Number($('opacity').value)/100,fontFamily:$('fontFamily').value,textColor:$('textColor').value,frameMode:$('frameMode').value,frameColor:$('frameColor').value,frameOpacity:Number($('frameOpacity').value)/100,screenName:$('screenName').value,locked:$('locked').checked,asrLanguage:$('asrLanguage').value,hotwordEnabled:$('hotwordEnabled').checked,hotwordExtra:$('hotwordExtra').value.trim(),liveTranslateEnabled:$('liveTranslateEnabled').checked,aiEnabled:$('aiEnabled').checked,aiBaseUrl:$('aiBaseUrl').value.trim(),aiModel:$('aiModel').value.trim(),aiMode:$('aiMode').value,aiSilenceSeconds:Number($('aiSilenceSeconds').value),aiSystemPrompt:$('aiSystemPrompt').value,aiOverridePrompt:$('aiOverridePrompt').value}}
 async function refreshTranslationStatus(){try{const s=await fetch('/api/translate/status').then(r=>r.json());$('translationBadge').textContent=s.loaded?`已加载 · ${s.device||'本机'}${s.lastLatencyMs?` · ${s.lastLatencyMs} ms`:''}`:'尚未加载';$('translationBadge').className='badge '+(s.loaded?'ok':'')}catch{$('translationBadge').textContent='状态未知'}}
 async function save(){
   $('save').disabled=true; showStatus('正在保存…'); try{const payload={settings:collect(),clearApiKey:clearRequested}; if($('apiKey').value.trim())payload.apiKey=$('apiKey').value.trim(); const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const data=await r.json(); if(!r.ok)throw Error(data.detail||r.status); clearRequested=false;$('apiKey').value='';$('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key';$('keyBadge').className='badge '+(data.apiKeySet?'ok':'');showStatus(data.asrRestarted?'已保存，正在切换识别模型…':'已保存，Overlay 将在约 1 秒内应用');return true}catch(e){showStatus('保存失败：'+e.message,true);return false}finally{$('save').disabled=false}

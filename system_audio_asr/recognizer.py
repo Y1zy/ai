@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import queue
 import os
+import queue
+import re
 import threading
 import time
 import traceback
@@ -12,6 +13,70 @@ import numpy as np
 from .capture import WasapiLoopbackCapture
 from .config import AppConfig
 from .segmenter import AudioPacket, SpeechSegmenter, merge_stream_text
+from .settings import load_settings
+
+
+_HOTWORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#.\-]{1,30}")
+_MAX_HOTWORDS = 80
+
+# 内置基础热词：C++ / Qt 技术栈（面试高频，简历为空时兜底）
+_BASE_HOTWORDS: list[str] = [
+    # C++ 核心
+    "C++", "C++11", "C++14", "C++17", "C++20", "C++23",
+    "STL", "template", "RAII", "smart pointer", "unique_ptr", "shared_ptr",
+    "move semantics", "rvalue", "lambda", "constexpr", "decltype",
+    "virtual", "vtable", "RTTI", "multiple inheritance", "diamond problem",
+    "memory alignment", "cache line", "false sharing", "memory order",
+    "atomic", "mutex", "condition variable", "thread pool", "coroutine",
+    # Qt 核心
+    "Qt", "Qt5", "Qt6", "QWidget", "QML", "QObject", "signal", "slot",
+    "moc", "meta object", "property", "event loop", "QThread",
+    "QTimer", "QMutex", "QWaitCondition", "QSemaphore",
+    "QNetworkAccessManager", "QHttp", "QWebSocket",
+    "QSqlDatabase", "QSqlQuery", "QTableView", "QStandardItemModel",
+    "QOpenGLWidget", "QGraphicsView", "QQuickItem",
+    "qmake", "CMake", "qrc", "ui file",
+    # 常见搭配
+    "signal slot mechanism", "event driven", "cross platform",
+    "desktop application", "embedded", "real time",
+]
+
+
+def _extract_hotwords(settings: dict) -> list[str]:
+    """从简历/JD/公司/附加背景里提取英文技术词作为热词表。"""
+    parts = [
+        str(settings.get("resumeContext") or ""),
+        str(settings.get("jdContext") or ""),
+        str(settings.get("targetCompany") or ""),
+        str(settings.get("extraContext") or ""),
+        str(settings.get("hotwordExtra") or ""),
+    ]
+    seen: set[str] = set()
+    hotwords: list[str] = []
+    for text in parts:
+        for match in _HOTWORD_RE.findall(text):
+            word = match.strip()
+            if word and word not in seen:
+                seen.add(word)
+                hotwords.append(word)
+                if len(hotwords) >= _MAX_HOTWORDS:
+                    return hotwords
+    return hotwords
+
+
+def _get_hotwords(settings: dict) -> list[str]:
+    """三层叠加热词：内置基础 + 简历提取 + 手动补充，去重后返回。"""
+    # ① 内置基础热词（兜底）
+    result: list[str] = list(_BASE_HOTWORDS)
+    seen: set[str] = {w.lower() for w in result}
+
+    # ② 简历自动提取（精准）
+    for word in _extract_hotwords(settings):
+        if word.lower() not in seen:
+            result.append(word)
+            seen.add(word.lower())
+
+    return result
 
 
 def choose_device(requested: str) -> str:
@@ -95,6 +160,9 @@ class TranscriptionEngine:
 
             cache: dict = {}
             utterance = ""
+            hotwords: list[str] = []
+            hotword_failed = False
+            last_hotword_refresh = 0.0
             while not self._stop.is_set():
                 try:
                     packet = self._packets.get(timeout=0.2)
@@ -103,7 +171,19 @@ class TranscriptionEngine:
                         break
                     continue
 
-                result = model.generate(
+                now = time.monotonic()
+                if now - last_hotword_refresh > 15.0:
+                    last_hotword_refresh = now
+                    try:
+                        settings = load_settings()
+                        if settings.get("hotwordEnabled", True):
+                            hotwords = _get_hotwords(settings)
+                        else:
+                            hotwords = []
+                    except Exception:
+                        pass
+
+                generate_kwargs: dict = dict(
                     input=packet.samples,
                     cache=cache,
                     is_final=packet.is_final,
@@ -111,6 +191,29 @@ class TranscriptionEngine:
                     encoder_chunk_look_back=self.config.encoder_look_back,
                     decoder_chunk_look_back=self.config.decoder_look_back,
                 )
+                if hotwords and not hotword_failed:
+                    generate_kwargs["hotword"] = " ".join(hotwords)
+
+                try:
+                    result = model.generate(**generate_kwargs)
+                except TypeError:
+                    # 模型不支持 hotword 参数时自动降级，后续不再尝试
+                    if hotwords and not hotword_failed:
+                        hotword_failed = True
+                        hotwords = []
+                        self.publish({"type": "status", "state": "hotword_disabled"})
+                    result = model.generate(
+                        input=packet.samples,
+                        cache=cache,
+                        is_final=packet.is_final,
+                        chunk_size=list(self.config.chunk_size),
+                        encoder_chunk_look_back=self.config.encoder_look_back,
+                        decoder_chunk_look_back=self.config.decoder_look_back,
+                    )
+                except Exception as exc:
+                    self.publish({"type": "error", "where": "recognizer", "message": f"generate 失败: {exc}"})
+                    continue
+
                 incoming = "".join(
                     str(item.get("text", "")) for item in (result or []) if isinstance(item, dict)
                 )
