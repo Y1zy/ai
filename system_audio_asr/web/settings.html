@@ -181,18 +181,18 @@ function builtinCurrentText(){
   if(!builtinPrompts)return'';
   return $('builtinPromptMode').value==='solve'
     ?(builtinPrompts.solveCustom||builtinPrompts.solveDefault||'')
-    :(builtinPrompts.aiBuiltInPrompt||'');
+    :(builtinPrompts.aiBuiltInPrompt||builtinDefaultText());
 }
-function builtinPlaceholderText(){
-  return $('builtinPromptMode').value==='solve'
-    ?builtinPrompts&&builtinPrompts.solveDefault||''
-    :(builtinPrompts&&builtinPrompts.modes&&builtinPrompts.modes[$('aiMode').value])||'';
+function builtinDefaultText(){
+  // 系统默认模板（未自定义时显示的只读参考）：随「处理模式」下拉联动。
+  const modes=(builtinPrompts&&builtinPrompts.modes)||{};
+  return modes[$('aiMode').value]||modes.auto||'';
 }
 function refreshBuiltinUi(){
   const isSolve=$('builtinPromptMode').value==='solve';
   const customized=isSolve?Boolean(builtinPrompts&&builtinPrompts.solveCustom):Boolean(builtinPrompts&&builtinPrompts.aiBuiltInPrompt);
   $('builtinPromptView').value=builtinCurrentText();
-  $('builtinHint').textContent=customized?'当前为自定义模板，清空并保存即恢复系统默认':'当前为系统默认模板，修改后点「保存内置模板」生效（约 1 秒内应用）';
+  $('builtinHint').textContent=customized?'当前为自定义模板，清空并保存即恢复系统默认':(isSolve?'当前为系统默认解题提示词，修改后点「保存内置模板」生效':'以下为系统默认模板全文（可直接修改，保存后替换默认；简历/JD 上下文仍会自动拼在前面）');
   $('builtinReset').disabled=!customized;
   builtinDirty=false;
 }
@@ -202,6 +202,8 @@ async function loadBuiltinPrompts(){
   if(builtinPrompts)refreshBuiltinUi();
 }
 $('builtinPromptMode').addEventListener('change',refreshBuiltinUi);
+// 处理模式切换时，同步刷新「字幕 AI 内置模板」下显示的系统默认全文。
+$('aiMode').addEventListener('change',()=>{if(!builtinDirty&&$('builtinPromptMode').value==='builtin'&&!(builtinPrompts&&builtinPrompts.aiBuiltInPrompt))refreshBuiltinUi();});
 $('builtinPromptView').addEventListener('input',()=>{builtinDirty=true;$('builtinHint').textContent='内容已修改，点「保存内置模板」生效；清空内容保存 = 恢复系统默认';});
 $('builtinSave').onclick=async()=>{
   if(!builtinPrompts){showStatus('内置提示词尚未加载',true);return}
