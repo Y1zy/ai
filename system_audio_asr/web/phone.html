@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>VoxRibbon · 手机投屏</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Microsoft YaHei UI",system-ui,sans-serif;background:#0a0a1a;color:#e0e0e0;min-height:100vh;min-height:100dvh}
+header{position:sticky;top:0;z-index:10;padding:12px 16px;background:rgba(10,10,26,.95);backdrop-filter:blur(12px);border-bottom:1px solid rgba(255,255,255,.06);display:flex;align-items:center;justify-content:space-between}
+.title{font-size:15px;font-weight:700;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.badge{font-size:11px;padding:3px 8px;border-radius:99px;font-weight:600}
+.b-on{background:rgba(34,197,94,.15);color:#4ade80}
+.b-off{background:rgba(239,68,68,.15);color:#f87171}
+main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
+.img-wrap{border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02)}
+.img-wrap img{width:100%;display:block}
+.actions{display:flex;gap:8px}
+.btn{flex:1;padding:10px 12px;font-size:13px;font-weight:600;border:none;border-radius:10px;cursor:pointer}
+.btn-primary{background:linear-gradient(135deg,#60a5fa,#a78bfa);color:#fff}
+.btn-secondary{background:rgba(255,255,255,.06);color:#e2e8f0;border:1px solid rgba(255,255,255,.1);display:flex;align-items:center;justify-content:center;gap:6px}
+.btn:active{opacity:.7}
+.switchline{display:flex;align-items:center;gap:8px;font-size:13px;color:#cbd5e1}
+.switchline input{width:18px;height:18px;accent-color:#60a5fa}
+.card{background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:12px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+.card .q{font-size:11px;color:#60a5fa;margin-bottom:6px;font-weight:600}
+.card.old{opacity:.55}
+.partial{font-size:12px;color:#64748b;padding:6px 10px;border-left:2px solid rgba(255,255,255,.1);margin:2px 0}
+.err{color:#f87171;font-size:12px}
+.tip{color:#64748b;font-size:11px;text-align:center;padding:6px}
+.cursor::after{content:"▌";color:#60a5fa;animation:blink .8s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<header>
+  <span class="title">VoxRibbon · 手机投屏</span>
+  <span id="status" class="badge b-off">未连接</span>
+</header>
+<main>
+  <div id="banner" class="err hidden"></div>
+  <div class="actions">
+    <button id="shot-btn" class="btn btn-primary">📸 立即截屏</button>
+    <button id="solve-btn" class="btn btn-primary">🧠 截题+回答</button>
+    <button id="save-btn" class="btn btn-secondary">💾 保存图片</button>
+  </div>
+  <label class="switchline"><input id="auto" type="checkbox">自动刷新截图（每 3 秒）</label>
+  <div id="img-wrap" class="img-wrap hidden"><img id="img" alt="电脑屏幕截图"></div>
+  <div class="tip hidden" id="save-tip">提示：iOS 浏览器长按图片也可保存</div>
+  <div id="partial" class="partial hidden"></div>
+  <div id="ai-card" class="card hidden"><div class="q">🤖 AI 回答</div><div id="ai-body"></div></div>
+  <div id="clipboard-card" class="card hidden">
+    <div class="q">📋 剪贴板双向同步（自动）</div>
+    <div id="pc-clip" style="color:#cbd5e1"></div>
+    <div class="actions" style="margin-top:8px">
+      <button id="copy-btn" class="btn btn-secondary">复制到手机</button>
+      <button id="clip-send" class="btn btn-primary">把手机剪贴板发到电脑</button>
+    </div>
+    <div id="clip-status" class="tip hidden"></div>
+  </div>
+  <div id="feed"></div>
+  <div id="err"></div>
+  <div class="tip">本地直连 · 手机与电脑同一网络 · 低延迟</div>
+</main>
+<script>
+var frag = new URLSearchParams(location.hash.replace(/^#/, ""));
+var sid = frag.get("sid") || "";
+var tok = frag.get("t") || "";
+var ws = null;
+var $status = document.getElementById("status");
+var $img = document.getElementById("img");
+var $imgWrap = document.getElementById("img-wrap");
+var $partial = document.getElementById("partial");
+var $aiCard = document.getElementById("ai-card");
+var $aiBody = document.getElementById("ai-body");
+var $feed = document.getElementById("feed");
+var $err = document.getElementById("err");
+var $banner = document.getElementById("banner");
+var currentImgUrl = null;
+
+function setStatus(on){
+  $status.className = "badge " + (on ? "b-on" : "b-off");
+  $status.textContent = on ? "已连接 · 电脑在线" : "未连接";
+}
+function setErr(msg){ $err.innerHTML = msg ? '<div class="err">'+msg+'</div>' : ""; }
+
+fetch("/api/phone/status").then(function(r){ return r.json(); }).then(function(data){
+  if (!data.enabled) { $banner.textContent = "电脑端尚未启用手机投屏：请在电脑设置页勾选启用并重启 start.ps1。"; $banner.classList.remove("hidden"); }
+}).catch(function(){});
+
+function connect(){
+  if (!sid || !tok) { setErr("会话参数缺失，请重新扫码"); return; }
+  var wsUrl = (location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host
+    + "/relay?role=phone&sid=" + encodeURIComponent(sid) + "&t=" + encodeURIComponent(tok);
+  try { ws = new WebSocket(wsUrl); } catch(e){ setErr("连接失败"); return; }
+  ws.binaryType = "arraybuffer";
+  ws.addEventListener("open", function(){ setStatus(true); setErr(""); });
+  ws.addEventListener("close", function(){ setStatus(false); setTimeout(connect, 2000); });
+  ws.addEventListener("error", function(){});
+  ws.addEventListener("message", function(e){
+    if (typeof e.data === "string") handleText(e.data);
+    else handleBinary(e.data);
+  });
+}
+
+function handleBinary(data){
+  var blob = data instanceof Blob ? data : new Blob([data], { type: "image/jpeg" });
+  var url = URL.createObjectURL(blob);
+  if (currentImgUrl) { try { URL.revokeObjectURL(currentImgUrl); } catch(_){} }
+  currentImgUrl = url;
+  $img.src = url;
+  $imgWrap.classList.remove("hidden");
+  document.getElementById("save-tip").classList.remove("hidden");
+}
+
+function saveScreenshot(){
+  if (!currentImgUrl) { setErr("还没有截图，先点「立即截屏」"); return; }
+  var link = document.createElement("a");
+  link.href = currentImgUrl;
+  var stamp = new Date();
+  function pad(n){ return (n < 10 ? "0" : "") + n; }
+  link.download = "voxribbon-" + stamp.getFullYear() + pad(stamp.getMonth()+1) + pad(stamp.getDate())
+    + "-" + pad(stamp.getHours()) + pad(stamp.getMinutes()) + pad(stamp.getSeconds()) + ".jpg";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+function stripMarkdown(t){
+  if(!t) return t||"";
+  return t.split("\n").map(function(line){
+    if(/^\s*```/.test(line)) return "";
+    var s=line.replace(/^\s*#+\s+/,"");
+    return s.replace(/\*\*/g,"").replace(/__/g,"").replace(/`/g,"");
+  }).join("\n").replace(/\n{3,}/g,"\n\n");
+}
+
+function handleText(raw){
+  var msg; try { msg = JSON.parse(raw); } catch(_) { return; }
+  switch (msg.type) {
+    case "hello": setStatus(true); break;
+    case "partial":
+      if (msg.text) { $partial.textContent = "🎙 " + msg.text; $partial.classList.remove("hidden"); }
+      break;
+    case "final":
+      $partial.classList.add("hidden");
+      if (msg.text) addTranscript(msg.text);
+      break;
+    case "status":
+      break;
+    case "ai":
+      if (msg.source === "solve" || $aiCard.classList.contains("hidden") === false) {
+        if (msg.text) {
+          $aiCard.classList.remove("hidden");
+          $aiBody.textContent = stripMarkdown(msg.text);
+          $aiCard.classList.toggle("cursor", !msg.done);
+        } else {
+          $aiCard.classList.add("hidden");
+          $aiBody.textContent = "";
+        }
+      }
+      break;
+    case "error":
+      setErr(msg.message || "");
+      break;
+    case "clipboard":
+      showPcClipboard(msg.text || "");
+      break;
+    case "clipboard_ack":
+      showClipStatus(msg.ok ? "✓ 已写入电脑剪贴板，电脑上直接 Ctrl+V" : "✗ 写入失败，请重试");
+      break;
+  }
+}
+
+var pcClipText = "";
+var lastPhonePush = "";
+function showPcClipboard(text){
+  if (!text) return;
+  pcClipText = text;
+  var card = document.getElementById("clipboard-card");
+  document.getElementById("pc-clip").textContent = text.length > 600 ? text.slice(0, 600) + "…" : text;
+  card.classList.remove("hidden");
+}
+
+function addTranscript(text){
+  var div = document.createElement("div");
+  div.className = "card";
+  div.textContent = text;
+  $feed.appendChild(div);
+  while ($feed.children.length > 40) $feed.removeChild($feed.firstChild);
+  window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+}
+
+function send(obj){
+  if (!ws || ws.readyState !== WebSocket.OPEN) { setErr("连接还没建立，等一秒再试"); return false; }
+  try { ws.send(JSON.stringify(obj)); return true; } catch(_){ setErr("发送失败"); return false; }
+}
+
+document.getElementById("shot-btn").onclick = function(){
+  if (send({ type:"trigger" })) setErr("");
+};
+document.getElementById("solve-btn").onclick = function(){
+  $aiCard.classList.remove("hidden");
+  $aiBody.textContent = "正在截屏解题…";
+  if (send({ type:"solve" })) setErr("");
+};
+document.getElementById("save-btn").onclick = saveScreenshot;
+document.getElementById("auto").onchange = function(e){
+  send({ type:"auto", on: e.target.checked, interval: 3000 });
+};
+document.getElementById("copy-btn").onclick = function(){
+  if (!pcClipText) return;
+  var done = function(){ document.getElementById("copy-btn").textContent = "✓ 已复制"; };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(pcClipText).then(done, function(){
+      window.prompt("长按复制：", pcClipText.slice(0, 2000));
+    });
+  } else {
+    window.prompt("长按复制：", pcClipText.slice(0, 2000));
+  }
+  setTimeout(function(){ document.getElementById("copy-btn").textContent = "复制到手机"; }, 2000);
+};
+// 手机剪贴板 → 电脑：浏览器无法后台读剪贴板，需一次用户点击授权。
+// 点击后读取手机剪贴板并推送到电脑；之后每次点这个按钮都会同步最新内容。
+document.getElementById("clip-send").onclick = function(){
+  var finish = function(text){
+    var trimmed = (text || "").trim();
+    if (!trimmed) { showClipStatus("手机剪贴板是空的，先在手机上复制一段文字"); return; }
+    if (trimmed === lastPhonePush) { showClipStatus("内容未变化"); return; }
+    lastPhonePush = trimmed;
+    send({ type: "clipboard", text: trimmed });
+  };
+  if (navigator.clipboard && navigator.clipboard.readText) {
+    navigator.clipboard.readText().then(function(text){
+      finish(text);
+    }).catch(function(){
+      showClipStatus("浏览器拒绝读取手机剪贴板，请点「复制到手机」卡片外任意处再试，或换 Chrome");
+    });
+  } else {
+    var text = window.prompt("粘贴要发送到电脑的文字：");
+    if (text !== null) finish(text);
+  }
+};
+function showClipStatus(message){
+  var clipStatus = document.getElementById("clip-status");
+  clipStatus.textContent = message;
+  clipStatus.classList.remove("hidden");
+  setTimeout(function(){ clipStatus.classList.add("hidden"); }, 3000);
+}
+
+connect();
+</script>
+</body>
+</html>
