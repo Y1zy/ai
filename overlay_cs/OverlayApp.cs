@@ -300,6 +300,8 @@ namespace WasapiParaformerOverlay
         internal string AiSystemPrompt = "";
         internal string AiBaseUrl = "https://api.deepseek.com";
         internal string AiOverridePrompt = "";
+        // 自定义内置模板：非空时替换 PromptForMode 的硬编码模板（上下文与附加要求仍自动附加）。
+        internal string AiBuiltInPrompt = "";
         // 简历上下文：面试回答时 AI 会参考这些真实经历来组织答案。
         internal string ResumeContext = "";
         internal string JdContext = "";
@@ -375,6 +377,7 @@ namespace WasapiParaformerOverlay
                 if (data.ContainsKey("aiSystemPrompt")) result.AiSystemPrompt = Convert.ToString(data["aiSystemPrompt"]);
                 if (data.ContainsKey("aiBaseUrl")) result.AiBaseUrl = Convert.ToString(data["aiBaseUrl"]);
                 if (data.ContainsKey("aiOverridePrompt")) result.AiOverridePrompt = Convert.ToString(data["aiOverridePrompt"]);
+                if (data.ContainsKey("aiBuiltInPrompt")) result.AiBuiltInPrompt = Convert.ToString(data["aiBuiltInPrompt"]);
                 if (data.ContainsKey("resumeContext")) result.ResumeContext = Convert.ToString(data["resumeContext"]);
                 if (data.ContainsKey("jdContext")) result.JdContext = Convert.ToString(data["jdContext"]);
                 if (data.ContainsKey("targetCompany")) result.TargetCompany = Convert.ToString(data["targetCompany"]);
@@ -419,6 +422,7 @@ namespace WasapiParaformerOverlay
             data["aiSystemPrompt"] = AiSystemPrompt;
             data["aiBaseUrl"] = AiBaseUrl;
             data["aiOverridePrompt"] = AiOverridePrompt;
+            data["aiBuiltInPrompt"] = AiBuiltInPrompt;
             data["resumeContext"] = ResumeContext;
             data["jdContext"] = JdContext;
             data["targetCompany"] = TargetCompany;
@@ -464,6 +468,7 @@ namespace WasapiParaformerOverlay
             AiSystemPrompt = other.AiSystemPrompt;
             AiBaseUrl = other.AiBaseUrl;
             AiOverridePrompt = other.AiOverridePrompt;
+            AiBuiltInPrompt = other.AiBuiltInPrompt;
             ResumeContext = other.ResumeContext;
             JdContext = other.JdContext;
             TargetCompany = other.TargetCompany;
@@ -740,6 +745,11 @@ namespace WasapiParaformerOverlay
             {
                 // 完全自定义模式：整体替换内置模板，但面试上下文（简历/JD 等）仍会拼在前面。
                 prompt = contextBlock + config.AiOverridePrompt.Trim();
+            }
+            else if (!string.IsNullOrWhiteSpace(config.AiBuiltInPrompt))
+            {
+                // 设置页改过的内置模板：替换硬编码模板，面试上下文与附加要求仍自动附加。
+                prompt = contextBlock + config.AiBuiltInPrompt.Trim();
             }
             else
             {

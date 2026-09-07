@@ -88,6 +88,15 @@
       <div class="row two"><label for="aiOverridePrompt">完全自定义系统提示词</label><textarea id="aiOverridePrompt" placeholder="可选。填写后替换内置模式提示词（处理模式失效）；简历/JD/公司等上下文仍会自动附加。"></textarea></div>
       <div class="row two"><label for="aiSystemPrompt">附加提示词</label><textarea id="aiSystemPrompt" placeholder="可选，例如：回答控制在 50 字以内；专业术语保留英文。"></textarea></div>
       <div class="row two"><label for="aiPromptPreview">内部系统提示词（最近一次实际发送）</label><textarea id="aiPromptPreview" readonly placeholder="发出 AI 请求后显示实际发送给模型的完整系统提示词；点「测试 AI 连接」可立即生成。"></textarea></div>
+      <div class="row two"><label for="builtinPromptMode">系统内置提示词（可查看可修改）</label><div style="display:flex;gap:8px;flex-wrap:wrap"><select id="builtinPromptMode" style="max-width:280px">
+        <option value="builtin">字幕 AI · 内置模板</option>
+        <option value="solve">截图解题 · 提示词</option>
+      </select><button id="builtinReset" type="button">恢复默认</button></div></div>
+      <div class="row two"><label for="builtinPromptView">模板内容</label><textarea id="builtinPromptView" style="min-height:170px" spellcheck="false"></textarea></div>
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px">
+        <span id="builtinHint" style="color:#91a1b8;font-size:12px"></span>
+        <button id="builtinSave" type="button">保存内置模板</button>
+      </div>
       <div class="row two"><label for="aiTestQuestion">回答测试（模拟面试问题，走真实管线）</label><textarea id="aiTestQuestion" placeholder="输入一个问题测试 AI 回答效果，如：请评估一下 RAG 系统要看哪些指标。需先在桌面设置窗发过一次测试或触发过字幕 AI（系统提示词就绪后可用）。"></textarea></div>
       <div style="display:flex;justify-content:flex-end"><button id="askAi" type="button">发送测试问题</button></div>
       <div class="row two"><label for="aiTestAnswer">测试结果（答案 / 实际模型 / 耗时）</label><textarea id="aiTestAnswer" readonly placeholder="显示回答全文、中转站实际路由的模型名和耗时"></textarea></div>
@@ -156,7 +165,7 @@ async function load(){
   try{const data=await fetch('/api/settings').then(r=>{if(!r.ok)throw Error(r.status);return r.json()}); loaded=data.settings;
     for(const id of ids){const el=$(id),v=loaded[id]; if(el.type==='checkbox')el.checked=Boolean(v); else if(id==='opacity'||id==='frameOpacity')el.value=Math.round(Number(v)*100); else if(v!==undefined)el.value=v}
     $('screenName').innerHTML=''; const monitors=data.monitors.length?data.monitors:[loaded.screenName||'默认显示器']; for(const name of monitors){const o=document.createElement('option');o.value=name;o.textContent=name;$('screenName').append(o)} $('screenName').value=loaded.screenName||monitors[0];
-    $('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key'; $('keyBadge').className='badge '+(data.apiKeySet?'ok':''); await refreshTranslationStatus(); updatePreview(); showStatus('设置已加载'); refreshPromptPreview();
+    $('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key'; $('keyBadge').className='badge '+(data.apiKeySet?'ok':''); await refreshTranslationStatus(); updatePreview(); showStatus('设置已加载'); refreshPromptPreview(); loadBuiltinPrompts();
   }catch(e){showStatus('加载失败：'+e.message,true)}
 }
 function collect(){return {fontSize:Number($('fontSize').value),opacity:Number($('opacity').value)/100,fontFamily:$('fontFamily').value,textColor:$('textColor').value,frameMode:$('frameMode').value,frameColor:$('frameColor').value,frameOpacity:Number($('frameOpacity').value)/100,screenName:$('screenName').value,locked:$('locked').checked,asrLanguage:$('asrLanguage').value,hotwordEnabled:$('hotwordEnabled').checked,hotwordExtra:$('hotwordExtra').value.trim(),liveTranslateEnabled:$('liveTranslateEnabled').checked,aiEnabled:$('aiEnabled').checked,aiBaseUrl:$('aiBaseUrl').value.trim(),aiModel:$('aiModel').value.trim(),aiMode:$('aiMode').value,aiSilenceSeconds:Number($('aiSilenceSeconds').value),aiSystemPrompt:$('aiSystemPrompt').value,aiOverridePrompt:$('aiOverridePrompt').value}}
@@ -165,7 +174,57 @@ async function save(){
   $('save').disabled=true; showStatus('正在保存…'); try{const payload={settings:collect(),clearApiKey:clearRequested}; if($('apiKey').value.trim())payload.apiKey=$('apiKey').value.trim(); const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const data=await r.json(); if(!r.ok)throw Error(data.detail||r.status); clearRequested=false;$('apiKey').value='';$('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key';$('keyBadge').className='badge '+(data.apiKeySet?'ok':'');showStatus(data.asrRestarted?'已保存，正在切换识别模型…':'已保存，Overlay 将在约 1 秒内应用');return true}catch(e){showStatus('保存失败：'+e.message,true);return false}finally{$('save').disabled=false}
 }
 async function refreshPromptPreview(){try{const d=await fetch('/api/ai/prompt').then(r=>r.json());$('aiPromptPreview').value=d.prompt||'';}catch{}}
-$('save').onclick=save; $('testAi').onclick=async()=>{if(!await save())return;$('testAi').disabled=true;showStatus('正在测试 AI 连接…');try{const r=await fetch('/api/settings/test-deepseek',{method:'POST'}),data=await r.json();if(!r.ok)throw Error(data.detail||r.status);showStatus('连接成功：'+data.message)}catch(e){showStatus('连接失败：'+e.message,true)}finally{$('testAi').disabled=false;refreshPromptPreview()}};
+let builtinPrompts=null;
+// 模板类型：builtin = 字幕 AI 内置模板（空 = 用系统默认）；solve = 截图解题提示词（存 solvePrompt）。
+let builtinDirty=false;
+function builtinCurrentText(){
+  if(!builtinPrompts)return'';
+  return $('builtinPromptMode').value==='solve'
+    ?(builtinPrompts.solveCustom||builtinPrompts.solveDefault||'')
+    :(builtinPrompts.aiBuiltInPrompt||'');
+}
+function builtinPlaceholderText(){
+  return $('builtinPromptMode').value==='solve'
+    ?builtinPrompts&&builtinPrompts.solveDefault||''
+    :(builtinPrompts&&builtinPrompts.modes&&builtinPrompts.modes[$('aiMode').value])||'';
+}
+function refreshBuiltinUi(){
+  const isSolve=$('builtinPromptMode').value==='solve';
+  const customized=isSolve?Boolean(builtinPrompts&&builtinPrompts.solveCustom):Boolean(builtinPrompts&&builtinPrompts.aiBuiltInPrompt);
+  $('builtinPromptView').value=builtinCurrentText();
+  $('builtinHint').textContent=customized?'当前为自定义模板，清空并保存即恢复系统默认':'当前为系统默认模板，修改后点「保存内置模板」生效（约 1 秒内应用）';
+  $('builtinReset').disabled=!customized;
+  builtinDirty=false;
+}
+async function loadBuiltinPrompts(){
+  try{builtinPrompts=await fetch('/api/prompts/builtin').then(r=>{if(!r.ok)throw Error(r.status);return r.json()});}
+  catch{builtinPrompts=null;}
+  if(builtinPrompts)refreshBuiltinUi();
+}
+$('builtinPromptMode').addEventListener('change',refreshBuiltinUi);
+$('builtinPromptView').addEventListener('input',()=>{builtinDirty=true;$('builtinHint').textContent='内容已修改，点「保存内置模板」生效；清空内容保存 = 恢复系统默认';});
+$('builtinSave').onclick=async()=>{
+  if(!builtinPrompts){showStatus('内置提示词尚未加载',true);return}
+  const isSolve=$('builtinPromptMode').value==='solve';
+  const text=$('builtinPromptView').value.trim();
+  const payload={settings:isSolve?{solvePrompt:text}:{aiBuiltInPrompt:text}};
+  $('builtinSave').disabled=true;showStatus('正在保存内置模板…');
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await r.json();if(!r.ok)throw Error(data.detail||r.status);
+    if(isSolve)builtinPrompts.solveCustom=text||null;else builtinPrompts.aiBuiltInPrompt=text;
+    refreshBuiltinUi();refreshPromptPreview();
+    showStatus(isSolve?(text?'解题提示词已保存':'已恢复解题内置默认'):(text?'内置模板已保存，桌面端即将应用':'已恢复系统默认模板'));
+  }catch(e){showStatus('保存失败：'+e.message,true)}
+  finally{$('builtinSave').disabled=false}
+};
+$('builtinReset').onclick=()=>{
+  if(!builtinPrompts)return;
+  $('builtinPromptView').value='';
+  builtinDirty=true;
+  $('builtinHint').textContent='内容已清空，点「保存内置模板」恢复系统默认';
+};
+$('save').onclick=save; $('testAi').onclick=async()=>{if(!await save())return;$('testAi').disabled=true;showStatus('正在测试 AI 连接…');try{const r=await fetch('/api/settings/test-deepseek',{method:'POST'}),data=await r.json();if(!r.ok)throw Error(data.detail||r.status);showStatus('连接成功：'+data.message)}catch(e){showStatus('连接失败：'+e.message,true)}finally{$('testAi').disabled=false;refreshPromptPreview();loadBuiltinPrompts()}};
 $('askAi').onclick=async()=>{const q=$('aiTestQuestion').value.trim();if(!q){showStatus('请先输入测试问题',true);return}$('askAi').disabled=true;$('aiTestAnswer').value='正在请求…';try{const r=await fetch('/api/ai/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})}),data=await r.json();if(!r.ok)throw Error(data.detail||r.status);$('aiTestAnswer').value=stripMarkdown(data.answer)+'\n\n—— 实际模型: '+(data.model||'未知')+' · 耗时 '+data.seconds+' 秒';showStatus('回答测试完成')}catch(e){$('aiTestAnswer').value='请求失败：'+e.message;showStatus('回答测试失败',true)}finally{$('askAi').disabled=false;refreshPromptPreview()}};
 $('warmTranslation').onclick=async()=>{$('warmTranslation').disabled=true;showStatus('正在下载并预热本地翻译模型，首次可能需要几分钟…');try{const r=await fetch('/api/translate/warmup',{method:'POST'}),data=await r.json();if(!r.ok)throw Error(data.detail||r.status);await refreshTranslationStatus();showStatus(`翻译模型已就绪：${data.translation}（${data.latencyMs} ms）`)}catch(e){showStatus('翻译模型加载失败：'+e.message,true)}finally{$('warmTranslation').disabled=false}};
 $('toggleKey').onclick=()=>{const input=$('apiKey');input.type=input.type==='password'?'text':'password';$('toggleKey').textContent=input.type==='password'?'显示':'隐藏'};
@@ -203,8 +262,7 @@ $('saveVision').onclick=async()=>{$('saveVision').disabled=true;showStatus('正�
     if($('clearVisionRequested'))payload.clearVisionApiKey=true;
     const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     if(!r.ok)throw Error((await r.json()).detail||r.status);
-    $('visionApiKey').value='';await refreshVisionStatus();showStatus('视觉模型配置已保存');
-  }catch(e){showStatus('保存失败：'+e.message,true)}finally{$('saveVision').disabled=false}};
+    $('visionApiKey').value='';await refreshVisionStatus();loadBuiltinPrompts();showStatus('视觉模型配置已保存');  }catch(e){showStatus('保存失败：'+e.message,true)}finally{$('saveVision').disabled=false}};
 let clearVisionRequested=false;
 $('clearVisionKey').onclick=()=>{clearVisionRequested=true;$('visionApiKey').value='';showStatus('保存后清除视觉模型 Key')};
 $('visionApiKey').addEventListener('input',()=>{clearVisionRequested=false});

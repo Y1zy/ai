@@ -20,6 +20,7 @@ from .recognizer import TranscriptionEngine
 from .recorder import session_recorder
 from .settings import (
     APP_DIR,
+    builtin_prompts,
     load_api_key,
     load_settings,
     public_settings,
@@ -365,6 +366,12 @@ def create_app(config: AppConfig) -> FastAPI:
     async def get_ai_prompt(request: Request) -> dict:
         require_local(request)
         return {"prompt": last_ai_prompt["prompt"] or None}
+
+    @app.get("/api/prompts/builtin")
+    async def get_builtin_prompts(request: Request) -> dict:
+        """系统内置提示词：字幕 AI 各模式模板 + 截图解题默认（设置页展示用）。"""
+        require_local(request)
+        return await asyncio.to_thread(builtin_prompts)
 
     @app.post("/api/ai/ask")
     async def ai_ask(request: Request, payload: dict) -> dict:

@@ -43,6 +43,7 @@ DEFAULTS: dict[str, Any] = {
     "aiSilenceSeconds": 0.6,
     "aiSystemPrompt": "",
     "aiOverridePrompt": "",
+    "aiBuiltInPrompt": "",
     "aiBaseUrl": "https://api.deepseek.com",
     "hotwordEnabled": True,
     "hotwordExtra": "",
@@ -161,7 +162,8 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
         result["frameMode"] = "hover"
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(result["frameColor"])):
         result["frameColor"] = "#7DBEFF"
-    for key in ("fontFamily", "screenName", "aiSystemPrompt", "aiOverridePrompt", "aiBaseUrl",
+    for key in ("fontFamily", "screenName", "aiSystemPrompt", "aiOverridePrompt", "aiBuiltInPrompt",
+                "aiBaseUrl",
                 "hotwordExtra", "solvePrompt", "webSocketUrl",
                 "visionBaseUrl", "visionModel"):
         result[key] = str(result[key] or DEFAULTS[key])
@@ -184,6 +186,80 @@ def public_settings() -> dict[str, Any]:
         "settings": load_settings(),
         "apiKeySet": bool(load_api_key()),
         "monitors": monitor_names(),
+    }
+
+
+# 与 C# OverlayApp.DeepSeekClient.PromptForMode 保持同源的内置提示词模板，
+# 供设置页查看系统自带的提示词（后端只读拼装，不参与实际请求）。
+_MODE_INSTRUCTIONS: dict[str, str] = {
+    "auto": "若内容中包含明确问题，直接回答；否则用一句话总结或解释重点。回答简洁，不复述全文；转写可能有少量错误，请结合上下文理解。",
+    "summary": "请用一句简洁中文总结这段语音的核心信息。",
+    "qa": "请识别语音中的问题并直接给出简洁、准确的中文回答。若没有问题，说明未检测到明确问题。",
+    "explain": "请用简洁中文解释这段语音涉及的概念或意图，不要复述全文。",
+    "translate": "请将这段中文转写准确翻译为自然、简洁的英文，只输出译文。",
+}
+_PERSONA_WITH_CONTEXT = (
+    "你是面试辅助助手。以下是候选人的真实背景资料，请基于这些经历来理解和回答问题，"
+    "必要时直接引用候选人的项目/技能/公司经历，让回答更贴合候选人实际，而不是泛泛而谈。"
+)
+_PERSONA_PLAIN = "你是实时字幕助手。"
+_NO_MARKDOWN_LINE = "直接输出纯文本，不要使用 Markdown 标记（如 **加粗**、# 标题、代码块围栏）。"
+
+
+def overlay_context_block() -> str:
+    """读取 C# Overlay 写入 config.json 的面试上下文（简历/JD/公司/附加背景）。"""
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
+    except (OSError, ValueError):
+        raw = {}
+    sections: list[str] = []
+    for key, label in (
+        ("resumeContext", "[Resume]"),
+        ("jdContext", "[JD]"),
+        ("targetCompany", "[Target Company]"),
+        ("extraContext", "[Extra Context]"),
+    ):
+        value = str(raw.get(key) or "").strip()
+        if value:
+            sections.append(label + "\n" + value)
+    return ("\n\n".join(sections) + "\n\n") if sections else ""
+
+
+def builtin_prompts() -> dict[str, Any]:
+    """系统内置提示词全集：字幕 AI 各处理模式模板 + 截图解题内置默认。"""
+    settings = load_settings()
+    context_block = overlay_context_block()
+    persona = _PERSONA_WITH_CONTEXT if context_block else _PERSONA_PLAIN
+    extra = str(settings.get("aiSystemPrompt") or "").strip()
+
+    modes: dict[str, str] = {}
+    for mode, instruction in _MODE_INSTRUCTIONS.items():
+        prompt = (
+            context_block
+            + "这是连续的面试转写内容。请结合前几轮上下文理解当前消息，并先默默修正明显的识别错误。\n"
+            + persona + "\n" + instruction
+            + "\n" + _NO_MARKDOWN_LINE
+        )
+        if extra:
+            prompt += "\n附加要求：" + extra
+        modes[mode] = prompt
+
+    override = str(settings.get("aiOverridePrompt") or "").strip()
+    override_prompt = ""
+    if override:
+        override_prompt = context_block + override
+        if extra:
+            override_prompt += "\n附加要求：" + extra
+
+    from .phone_share import SOLVE_PROMPT
+
+    return {
+        "contextBlock": context_block,
+        "modes": modes,
+        "overridePrompt": override_prompt or None,
+        "solveDefault": SOLVE_PROMPT,
+        "solveCustom": str(settings.get("solvePrompt") or "").strip() or None,
+        "aiBuiltInPrompt": str(settings.get("aiBuiltInPrompt") or ""),
     }
 
 
