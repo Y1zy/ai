@@ -312,6 +312,10 @@ namespace WasapiParaformerOverlay
         internal string VisionBaseUrl = "";
         internal string VisionModel = "";
         internal string SolvePrompt = "";
+        // 热词纠正：由网页设置页写入，C# 不参与逻辑，但必须原样保留，
+        // 否则 Overlay 保存 config.json 时会把这两个键抹掉。
+        internal bool HotwordEnabled = true;
+        internal string HotwordExtra = "";
 
         internal static string ConfigPath
         {
@@ -386,6 +390,8 @@ namespace WasapiParaformerOverlay
                 if (data.ContainsKey("visionBaseUrl")) result.VisionBaseUrl = Convert.ToString(data["visionBaseUrl"]);
                 if (data.ContainsKey("visionModel")) result.VisionModel = Convert.ToString(data["visionModel"]);
                 if (data.ContainsKey("solvePrompt")) result.SolvePrompt = Convert.ToString(data["solvePrompt"]);
+                if (data.ContainsKey("hotwordEnabled")) result.HotwordEnabled = Convert.ToBoolean(data["hotwordEnabled"]);
+                if (data.ContainsKey("hotwordExtra")) result.HotwordExtra = Convert.ToString(data["hotwordExtra"]);
             }
             catch { }
             result.Normalize();
@@ -431,6 +437,8 @@ namespace WasapiParaformerOverlay
             data["visionBaseUrl"] = VisionBaseUrl;
             data["visionModel"] = VisionModel;
             data["solvePrompt"] = SolvePrompt;
+            data["hotwordEnabled"] = HotwordEnabled;
+            data["hotwordExtra"] = HotwordExtra;
             string directory = Path.GetDirectoryName(ConfigPath);
             Directory.CreateDirectory(directory);
             string temporary = ConfigPath + ".tmp";
@@ -482,6 +490,8 @@ namespace WasapiParaformerOverlay
             VisionBaseUrl = other.VisionBaseUrl;
             VisionModel = other.VisionModel;
             SolvePrompt = other.SolvePrompt;
+            HotwordEnabled = other.HotwordEnabled;
+            HotwordExtra = other.HotwordExtra;
             Normalize();
         }
     }
@@ -3828,6 +3838,8 @@ namespace WasapiParaformerOverlay
             if (!Same(local.VisionBaseUrl, baseline.VisionBaseUrl)) merged.VisionBaseUrl = local.VisionBaseUrl;
             if (!Same(local.VisionModel, baseline.VisionModel)) merged.VisionModel = local.VisionModel;
             if (!Same(local.SolvePrompt, baseline.SolvePrompt)) merged.SolvePrompt = local.SolvePrompt;
+            if (local.HotwordEnabled != baseline.HotwordEnabled) merged.HotwordEnabled = local.HotwordEnabled;
+            if (!Same(local.HotwordExtra, baseline.HotwordExtra)) merged.HotwordExtra = local.HotwordExtra;
             config.ApplyFrom(merged);
         }
 
