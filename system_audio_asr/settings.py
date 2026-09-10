@@ -51,6 +51,13 @@ DEFAULTS: dict[str, Any] = {
     "visionEnabled": False,
     "visionBaseUrl": "",
     "visionModel": "",
+    # C# Overlay 写入的面试上下文与采集开关：必须纳入 DEFAULTS，
+    # 否则网页设置保存时会把这些键从 config.json 整体抹掉。
+    "resumeContext": "",
+    "jdContext": "",
+    "targetCompany": "",
+    "extraContext": "",
+    "captureInvisible": True,
 }
 
 
@@ -165,10 +172,12 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
     for key in ("fontFamily", "screenName", "aiSystemPrompt", "aiOverridePrompt", "aiBuiltInPrompt",
                 "aiBaseUrl",
                 "hotwordExtra", "solvePrompt", "webSocketUrl",
-                "visionBaseUrl", "visionModel"):
+                "visionBaseUrl", "visionModel",
+                "resumeContext", "jdContext", "targetCompany", "extraContext"):
         result[key] = str(result[key] or DEFAULTS[key])
     result["visionEnabled"] = bool(result["visionEnabled"])
     result["hotwordEnabled"] = bool(result.get("hotwordEnabled", True))
+    result["captureInvisible"] = bool(result.get("captureInvisible", True))
     return result
 
 
@@ -297,8 +306,9 @@ def monitor_names() -> list[str]:
     return [name for _primary, name in sorted(monitors, key=lambda item: (not item[0], item[1]))]
 
 
-def update_from_web(payload: dict[str, Any]) -> dict[str, Any]:
-    current = load_settings(strict=True)
+def update_from_web(payload: dict[str, Any], *, path: Path | None = None) -> dict[str, Any]:
+    target = path or CONFIG_PATH
+    current = load_settings(target, strict=True)
     supplied = payload.get("settings", payload)
     if isinstance(supplied, dict):
         current.update({key: value for key, value in supplied.items() if key in DEFAULTS})
@@ -316,7 +326,7 @@ def update_from_web(payload: dict[str, Any]) -> dict[str, Any]:
         from .phone_share import save_vision_key
 
         save_vision_key("")
-    return save_settings(current)
+    return save_settings(current, target)
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):

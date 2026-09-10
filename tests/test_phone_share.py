@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,7 @@ def test_solve_engine_streams_and_throttles(monkeypatch):
         "model": "test-vision",
         "resume": "简历",
         "jd": "",
+        "prompt": phone_share.SOLVE_PROMPT,
     })
     monkeypatch.setattr(phone_share, "load_vision_key", lambda: "vk-123")
 
@@ -176,6 +178,9 @@ def test_solve_engine_streams_and_throttles(monkeypatch):
             return FakeResponse(sse_lines)
 
     monkeypatch.setattr("httpx.Client", FakeClient)
+    monkeypatch.setattr(
+        "system_audio_asr.settings.validate_public_http_url", lambda url: url
+    )  # 跳过 SSRF 校验：vision.example 无法解析 DNS
     monkeypatch.setattr(phone_share.time, "monotonic", lambda: 1e9)  # 时间冻结 → 每次都攒住，由 force 落盘
     engine.on_delta = lambda text, done: events.append((text, done))
     engine.solve(b"\xff\xd8fake")
@@ -192,6 +197,7 @@ def test_solve_engine_rejects_when_disabled(monkeypatch):
     events: list[tuple[str, bool]] = []
     monkeypatch.setattr(phone_share, "load_vision_config", lambda: {
         "enabled": False, "baseUrl": "", "model": "", "resume": "", "jd": "",
+        "prompt": phone_share.SOLVE_PROMPT,
     })
     engine.on_delta = lambda text, done: events.append((text, done))
     engine.solve(b"\xff\xd8fake")
