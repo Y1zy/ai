@@ -440,6 +440,11 @@ namespace WasapiParaformerOverlay
             else File.Move(temporary, ConfigPath);
         }
 
+        internal OverlayConfig Clone()
+        {
+            return (OverlayConfig)MemberwiseClone();
+        }
+
         internal void ApplyFrom(OverlayConfig other)
         {
             Left = other.Left;
@@ -481,19 +486,25 @@ namespace WasapiParaformerOverlay
         }
     }
 
-    internal static class SecretStore
+    /// <summary>
+    /// DPAPI(CurrentUser) 加密的 API Key 存储。Entropy 与文件名由子类给出；
+    /// DeepSeek / Vision 两个 Key 只差这两项，故共用同一套读写实现。
+    /// </summary>
+    internal abstract class ApiKeyStore
     {
-        private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("WasapiParaformerOverlay.DeepSeek.v1");
-        internal static string KeyPath
+        protected abstract byte[] Entropy { get; }
+        protected abstract string FileName { get; }
+
+        internal string KeyPath
         {
             get
             {
                 string directory = Path.GetDirectoryName(OverlayConfig.ConfigPath);
-                return Path.Combine(directory, "deepseek.key");
+                return Path.Combine(directory, FileName);
             }
         }
 
-        internal static void SaveApiKey(string apiKey)
+        internal void SaveApiKey(string apiKey)
         {
             string directory = Path.GetDirectoryName(KeyPath);
             Directory.CreateDirectory(directory);
@@ -503,70 +514,68 @@ namespace WasapiParaformerOverlay
                 return;
             }
             byte[] clear = Encoding.UTF8.GetBytes(apiKey.Trim());
-            byte[] encrypted = ProtectedData.Protect(clear, Entropy, DataProtectionScope.CurrentUser);
-            File.WriteAllBytes(KeyPath, encrypted);
-            Array.Clear(clear, 0, clear.Length);
+            try
+            {
+                byte[] encrypted = ProtectedData.Protect(clear, Entropy, DataProtectionScope.CurrentUser);
+                File.WriteAllBytes(KeyPath, encrypted);
+            }
+            finally
+            {
+                Array.Clear(clear, 0, clear.Length);
+            }
         }
 
-        internal static string LoadApiKey()
+        internal string LoadApiKey()
         {
+            byte[] clear = null;
             try
             {
                 if (!File.Exists(KeyPath)) return "";
                 byte[] encrypted = File.ReadAllBytes(KeyPath);
-                byte[] clear = ProtectedData.Unprotect(encrypted, Entropy, DataProtectionScope.CurrentUser);
-                string value = Encoding.UTF8.GetString(clear);
-                Array.Clear(clear, 0, clear.Length);
-                return value;
+                clear = ProtectedData.Unprotect(encrypted, Entropy, DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(clear);
             }
             catch { return ""; }
+            finally
+            {
+                if (clear != null) Array.Clear(clear, 0, clear.Length);
+            }
         }
 
-        internal static bool HasApiKey { get { return LoadApiKey().Length > 0; } }
+        internal bool HasApiKey { get { return LoadApiKey().Length > 0; } }
+    }
+
+    internal sealed class DeepSeekKeyStore : ApiKeyStore
+    {
+        private static readonly byte[] EntropyBytes = Encoding.UTF8.GetBytes("WasapiParaformerOverlay.DeepSeek.v1");
+        protected override byte[] Entropy { get { return EntropyBytes; } }
+        protected override string FileName { get { return "deepseek.key"; } }
+    }
+
+    internal sealed class VisionKeyStore : ApiKeyStore
+    {
+        private static readonly byte[] EntropyBytes = Encoding.UTF8.GetBytes("WasapiParaformerOverlay.Vision.v1");
+        protected override byte[] Entropy { get { return EntropyBytes; } }
+        protected override string FileName { get { return "vision.key"; } }
+    }
+
+    // 静态门面：保留原有调用点 SecretStore.X() / VisionSecretStore.X() 不变。
+    internal static class SecretStore
+    {
+        private static readonly DeepSeekKeyStore Store = new DeepSeekKeyStore();
+        internal static string KeyPath { get { return Store.KeyPath; } }
+        internal static void SaveApiKey(string apiKey) { Store.SaveApiKey(apiKey); }
+        internal static string LoadApiKey() { return Store.LoadApiKey(); }
+        internal static bool HasApiKey { get { return Store.HasApiKey; } }
     }
 
     internal static class VisionSecretStore
     {
-        private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("WasapiParaformerOverlay.Vision.v1");
-        internal static string KeyPath
-        {
-            get
-            {
-                string directory = Path.GetDirectoryName(OverlayConfig.ConfigPath);
-                return Path.Combine(directory, "vision.key");
-            }
-        }
-
-        internal static void SaveApiKey(string apiKey)
-        {
-            string directory = Path.GetDirectoryName(KeyPath);
-            Directory.CreateDirectory(directory);
-            if (string.IsNullOrWhiteSpace(apiKey))
-            {
-                if (File.Exists(KeyPath)) File.Delete(KeyPath);
-                return;
-            }
-            byte[] clear = Encoding.UTF8.GetBytes(apiKey.Trim());
-            byte[] encrypted = ProtectedData.Protect(clear, Entropy, DataProtectionScope.CurrentUser);
-            File.WriteAllBytes(KeyPath, encrypted);
-            Array.Clear(clear, 0, clear.Length);
-        }
-
-        internal static string LoadApiKey()
-        {
-            try
-            {
-                if (!File.Exists(KeyPath)) return "";
-                byte[] encrypted = File.ReadAllBytes(KeyPath);
-                byte[] clear = ProtectedData.Unprotect(encrypted, Entropy, DataProtectionScope.CurrentUser);
-                string value = Encoding.UTF8.GetString(clear);
-                Array.Clear(clear, 0, clear.Length);
-                return value;
-            }
-            catch { return ""; }
-        }
-
-        internal static bool HasApiKey { get { return LoadApiKey().Length > 0; } }
+        private static readonly VisionKeyStore Store = new VisionKeyStore();
+        internal static string KeyPath { get { return Store.KeyPath; } }
+        internal static void SaveApiKey(string apiKey) { Store.SaveApiKey(apiKey); }
+        internal static string LoadApiKey() { return Store.LoadApiKey(); }
+        internal static bool HasApiKey { get { return Store.HasApiKey; } }
     }
 
     internal static class PhoneAiFeed
@@ -2075,6 +2084,8 @@ namespace WasapiParaformerOverlay
         private string lastFinalText = "";
         private CancellationTokenSource aiRequestCancellation;
         private DateTime configLastWrite = DateTime.MinValue;
+        // 上次同步到磁盘的配置快照：用于 SaveConfig 的三方合并，避免覆盖网页端刚保存的设置。
+        private OverlayConfig lastSyncedConfig;
         private int hoverMisses;
         private bool applyingGeometry;
         private bool manualResizing;
@@ -2250,6 +2261,7 @@ namespace WasapiParaformerOverlay
                 configLastWrite = File.Exists(OverlayConfig.ConfigPath)
                     ? File.GetLastWriteTimeUtc(OverlayConfig.ConfigPath)
                     : DateTime.MinValue;
+                lastSyncedConfig = config.Clone();
                 configTimer.Start();
                 hoverTimer.Start();
             };
@@ -3746,7 +3758,88 @@ namespace WasapiParaformerOverlay
         internal void SaveConfig()
         {
             RememberPosition();
+            MergeExternalChangesBeforeSave();
             config.Save();
+            lastSyncedConfig = config.Clone();
+            try
+            {
+                configLastWrite = File.Exists(OverlayConfig.ConfigPath)
+                    ? File.GetLastWriteTimeUtc(OverlayConfig.ConfigPath)
+                    : DateTime.MinValue;
+            }
+            catch { }
+        }
+
+        // 三方合并：若磁盘配置在上次同步之后被别的进程（网页设置页）改过，
+        // 则对「本地未改动」的字段采用磁盘值，只保留本地真正改动的字段，
+        // 避免把网页端刚保存的设置用旧内存值覆盖掉（last-writer-wins 丢数据）。
+        private void MergeExternalChangesBeforeSave()
+        {
+            if (lastSyncedConfig == null)
+            {
+                lastSyncedConfig = config.Clone();
+                return;
+            }
+            OverlayConfig disk;
+            try
+            {
+                if (!File.Exists(OverlayConfig.ConfigPath)) return;
+                DateTime stamp = File.GetLastWriteTimeUtc(OverlayConfig.ConfigPath);
+                if (stamp <= configLastWrite) return;
+                disk = OverlayConfig.Load();
+            }
+            catch { return; }
+            OverlayConfig baseline = lastSyncedConfig;
+            OverlayConfig local = config.Clone();
+            OverlayConfig merged = disk.Clone();
+            // 逐字段：本地相对 baseline 有改动 → 以本地为准；否则采用磁盘值。
+            if (!Same(local.Left, baseline.Left)) merged.Left = local.Left;
+            if (!Same(local.Top, baseline.Top)) merged.Top = local.Top;
+            if (!Same(local.Width, baseline.Width)) merged.Width = local.Width;
+            if (!Same(local.Height, baseline.Height)) merged.Height = local.Height;
+            if (!Same(local.FontSize, baseline.FontSize)) merged.FontSize = local.FontSize;
+            if (local.MaxLines != baseline.MaxLines) merged.MaxLines = local.MaxLines;
+            if (!Same(local.Opacity, baseline.Opacity)) merged.Opacity = local.Opacity;
+            if (local.FadeDelayMs != baseline.FadeDelayMs) merged.FadeDelayMs = local.FadeDelayMs;
+            if (!Same(local.FrameOpacity, baseline.FrameOpacity)) merged.FrameOpacity = local.FrameOpacity;
+            if (local.Locked != baseline.Locked) merged.Locked = local.Locked;
+            if (local.CaptureInvisible != baseline.CaptureInvisible) merged.CaptureInvisible = local.CaptureInvisible;
+            if (local.LiveTranslateEnabled != baseline.LiveTranslateEnabled) merged.LiveTranslateEnabled = local.LiveTranslateEnabled;
+            if (local.AiEnabled != baseline.AiEnabled) merged.AiEnabled = local.AiEnabled;
+            if (local.VisionEnabled != baseline.VisionEnabled) merged.VisionEnabled = local.VisionEnabled;
+            if (!Same(local.AiSilenceSeconds, baseline.AiSilenceSeconds)) merged.AiSilenceSeconds = local.AiSilenceSeconds;
+            if (!Same(local.FontFamilyName, baseline.FontFamilyName)) merged.FontFamilyName = local.FontFamilyName;
+            if (!Same(local.TextColor, baseline.TextColor)) merged.TextColor = local.TextColor;
+            if (!Same(local.FrameMode, baseline.FrameMode)) merged.FrameMode = local.FrameMode;
+            if (!Same(local.FrameColor, baseline.FrameColor)) merged.FrameColor = local.FrameColor;
+            if (!Same(local.ScreenName, baseline.ScreenName)) merged.ScreenName = local.ScreenName;
+            if (!Same(local.WebSocketUrl, baseline.WebSocketUrl)) merged.WebSocketUrl = local.WebSocketUrl;
+            if (!Same(local.AsrLanguage, baseline.AsrLanguage)) merged.AsrLanguage = local.AsrLanguage;
+            if (!Same(local.AiModel, baseline.AiModel)) merged.AiModel = local.AiModel;
+            if (!Same(local.AiMode, baseline.AiMode)) merged.AiMode = local.AiMode;
+            if (!Same(local.AiSystemPrompt, baseline.AiSystemPrompt)) merged.AiSystemPrompt = local.AiSystemPrompt;
+            if (!Same(local.AiBaseUrl, baseline.AiBaseUrl)) merged.AiBaseUrl = local.AiBaseUrl;
+            if (!Same(local.AiOverridePrompt, baseline.AiOverridePrompt)) merged.AiOverridePrompt = local.AiOverridePrompt;
+            if (!Same(local.AiBuiltInPrompt, baseline.AiBuiltInPrompt)) merged.AiBuiltInPrompt = local.AiBuiltInPrompt;
+            if (!Same(local.ResumeContext, baseline.ResumeContext)) merged.ResumeContext = local.ResumeContext;
+            if (!Same(local.JdContext, baseline.JdContext)) merged.JdContext = local.JdContext;
+            if (!Same(local.TargetCompany, baseline.TargetCompany)) merged.TargetCompany = local.TargetCompany;
+            if (!Same(local.ExtraContext, baseline.ExtraContext)) merged.ExtraContext = local.ExtraContext;
+            if (!Same(local.VisionBaseUrl, baseline.VisionBaseUrl)) merged.VisionBaseUrl = local.VisionBaseUrl;
+            if (!Same(local.VisionModel, baseline.VisionModel)) merged.VisionModel = local.VisionModel;
+            if (!Same(local.SolvePrompt, baseline.SolvePrompt)) merged.SolvePrompt = local.SolvePrompt;
+            config.ApplyFrom(merged);
+        }
+
+        private static bool Same(double a, double b)
+        {
+            if (double.IsNaN(a) && double.IsNaN(b)) return true;
+            return a == b;
+        }
+
+        private static bool Same(string a, string b)
+        {
+            return string.Equals(a, b, StringComparison.Ordinal);
         }
 
         private void ReloadConfigIfChanged()
@@ -3761,6 +3854,7 @@ namespace WasapiParaformerOverlay
                 string oldScreen = config.ScreenName;
                 bool oldLiveTranslate = config.LiveTranslateEnabled;
                 config.ApplyFrom(fresh);
+                lastSyncedConfig = config.Clone();
                 if (!editMode && hwnd != IntPtr.Zero)
                     NativeMethods.SetNormalInteraction(hwnd, config.Locked);
                 lockIndicator.UpdateState(config.Locked);

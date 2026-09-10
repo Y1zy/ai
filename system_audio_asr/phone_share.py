@@ -293,7 +293,8 @@ def load_vision_key(path: Path | None = None) -> str:
     target = path or VISION_KEY_PATH
     try:
         return _dpapi_unprotect(target.read_bytes(), VISION_ENTROPY)
-    except (OSError, ValueError, Exception):
+    except Exception:
+        # 读取失败（文件缺失/损坏/DPAPI 解密异常）一律视为未配置。
         return ""
 
 
@@ -485,15 +486,30 @@ class ClipboardWatcher:
         self._stop.set()
 
     def accept_from_phone(self, text: str) -> bool:
-        """手机推送的文本写入电脑剪贴板；记录来源防止回环广播。"""
+        """手机推送的文本写入电脑剪贴板；记录来源防止回环广播。
+
+        先取当前序列号再做写入：若在写入瞬间其它程序也改了剪贴板，其序列号
+        一定晚于这里记录的值，poll_once 仍能把它当作真实更新推送出去，不会
+        因「先写后读」而把它误认成本次写入。
+        """
         self._last_pushed_from_phone = text
+        try:
+            before = clipboard_sequence()
+        except Exception:
+            before = None
         ok = False
         try:
             ok = set_clipboard_text(text)
         except Exception:
             ok = False
         if ok:
-            self._last_sequence = clipboard_sequence()
+            if before is not None:
+                self._last_sequence = before
+            else:
+                try:
+                    self._last_sequence = clipboard_sequence()
+                except Exception:
+                    pass
             self._last_text = text
             if self.relay is not None:
                 self.relay.latest_clipboard_text = text
@@ -546,6 +562,17 @@ class PhoneRelay:
         # 手机端追问上下文：最近的问答对（user/assistant 交替，上限 12 条）。
         self.phone_chat_history: list[dict] = []
         self._chat_lock = threading.Lock()
+        # 持有后台 task 的强引用，避免事件循环仅弱引用导致高负载下被 GC 回收。
+        self._tasks: set[asyncio.Task] = set()
+
+    def _spawn(self, coro: Any) -> None:
+        """在运行中的事件循环里创建后台 task，并保留强引用直到完成。"""
+        try:
+            task = asyncio.ensure_future(coro)
+        except RuntimeError:
+            return  # 事件循环已关闭：丢弃协程，避免告警
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     def _on_solve_delta(self, text: str, done: bool) -> None:
         self.schedule_json({"type": "ai", "text": text, "done": done, "source": "solve"})
@@ -557,9 +584,12 @@ class PhoneRelay:
                 pass
 
     def request_solve(self) -> bool:
-        """触发一次截图解题；返回 False 表示引擎未启用或正在进行。"""
+        """触发一次截图解题；返回 False 表示引擎未启用或正在进行。
+
+        注意：busy 分支不发提示——并发竞争由 SolveEngine.solve() 内部的
+        非阻塞加锁兜底并统一发出一次提示，避免此处与 solve() 重复提示。
+        """
         if self.solve_engine.busy:
-            self._on_solve_delta("上一个解题请求还在进行中，请稍候", True)
             return False
         try:
             jpeg = capture_screen_jpeg()
@@ -577,26 +607,28 @@ class PhoneRelay:
     def _drain_bytes_threadsafe(self, data: bytes) -> None:
         if not self._phones:
             return
-        loop = self._running_loop()
-        if loop is None:
-            return
-        loop.call_soon_threadsafe(self._drain_bytes, data)
+        self._call_soon_threadsafe(self._drain_bytes, data)
 
     def bind_loop(self) -> None:
         self._loop = asyncio.get_running_loop()
 
     async def handle(self, websocket: Any, sid: str, token: str) -> None:
         config = load_phone_config()
-        if (
-            not config["enabled"]
-            or not sid
-            or sid != config["sid"]
-            or not token
-            or token != config["token"]
-        ):
+        expected_sid = str(config.get("sid") or "")
+        expected_token = str(config.get("token") or "")
+        # 常量时间比较；用 UTF-8 字节避免 compare_digest 对非 ASCII 字符串抛 TypeError。
+        sid_ok = bool(sid) and secrets.compare_digest(sid.encode("utf-8"), expected_sid.encode("utf-8"))
+        token_ok = bool(token) and secrets.compare_digest(token.encode("utf-8"), expected_token.encode("utf-8"))
+        if not config["enabled"] or not sid_ok or not token_ok:
             await websocket.close(code=4401)
             return
         await websocket.accept()
+        # 确保已知当前事件循环：lifespan 之外的调用路径（如测试/嵌入）也能正常推送。
+        if self._loop is None:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
         self._phones.add(websocket)
         try:
             await websocket.send_json({"type": "hello", "sid": sid})
@@ -620,13 +652,13 @@ class PhoneRelay:
                     continue
                 kind = str(payload.get("type", ""))
                 if kind == "trigger":
-                    asyncio.ensure_future(self._capture_and_push())
+                    self._spawn(self._capture_and_push())
                 elif kind == "solve":
-                    asyncio.ensure_future(self._handle_solve())
+                    self._spawn(self._handle_solve())
                 elif kind == "ask":
                     phone_text = str(payload.get("text", ""))[:4000]
                     if phone_text:
-                        asyncio.ensure_future(self._handle_ask(phone_text))
+                        self._spawn(self._handle_ask(phone_text))
                 elif kind == "clear_chat":
                     with self._chat_lock:
                         self.phone_chat_history.clear()
@@ -636,7 +668,7 @@ class PhoneRelay:
                 elif kind == "clipboard":
                     phone_text = str(payload.get("text", ""))[:MAX_CLIPBOARD_CHARS]
                     if phone_text:
-                        asyncio.ensure_future(self._handle_clipboard(phone_text))
+                        self._spawn(self._handle_clipboard(phone_text))
         except Exception:
             pass
         finally:
@@ -697,10 +729,7 @@ class PhoneRelay:
         if not self._phones:
             return
         message = json.dumps(payload, ensure_ascii=False)
-        loop = self._running_loop()
-        if loop is None:
-            return
-        loop.call_soon_threadsafe(self._drain_json, message)
+        self._call_soon_threadsafe(self._drain_json, message)
 
     def _running_loop(self) -> asyncio.AbstractEventLoop | None:
         if self._loop is not None:
@@ -710,13 +739,23 @@ class PhoneRelay:
         except RuntimeError:
             return None
 
+    def _call_soon_threadsafe(self, callback: Any, *args: Any) -> None:
+        """从引擎线程投递回调；事件循环关闭阶段容忍 RuntimeError（服务正在退出）。"""
+        loop = self._running_loop()
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(callback, *args)
+        except RuntimeError:
+            pass
+
     def _drain_json(self, message: str) -> None:
         for websocket in tuple(self._phones):
-            asyncio.ensure_future(self._safe_send_text(websocket, message))
+            self._spawn(self._safe_send_text(websocket, message))
 
     def _drain_bytes(self, data: bytes) -> None:
         for websocket in tuple(self._phones):
-            asyncio.ensure_future(self._safe_send_bytes(websocket, data))
+            self._spawn(self._safe_send_bytes(websocket, data))
 
     async def _safe_send_text(self, websocket: Any, message: str) -> None:
         try:
@@ -746,7 +785,7 @@ class PhoneRelay:
                 await self._capture_and_push()
                 await asyncio.sleep(interval)
 
-        asyncio.ensure_future(auto_loop())
+        self._spawn(auto_loop())
 
     async def _capture_and_push(self) -> None:
         try:
@@ -758,6 +797,4 @@ class PhoneRelay:
             return
         self._latest_jpeg = jpeg
         if self._phones:
-            loop = self._running_loop()
-            if loop is not None:
-                loop.call_soon_threadsafe(self._drain_bytes, jpeg)
+            self._call_soon_threadsafe(self._drain_bytes, jpeg)

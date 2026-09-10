@@ -142,7 +142,11 @@ class EventHub:
             elif event.get("type") == "error":
                 self.latest_error = payload
         if self.loop and self.queue:
-            self.loop.call_soon_threadsafe(self._enqueue, payload)
+            try:
+                self.loop.call_soon_threadsafe(self._enqueue, payload)
+            except RuntimeError:
+                # 事件循环已关闭（服务退出阶段）：丢弃该事件，避免把异常抛回引擎线程。
+                pass
 
     def _enqueue(self, payload: dict) -> None:
         assert self.queue is not None

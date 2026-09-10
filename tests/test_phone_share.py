@@ -323,6 +323,7 @@ class TestRelayEndpoints:
             "model": "test-vision",
             "resume": "",
             "jd": "",
+            "prompt": phone_share.SOLVE_PROMPT,
         })
         monkeypatch.setattr(phone_share, "load_vision_key", lambda: "vk-123")
 
@@ -358,6 +359,9 @@ class TestRelayEndpoints:
                 return FakeResponse()
 
         monkeypatch.setattr("httpx.Client", FakeClient)
+        monkeypatch.setattr(
+            "system_audio_asr.settings.validate_public_http_url", lambda url: url
+        )  # 跳过 SSRF 校验：vision.example 无法解析 DNS
 
         config = phone_share.load_phone_config(phone_path)
         with client.websocket_connect(
