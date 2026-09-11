@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import os
 import threading
@@ -12,7 +14,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-from . import phone_share
+from . import knowledge, phone_share
 from .capture import list_speakers
 from .config import AppConfig
 from .phone_share import ClipboardWatcher, PhoneRelay
@@ -468,6 +470,86 @@ def create_app(config: AppConfig) -> FastAPI:
         require_local(request)
         session_recorder.clear()
         return {"ok": True}
+
+        # ---------------------------------------------------------------- 知识库
+    # 独立存 knowledge.json（不写 config.json）：C# Overlay 会整体重写 config.json，
+    # 混写会导致浮窗保存设置时知识库被抹掉。
+    @app.get("/api/knowledge")
+    async def knowledge_list(request: Request) -> dict:
+        require_local(request)
+        return {"entries": knowledge.public_entries()}
+
+    @app.post("/api/knowledge/save")
+    async def knowledge_save(request: Request, payload: dict) -> dict:
+        require_local(request)
+        entry = payload.get("entry")
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=400, detail="缺少 entry 参数")
+        current = knowledge.load_entries()
+        entry_id = str(entry.get("id") or "").strip()
+        if not entry_id and len(current) >= knowledge.MAX_ENTRIES:
+            raise HTTPException(status_code=400, detail=f"知识库最多 {knowledge.MAX_ENTRIES} 条")
+        try:
+            saved = await asyncio.to_thread(knowledge.upsert_entry, entry)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"保存失败：{exc}") from exc
+        return {"ok": True, "entry": saved, "entries": knowledge.public_entries()}
+
+    @app.post("/api/knowledge/delete")
+    async def knowledge_delete(request: Request, payload: dict) -> dict:
+        require_local(request)
+        entry_id = str(payload.get("id") or "").strip()
+        if not entry_id:
+            raise HTTPException(status_code=400, detail="缺少 id 参数")
+        await asyncio.to_thread(knowledge.delete_entry, entry_id)
+        return {"ok": True, "entries": knowledge.public_entries()}
+
+    @app.post("/api/knowledge/clear")
+    async def knowledge_clear(request: Request) -> dict:
+        require_local(request)
+        await asyncio.to_thread(knowledge.clear_entries)
+        return {"ok": True, "entries": []}
+
+    @app.post("/api/knowledge/upload")
+    async def knowledge_upload(request: Request, payload: dict) -> dict:
+        """解析上传文档为纯文本（前端先 base64 编码），不落盘原文件。"""
+        require_local(request)
+        
+
+        filename = str(payload.get("filename") or "")[:200]
+        encoded = payload.get("data")
+        if not isinstance(encoded, str) or not encoded:
+            raise HTTPException(status_code=400, detail="缺少文件内容")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise HTTPException(status_code=400, detail="文件内容不是合法的 base64") from exc
+        # 上传体积上限：知识库条目本身也受 MAX_CONTENT_CHARS 约束
+        if len(raw) > 12 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="文件过大（上限 12 MB）")
+        try:
+            text = await asyncio.to_thread(knowledge.parse_document, raw, filename)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        default_title = Path(filename).stem[:knowledge.MAX_TITLE_CHARS] or "导入的资料"
+        return {"ok": True, "title": default_title, "text": text, "chars": len(text)}
+
+    @app.post("/api/knowledge/import-legacy")
+    async def knowledge_import_legacy(request: Request) -> dict:
+        """把旧的 extraContext 单字段导入为一条知识库条目（不删除原字段）。"""
+        require_local(request)
+        settings = load_settings()
+        legacy = str(settings.get("extraContext") or "").strip()
+        if not legacy:
+            raise HTTPException(status_code=400, detail="没有可导入的附加背景内容")
+        existing = knowledge.load_entries()
+        if any(item.get("title") == "附加背景（旧）" for item in existing):
+            raise HTTPException(status_code=400, detail="已导入过，请勿重复操作")
+        saved = await asyncio.to_thread(
+            knowledge.upsert_entry,
+            {"title": "附加背景（旧）", "content": legacy, "enabled": True},
+        )
+        return {"ok": True, "entry": saved, "entries": knowledge.public_entries()}
 
     @app.post("/api/phone/solve")
     async def phone_solve(request: Request) -> dict:

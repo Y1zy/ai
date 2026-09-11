@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import ctypes
 import http.client
@@ -215,13 +215,22 @@ _PERSONA_PLAIN = "你是实时字幕助手。"
 _NO_MARKDOWN_LINE = "直接输出纯文本，不要使用 Markdown 标记（如 **加粗**、# 标题、代码块围栏）。"
 
 
+# 面试上下文总长度上限：简历 + JD + 附加背景 + 知识库合计，防止撑爆模型上下文窗口
+_CONTEXT_TOTAL_LIMIT = 32000
+
+
 def overlay_context_block() -> str:
-    """读取 C# Overlay 写入 config.json 的面试上下文（简历/JD/公司/附加背景）。"""
+    """读取面试上下文（简历/JD/公司/附加背景）并追加知识库条目。
+
+    组成顺序：config.json 的四个字段在前（保持既有行为），知识库追加在后。
+    总长度统一截断，避免用户填充大量资料后请求因超长而失败。
+    """
     try:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
     except (OSError, ValueError):
         raw = {}
     sections: list[str] = []
+    used = 0
     for key, label in (
         ("resumeContext", "[Resume]"),
         ("jdContext", "[JD]"),
@@ -229,8 +238,26 @@ def overlay_context_block() -> str:
         ("extraContext", "[Extra Context]"),
     ):
         value = str(raw.get(key) or "").strip()
-        if value:
-            sections.append(label + "\n" + value)
+        if not value:
+            continue
+        block = label + "\n" + value
+        if used + len(block) > _CONTEXT_TOTAL_LIMIT:
+            break
+        sections.append(block)
+        used += len(block)
+
+    # 知识库：独立文件，仅取启用条目；剩余额度不足时按条目顺序截断
+    remaining = _CONTEXT_TOTAL_LIMIT - used
+    if remaining > 0:
+        from .knowledge import build_context_block
+
+        try:
+            knowledge_block = build_context_block(limit=remaining).strip()
+        except Exception:
+            knowledge_block = ""
+        if knowledge_block:
+            sections.append(knowledge_block)
+
     return ("\n\n".join(sections) + "\n\n") if sections else ""
 
 

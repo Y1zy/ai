@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import queue
@@ -16,68 +16,125 @@ from .segmenter import AudioPacket, SpeechSegmenter, merge_stream_text
 from .settings import load_settings
 
 
-_HOTWORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#.\-]{1,30}")
-_MAX_HOTWORDS = 80
+# 英文技术词：字母开头，允许 C++/C#/.NET/Node.js 这类符号
+_EN_HOTWORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#.\-]{1,30}")
+# 中文热词：连续 2-12 个汉字（项目代号、岗位术语、公司名等）
+_ZH_HOTWORD_RE = re.compile(r"[\u4e00-\u9fa5]{2,12}")
+# 热词表总上限：Paraformer 把热词拼成一整串送入，过长反而拉低识别率
+_MAX_HOTWORDS = 120
+_MAX_ZH_HOTWORDS = 40
 
-# 内置基础热词：C++ / Qt 技术栈（面试高频，简历为空时兜底）
+# 仅用于「简历/手动词全都为空」时的兜底，保持精简通用；
+# 方向性强的大词表交给用户简历自动提取，避免干扰非技术岗识别。
 _BASE_HOTWORDS: list[str] = [
-    # C++ 核心
-    "C++", "C++11", "C++14", "C++17", "C++20", "C++23",
-    "STL", "template", "RAII", "smart pointer", "unique_ptr", "shared_ptr",
-    "move semantics", "rvalue", "lambda", "constexpr", "decltype",
-    "virtual", "vtable", "RTTI", "multiple inheritance", "diamond problem",
-    "memory alignment", "cache line", "false sharing", "memory order",
-    "atomic", "mutex", "condition variable", "thread pool", "coroutine",
-    # Qt 核心
-    "Qt", "Qt5", "Qt6", "QWidget", "QML", "QObject", "signal", "slot",
-    "moc", "meta object", "property", "event loop", "QThread",
-    "QTimer", "QMutex", "QWaitCondition", "QSemaphore",
-    "QNetworkAccessManager", "QHttp", "QWebSocket",
-    "QSqlDatabase", "QSqlQuery", "QTableView", "QStandardItemModel",
-    "QOpenGLWidget", "QGraphicsView", "QQuickItem",
-    "qmake", "CMake", "qrc", "ui file",
-    # 常见搭配
-    "signal slot mechanism", "event driven", "cross platform",
-    "desktop application", "embedded", "real time",
+    "Redis", "Kafka", "MySQL", "Docker", "Kubernetes", "Linux",
+    "CTF", "QPS", "TPS", "SLA", "CI", "CD", "API", "SDK",
+    "C++", "Java", "Python", "Golang", "Rust", "SQL",
+    "STL", "RAII", "lambda", "atomic", "mutex", "thread pool",
+    "微服务", "分布式", "高并发", "负载均衡", "消息队列",
 ]
+
+# 提取热词时的文本来源（简历/JD/公司/附加背景）
+_CONTEXT_KEYS = ("resumeContext", "jdContext", "targetCompany", "extraContext")
+
+# 简历/JD 里高频出现但不构成「技术词」的中文词：进热词表只会干扰识别
+_ZH_STOPWORDS: frozenset[str] = frozenset({
+    "熟悉", "熟练", "精通", "了解", "掌握", "负责", "参与", "主导", "完成", "实现",
+    "开发", "设计", "优化", "维护", "搭建", "支持", "使用", "基于", "具备", "拥有",
+    "良好", "优秀", "丰富", "相关", "经验", "能力", "团队", "沟通", "协作", "学习",
+    "本科", "硕士", "博士", "毕业", "专业", "大学", "公司", "岗位", "职位", "工作",
+    "项目", "需求", "业务", "系统", "平台", "功能", "模块", "接口", "数据", "服务",
+    "以及", "并且", "能够", "可以", "需要", "要求", "以下", "以上", "负责相关工作",
+    "任职", "职责", "加分", "优先", "者优先", "年以上", "及其", "等等", "其他",
+})
+
+
+def _is_meaningful_zh(word: str) -> bool:
+    """过滤无意义中文词：停用词、纯数字、以及短于 2 字的片段。"""
+    if len(word) < 2 or word in _ZH_STOPWORDS:
+        return False
+    if word.isdigit():
+        return False
+    return True
+
+# 手动补充热词的分隔符：换行、中英文逗号、顿号、分号、竖线、制表符
+_HOTWORD_SPLIT_RE = re.compile(r"[\r\n,，、;；|\t]+")
+
+
+def _split_manual_hotwords(text: str) -> list[str]:
+    """切分手动补充热词。
+
+    中文词之间没有天然空格，因此以换行/逗号/顿号/分号等显式分隔符为准；
+    空格仅在「两侧都不是汉字」时才作为分隔符，避免把「分布式 缓存」之外的
+    中文短语误切（如「高并发 场景」会被切成一个短语而不是两个词的中间态）。
+    """
+    if not text.strip():
+        return []
+    parts: list[str] = []
+    for chunk in _HOTWORD_SPLIT_RE.split(text):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if re.search(r"[\u4e00-\u9fa5]", chunk):
+            # 中文片段整体保留，不按空格再切，防止破坏词组
+            parts.append(chunk)
+        else:
+            parts.extend(piece for piece in chunk.split() if piece)
+    return parts
 
 
 def _extract_hotwords(settings: dict) -> list[str]:
-    """从简历/JD/公司/附加背景里提取英文技术词作为热词表。"""
-    parts = [
-        str(settings.get("resumeContext") or ""),
-        str(settings.get("jdContext") or ""),
-        str(settings.get("targetCompany") or ""),
-        str(settings.get("extraContext") or ""),
-        str(settings.get("hotwordExtra") or ""),
-    ]
+    """从简历/JD/公司/附加背景中提取中英文技术词作为热词表。"""
     seen: set[str] = set()
     hotwords: list[str] = []
-    for text in parts:
-        for match in _HOTWORD_RE.findall(text):
+    zh_count = 0
+    for key in _CONTEXT_KEYS:
+        text = str(settings.get(key) or "")
+        if not text:
+            continue
+        for match in _EN_HOTWORD_RE.findall(text):
             word = match.strip()
-            if word and word not in seen:
+            lowered = word.lower()
+            if word and lowered not in seen and len(hotwords) < _MAX_HOTWORDS:
+                seen.add(lowered)
+                hotwords.append(word)
+        for match in _ZH_HOTWORD_RE.findall(text):
+            word = match.strip()
+            if not _is_meaningful_zh(word):
+                continue
+            if word not in seen and zh_count < _MAX_ZH_HOTWORDS:
                 seen.add(word)
                 hotwords.append(word)
-                if len(hotwords) >= _MAX_HOTWORDS:
-                    return hotwords
+                zh_count += 1
     return hotwords
 
 
 def _get_hotwords(settings: dict) -> list[str]:
-    """三层叠加热词：内置基础 + 简历提取 + 手动补充，去重后返回。"""
-    # ① 内置基础热词（兜底）
-    result: list[str] = list(_BASE_HOTWORDS)
-    seen: set[str] = {w.lower() for w in result}
+    """三层叠加热词：手动补充（最精准，优先） + 简历提取 + 内置兜底，去重后截断。"""
+    result: list[str] = []
+    seen: set[str] = set()
 
-    # ② 简历自动提取（精准）
-    for word in _extract_hotwords(settings):
-        if word.lower() not in seen:
+    def push(word: str, *, is_zh: bool = False) -> None:
+        key = word.lower() if not is_zh else word
+        if key and key not in seen and len(result) < _MAX_HOTWORDS:
+            seen.add(key)
             result.append(word)
-            seen.add(word.lower())
 
-    return result
+    # ① 手动补充：用户显式指定，优先级最高，中英文都支持
+    for word in _split_manual_hotwords(str(settings.get("hotwordExtra") or "")):
+        is_zh = bool(re.search(r"[\u4e00-\u9fa5]", word))
+        push(word, is_zh=is_zh)
 
+    # ② 简历/JD 自动提取
+    for word in _extract_hotwords(settings):
+        is_zh = bool(re.search(r"[\u4e00-\u9fa5]", word))
+        push(word, is_zh=is_zh)
+
+    # ③ 内置兜底：仅当上面两层都没有产出时才使用，避免方向词干扰
+    if not result:
+        result.extend(_BASE_HOTWORDS)
+
+    return result[: _MAX_HOTWORDS]
 
 def choose_device(requested: str) -> str:
     if requested != "auto":

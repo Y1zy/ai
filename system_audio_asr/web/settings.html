@@ -70,7 +70,7 @@
       <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><h2>本地实时翻译</h2><span id="translationBadge" class="badge">未加载</span></div>
       <div class="row two"><label for="asrLanguage">识别语言</label><select id="asrLanguage"><option value="zh">中文 · Paraformer Streaming</option><option value="en">英文 · Faster-Whisper</option></select></div>
       <label class="switch"><input id="hotwordEnabled" type="checkbox" checked>启用热词纠正（从简历/JD 自动提取技术词，减少 Kafka→卡夫卡 等错误）</label>
-      <div class="row two"><label for="hotwordExtra">补充热词（每行一个，填中文项目代号也行）</label><div><textarea id="hotwordExtra" placeholder="如：雪球系统&#10;OceanBase"></textarea><div style="font-size:12px;margin-top:4px;color:#91a1b8" id="hotwordExtraState">当前为空 = 仅使用内置词库与简历/JD 自动提取</div></div></div>
+      <div class="row two"><label for="hotwordExtra">补充热词（中文也可以：每行一个或用逗号分隔）</label><div><textarea id="hotwordExtra" placeholder="如：雪球系统&#10;OceanBase"></textarea><div style="font-size:12px;margin-top:4px;color:#91a1b8" id="hotwordExtraState">当前为空 = 仅使用内置词库与简历/JD 自动提取</div></div></div>
       <label class="switch"><input id="liveTranslateEnabled" type="checkbox">启用英文 → 中文实时翻译（本地模型，不使用 DeepSeek）</label>
       <p class="hint">英文模式使用约 78 MB 的 Faster-Whisper 英文模型；每次 partial 再由本机 OPUS-MT 翻译，final 到达后稳定定稿。模型下载后可离线使用。原英文直接显示，中文结果标为“译文”。</p>
       <div style="display:flex;justify-content:flex-end"><button id="warmTranslation" type="button">下载并预热翻译模型</button></div>
@@ -142,6 +142,28 @@
       </div>
     </section>
   </div>
+    <section class="card wide">
+      <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><h2>🗂 知识库</h2><span id="kbBadge" class="badge">—</span></div>
+      <p class="hint">存话术、FAQ、公司资料、项目细节等。启用的条目会拼进 AI 系统提示词，答题时优先参考；资料越具体，回答越贴合你的真实经历。全部数据存在本机 <code>%LOCALAPPDATA%\WasapiParaformerOverlay\knowledge.json</code>，不上传服务器。</p>
+      <p class="hint" id="kbLegacyHint" style="display:none;color:#fbbf24"></p>
+      <div id="kbList" style="display:flex;flex-direction:column;gap:10px;margin:14px 0"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
+        <button id="kbAdd" type="button">＋ 新增条目</button>
+        <button id="kbUploadBtn" type="button">📄 上传文档</button>
+        <button id="kbImportLegacy" type="button" style="display:none">导入旧附加背景</button>
+        <button id="kbClear" class="danger" type="button">清空知识库</button>
+        <input id="kbFile" type="file" accept=".pdf,.docx,.txt,.md,.markdown" style="display:none">
+      </div>
+      <div id="kbEditor" style="display:none;margin-top:16px;padding-top:16px;border-top:1px solid var(--line)">
+        <div class="row two"><label for="kbTitle">标题</label><input id="kbTitle" type="text" placeholder="例如：自我介绍稿 / 为什么选我们公司" maxlength="80"></div>
+        <div class="row two"><label for="kbContent">内容</label><textarea id="kbContent" style="min-height:170px" placeholder="面试时 AI 会优先参考这里的说法"></textarea></div>
+        <div class="row two"><label>启用</label><label class="switch"><input id="kbEnabled" type="checkbox" checked>参与 AI 提示词（不勾选则仅保存不使用）</label></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button id="kbCancel" type="button">取消</button>
+          <button id="kbSave" class="primary" type="button">保存条目</button>
+        </div>
+      </div>
+    </section>
   <div class="actions"><span id="status">正在加载设置…</span><button id="save" class="primary" type="button">保存并应用</button></div>
 </main>
 <script>
@@ -315,6 +337,178 @@ $('recordsSave').onclick=async()=>{$('recordsSave').disabled=true;showStatus('�
 $('recordsOpen').onclick=async()=>{try{await fetch('/api/records/open',{method:'POST'})}catch(e){showStatus('打开失败：'+e.message,true)}};
 $('recordsClear').onclick=async()=>{if(!confirm('清空本场内存记录（不影响已保存的文件）？'))return;try{await fetch('/api/records/clear',{method:'POST'});showStatus('已清空本场内存记录');refreshRecords()}catch(e){showStatus('清空失败：'+e.message,true)}};
 load(); loadPhoneInfo(); refreshRecords();
+/* ---------------- 知识库 ---------------- */
+let kbEntries=[], kbEditingId=null;
+
+function kbRender(){
+  const list=$('kbList'); list.innerHTML='';
+  $('kbBadge').textContent=kbEntries.length?kbEntries.length+' 条 · 启用 '+kbEntries.filter(e=>e.enabled).length+' 条':'暂无条目';
+  $('kbBadge').className='badge '+(kbEntries.length?'ok':'');
+  if(!kbEntries.length){
+    const empty=document.createElement('div');
+    empty.className='hint'; empty.style.margin='0';
+    empty.textContent='还没有资料。建议先添加「自我介绍稿」和「简历之外的项目细节」。';
+    list.appendChild(empty); return;
+  }
+  kbEntries.forEach(function(entry){
+    const row=document.createElement('div');
+    row.style.cssText='display:flex;gap:10px;align-items:flex-start;padding:11px 13px;border:1px solid var(--line);border-radius:10px;background:#0d1524';
+    const left=document.createElement('div'); left.style.cssText='flex:1;min-width:0';
+    const title=document.createElement('div'); title.style.cssText='font-size:14px;color:#e8f1ff;margin-bottom:3px;word-break:break-all';
+    title.textContent=entry.title;
+    const meta=document.createElement('div'); meta.className='hint'; meta.style.margin='0';
+    meta.textContent=(entry.enabled?'✔ 已启用':'✘ 已停用')+' · '+entry.chars+' 字 · '+entry.content.replace(/\s+/g,' ').slice(0,60)+(entry.content.length>60?'…':'');
+    left.appendChild(title); left.appendChild(meta);
+    const actions=document.createElement('div'); actions.style.cssText='display:flex;gap:6px;flex-shrink:0';
+    const toggle=document.createElement('button'); toggle.type='button';
+    toggle.textContent=entry.enabled?'停用':'启用';
+    toggle.onclick=async function(){
+      toggle.disabled=true;
+      await kbSaveEntry({id:entry.id,title:entry.title,content:entry.content,enabled:!entry.enabled},false);
+    };
+    const edit=document.createElement('button'); edit.type='button'; edit.textContent='编辑';
+    edit.onclick=function(){ kbOpenEditor(entry); };
+    const del=document.createElement('button'); del.type='button'; del.className='danger'; del.textContent='删除';
+    del.onclick=async function(){
+      if(!confirm('删除条目「'+entry.title+'」？此操作不可撤销。')) return;
+      del.disabled=true;
+      try{
+        const r=await fetch('/api/knowledge/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:entry.id})});
+        const data=await r.json();
+        if(!r.ok) throw Error(data.detail||'删除失败');
+        kbEntries=data.entries||[]; kbRender(); kbRefreshLegacyHint();
+        showStatus('已删除条目');
+      }catch(err){ del.disabled=false; showStatus('删除失败：'+err.message,true); }
+    };
+    actions.appendChild(toggle); actions.appendChild(edit); actions.appendChild(del);
+    row.appendChild(left); row.appendChild(actions);
+    list.appendChild(row);
+  });
+}
+
+function kbOpenEditor(entry){
+  kbEditingId=entry?entry.id:null;
+  $('kbTitle').value=entry?entry.title:'';
+  $('kbContent').value=entry?entry.content:'';
+  $('kbEnabled').checked=entry?entry.enabled:true;
+  $('kbEditor').style.display='block';
+  $('kbEditor').scrollIntoView({behavior:'smooth',block:'center'});
+  $('kbTitle').focus();
+}
+
+function kbCloseEditor(){
+  kbEditingId=null;
+  $('kbEditor').style.display='none';
+  $('kbTitle').value=''; $('kbContent').value=''; $('kbEnabled').checked=true;
+}
+
+async function kbLoad(){
+  try{
+    const r=await fetch('/api/knowledge');
+    if(!r.ok) throw Error('HTTP '+r.status);
+    const data=await r.json();
+    kbEntries=data.entries||[];
+    kbRender();
+  }catch(err){
+    $('kbBadge').textContent='加载失败'; $('kbBadge').className='badge';
+  }
+  kbRefreshLegacyHint();
+}
+
+async function kbRefreshLegacyHint(){
+  /* 旧 extraContext 有内容时提示可导入，不自动迁移，避免用户数据被改动 */
+  try{
+    const r=await fetch('/api/settings');
+    if(!r.ok) return;
+    const data=await r.json();
+    const legacy=(data.settings&&data.settings.extraContext||'').trim();
+    const already=kbEntries.some(e=>e.title==='附加背景（旧）');
+    const hint=$('kbLegacyHint'), btn=$('kbImportLegacy');
+    if(legacy&&!already){
+      hint.style.display='block';
+      hint.textContent='检测到「附加背景」中还有 '+legacy.length+' 字内容。可以导入为知识库条目统一管理（不会删除原字段）。';
+      btn.style.display='inline-block';
+    }else{ hint.style.display='none'; btn.style.display='none'; }
+  }catch(err){}
+}
+
+
+async function kbSaveEntry(entry,closeEditor){
+  $('kbSave').disabled=true;
+  try{
+    const r=await fetch('/api/knowledge/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entry:entry})});
+    const data=await r.json();
+    if(!r.ok) throw Error(data.detail||'保存失败');
+    kbEntries=data.entries||[];
+    kbRender();
+    if(closeEditor) kbCloseEditor();
+    showStatus('知识库已保存');
+    return true;
+  }catch(err){ showStatus('保存失败：'+err.message,true); return false; }
+  finally{ $('kbSave').disabled=false; }
+}
+
+$('kbAdd').onclick=function(){ kbOpenEditor(null); };
+$('kbCancel').onclick=kbCloseEditor;
+$('kbSave').onclick=async function(){
+  const title=$('kbTitle').value.trim();
+  const content=$('kbContent').value.trim();
+  if(!content){ showStatus('内容不能为空',true); return; }
+  const payload={title:title||'未命名条目',content:content,enabled:$('kbEnabled').checked};
+  if(kbEditingId) payload.id=kbEditingId;
+  await kbSaveEntry(payload,true);
+};
+
+$('kbUploadBtn').onclick=function(){ $('kbFile').click(); };
+$('kbFile').onchange=async function(){
+  const file=$('kbFile').files&&$('kbFile').files[0];
+  if(!file) return;
+  if(file.size>12*1024*1024){ showStatus('文件过大（上限 12 MB）',true); $('kbFile').value=''; return; }
+  showStatus('正在解析 '+file.name+' …');
+  try{
+    const buffer=await file.arrayBuffer();
+    let binary=''; const bytes=new Uint8Array(buffer);
+    for(let i=0;i<bytes.length;i++) binary+=String.fromCharCode(bytes[i]);
+    const b64=btoa(binary);
+    const r=await fetch('/api/knowledge/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:file.name,data:b64})});
+    const data=await r.json();
+    if(!r.ok) throw Error(data.detail||'解析失败');
+    kbOpenEditor(null);
+    $('kbTitle').value=data.title||file.name;
+    $('kbContent').value=data.text||'';
+    showStatus('已解析 '+data.chars+' 字，确认后点「保存条目」');
+  }catch(err){ showStatus('解析失败：'+err.message,true); }
+  finally{ $('kbFile').value=''; }
+};
+
+$('kbImportLegacy').onclick=async function(){
+  if(!confirm('把当前「附加背景」内容导入为知识库条目？原字段会保留。')) return;
+  $('kbImportLegacy').disabled=true;
+  try{
+    const r=await fetch('/api/knowledge/import-legacy',{method:'POST'});
+    const data=await r.json();
+    if(!r.ok) throw Error(data.detail||'导入失败');
+    kbEntries=data.entries||[]; kbRender(); kbRefreshLegacyHint();
+    showStatus('已导入为「附加背景（旧）」');
+  }catch(err){ showStatus('导入失败：'+err.message,true); }
+  finally{ $('kbImportLegacy').disabled=false; }
+};
+
+$('kbClear').onclick=async function(){
+  if(!kbEntries.length){ showStatus('知识库已经是空的'); return; }
+  if(!confirm('清空全部 '+kbEntries.length+' 条知识库内容？此操作不可撤销。')) return;
+  $('kbClear').disabled=true;
+  try{
+    const r=await fetch('/api/knowledge/clear',{method:'POST'});
+    const data=await r.json();
+    if(!r.ok) throw Error(data.detail||'清空失败');
+    kbEntries=data.entries||[]; kbRender(); kbRefreshLegacyHint();
+    showStatus('知识库已清空');
+  }catch(err){ showStatus('清空失败：'+err.message,true); }
+  finally{ $('kbClear').disabled=false; }
+};
+
+kbLoad();
 </script>
 </body>
 </html>
