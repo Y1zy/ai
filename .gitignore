@@ -15,8 +15,14 @@ qa/
 dist/
 
 # User-local settings and secrets (normally stored outside the repository)
+# 这些文件实际存放在 %LOCALAPPDATA%\WasapiParaformerOverlay\，但一并忽略以防
+# 被误复制到项目目录后提交（vision.key 含加密的视觉模型 Key，
+# knowledge.json 含用户简历/话术，phone_share.json 含局域网配对令牌）。
 config.json
 deepseek.key
+vision.key
+phone_share.json
+knowledge.json
 .env
 .env.*
 
