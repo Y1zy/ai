@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import queue
@@ -57,16 +57,63 @@ def _is_meaningful_zh(word: str) -> bool:
         return False
     return True
 
-# 手动补充热词的分隔符：换行、中英文逗号、顿号、分号、竖线、制表符
-_HOTWORD_SPLIT_RE = re.compile(r"[\r\n,，、;；|\t]+")
+
+# 简历/JD 里的动词与限定词：常作为「负责……」「熟悉……」的前后缀出现，
+# 需从抽取结果中剥离，否则会得到「负责高并发系统优化」这种带噪声的候选词。
+_ZH_AFFIXES: tuple[str, ...] = (
+    "负责", "主导", "参与", "熟悉", "掌握", "精通", "了解", "完成",
+    "使用", "基于", "具备", "拥有", "熟练", "擅长", "从事", "负责人",
+    "工作", "系统", "平台", "项目", "优化", "设计", "开发", "维护",
+    "搭建", "支持", "实现", "能力", "经验", "相关", "以及", "等",
+)
+
+
+def _strip_zh_affixes(word: str) -> str:
+    """反复剥离前后缀动词/限定词，得到更像术语的中文片段。
+
+    例：「负责高并发系统优化」→ 「高并发」；「掌握 ClickHouse 等」→ 剥离后为空则丢弃。
+    """
+    current = word
+    changed = True
+    while changed and current:
+        changed = False
+        for affix in _ZH_AFFIXES:
+            if current.startswith(affix) and len(current) > len(affix):
+                current = current[len(affix):]
+                changed = True
+            if current.endswith(affix) and len(current) > len(affix):
+                current = current[: -len(affix)]
+                changed = True
+    return current
+
+
+def _extract_zh_hotwords(text: str) -> list[str]:
+    """从中文文本中提取候选术语：按连续汉字跑切分，再剥离动词前后缀。"""
+    results: list[str] = []
+    for run in _ZH_HOTWORD_RE.findall(text):
+        stripped = _strip_zh_affixes(run)
+        if _is_meaningful_zh(stripped):
+            results.append(stripped)
+    return results
+
+# 单个热词长度上限：仅作防御，防止用户把整篇简历误粘进热词框。
+# 注意：这不是「按字数切分」——超长条目直接丢弃，绝不切碎。
+_MAX_HOTWORD_CHARS = 32
+
+# 手动补充热词的分隔符：换行、中英文逗号、顿号。
+# 与参考实现（商业版仅用 , ， \n）保持一致；额外支持顿号，因为中文用户习惯用「、」列举。
+# 不引入分号/竖线/制表符：规则越少越不容易误解。
+_HOTWORD_SPLIT_RE = re.compile(r"[\r\n,，、]+")
 
 
 def _split_manual_hotwords(text: str) -> list[str]:
-    """切分手动补充热词。
+    """切分手动补充热词：只按用户显式写下的分隔符切，不做任何语义猜测。
 
-    中文词之间没有天然空格，因此以换行/逗号/顿号/分号等显式分隔符为准；
-    空格仅在「两侧都不是汉字」时才作为分隔符，避免把「分布式 缓存」之外的
-    中文短语误切（如「高并发 场景」会被切成一个短语而不是两个词的中间态）。
+    中文没有天然词边界，任何「按字数切分」都会把「高并发缓存穿透」这类完整术语
+    切坏，并把碎片混进热词表污染识别结果。因此严格遵守：
+    用户写了分隔符才切，中文词组完整保留。
+
+    超长条目（> _MAX_HOTWORD_CHARS）视为误粘贴，直接丢弃而非切分。
     """
     if not text.strip():
         return []
@@ -75,13 +122,13 @@ def _split_manual_hotwords(text: str) -> list[str]:
         chunk = chunk.strip()
         if not chunk:
             continue
+        # 中文片段完整保留；英文/数字片段按空格再分（英文本身有空格，语义明确）
         if re.search(r"[\u4e00-\u9fa5]", chunk):
-            # 中文片段整体保留，不按空格再切，防止破坏词组
             parts.append(chunk)
         else:
             parts.extend(piece for piece in chunk.split() if piece)
-    return parts
-
+    # 防御：超长条目丢弃（绝不切碎）
+    return [item for item in parts if item and len(item) <= _MAX_HOTWORD_CHARS]
 
 def _extract_hotwords(settings: dict) -> list[str]:
     """从简历/JD/公司/附加背景中提取中英文技术词作为热词表。"""
@@ -98,10 +145,7 @@ def _extract_hotwords(settings: dict) -> list[str]:
             if word and lowered not in seen and len(hotwords) < _MAX_HOTWORDS:
                 seen.add(lowered)
                 hotwords.append(word)
-        for match in _ZH_HOTWORD_RE.findall(text):
-            word = match.strip()
-            if not _is_meaningful_zh(word):
-                continue
+        for word in _extract_zh_hotwords(text):
             if word not in seen and zh_count < _MAX_ZH_HOTWORDS:
                 seen.add(word)
                 hotwords.append(word)
@@ -113,22 +157,35 @@ def _get_hotwords(settings: dict) -> list[str]:
     """三层叠加热词：手动补充（最精准，优先） + 简历提取 + 内置兜底，去重后截断。"""
     result: list[str] = []
     seen: set[str] = set()
+    zh_total = 0
 
-    def push(word: str, *, is_zh: bool = False) -> None:
-        key = word.lower() if not is_zh else word
-        if key and key not in seen and len(result) < _MAX_HOTWORDS:
-            seen.add(key)
-            result.append(word)
+    def push(word: str) -> bool:
+        """返回是否成功加入；中文受 _MAX_ZH_HOTWORDS 单独约束。"""
+        nonlocal zh_total
+        word = word.strip()
+        if not word:
+            return False
+        is_zh = bool(re.search(r"[\u4e00-\u9fa5]", word))
+        key = word if is_zh else word.lower()
+        if key in seen:
+            return False
+        if len(result) >= _MAX_HOTWORDS:
+            return False
+        if is_zh:
+            if zh_total >= _MAX_ZH_HOTWORDS:
+                return False
+            zh_total += 1
+        seen.add(key)
+        result.append(word)
+        return True
 
     # ① 手动补充：用户显式指定，优先级最高，中英文都支持
     for word in _split_manual_hotwords(str(settings.get("hotwordExtra") or "")):
-        is_zh = bool(re.search(r"[\u4e00-\u9fa5]", word))
-        push(word, is_zh=is_zh)
+        push(word)
 
     # ② 简历/JD 自动提取
     for word in _extract_hotwords(settings):
-        is_zh = bool(re.search(r"[\u4e00-\u9fa5]", word))
-        push(word, is_zh=is_zh)
+        push(word)
 
     # ③ 内置兜底：仅当上面两层都没有产出时才使用，避免方向词干扰
     if not result:

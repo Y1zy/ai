@@ -471,7 +471,29 @@ def create_app(config: AppConfig) -> FastAPI:
         session_recorder.clear()
         return {"ok": True}
 
-        # ---------------------------------------------------------------- 知识库
+    # ---------------------------------------------------------------- 热词
+    @app.get("/api/hotwords/detected")
+    async def hotwords_detected(request: Request) -> dict:
+        """从简历/JD/公司/附加背景中提取候选热词，供设置页「一键添加」。
+
+        只做正则提取（不调 AI），返回的候选由用户确认后才写入 hotwordExtra。
+        """
+        require_local(request)
+        from .recognizer import _extract_hotwords, _split_manual_hotwords
+
+        def collect() -> dict:
+            settings = load_settings()
+            terms = _extract_hotwords(settings)
+            # 已填入热词框的词不再重复推荐（复用同一套切分规则，保证前后端一致）
+            existing = {
+                word.lower() for word in _split_manual_hotwords(str(settings.get("hotwordExtra") or ""))
+            }
+            fresh = [term for term in terms if term.lower() not in existing]
+            manual = _split_manual_hotwords(str(settings.get("hotwordExtra") or ""))
+            return {"terms": fresh, "count": len(fresh), "manualCount": len(manual)}
+
+        return await asyncio.to_thread(collect)
+    # ---------------------------------------------------------------- 知识库
     # 独立存 knowledge.json（不写 config.json）：C# Overlay 会整体重写 config.json，
     # 混写会导致浮窗保存设置时知识库被抹掉。
     @app.get("/api/knowledge")
@@ -514,8 +536,6 @@ def create_app(config: AppConfig) -> FastAPI:
     async def knowledge_upload(request: Request, payload: dict) -> dict:
         """解析上传文档为纯文本（前端先 base64 编码），不落盘原文件。"""
         require_local(request)
-        
-
         filename = str(payload.get("filename") or "")[:200]
         encoded = payload.get("data")
         if not isinstance(encoded, str) or not encoded:
