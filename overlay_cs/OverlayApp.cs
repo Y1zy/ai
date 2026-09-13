@@ -2153,7 +2153,7 @@ namespace WasapiParaformerOverlay
         private readonly System.Windows.Threading.DispatcherTimer configTimer;
         private readonly System.Windows.Threading.DispatcherTimer hoverTimer;
         private readonly System.Windows.Threading.DispatcherTimer geometrySaveTimer;
-        private readonly System.Windows.Threading.DispatcherTimer aiTypewriterTimer;
+        private readonly System.Windows.Threading.DispatcherTimer aiStreamTimer;
         private readonly SettingsWindow settings;
         private readonly LockIndicatorWindow lockIndicator;
         private readonly WebSocketSubscriber subscriber;
@@ -2191,11 +2191,12 @@ namespace WasapiParaformerOverlay
         private double resizeStartTop;
         private double resizeStartWidth;
         private double resizeStartHeight;
-        private readonly Queue<string> aiGlyphQueue = new Queue<string>();
-        private readonly StringBuilder aiTypedText = new StringBuilder();
-        private TaskCompletionSource<bool> aiTypingCompletion;
-        private bool aiNetworkComplete;
-        private int aiTypeTick;
+        // 流式回答的显示缓冲：网络增量直接累积，由 aiStreamTimer 按帧节流刷新。
+        // 不做逐字排队播放——那会让回答在网络已完成后还要等动画播完（实测 277 字
+        // 的回答网络耗时 2.3s，打字机却要 14.7s），期间 aiBusy 不释放、新的提问
+        // 无法排队。
+        private readonly StringBuilder aiStreamText = new StringBuilder();
+        private bool aiStreamDirty;
         // 本轮 AI 的题目：手机端据此把「识别出的问题 → 回答」显示成问答对。
         // aiTurnId 每轮自增，手机用它把同一轮的多帧流式更新归到同一条回答气泡。
         private string aiCurrentQuestion = "";
@@ -2320,9 +2321,10 @@ namespace WasapiParaformerOverlay
                     "geometry saved left={0:0} top={1:0} width={2:0} height={3:0}",
                     Left, Top, ActualWidth, ActualHeight));
             };
-            aiTypewriterTimer = new System.Windows.Threading.DispatcherTimer();
-            aiTypewriterTimer.Interval = TimeSpan.FromMilliseconds(35);
-            aiTypewriterTimer.Tick += delegate { TypeNextAiCharacters(); };
+            // 流式刷新节流：120ms 一次，兼顾观感与 UI 线程负载（每次刷新要重排字幕控件）。
+            aiStreamTimer = new System.Windows.Threading.DispatcherTimer();
+            aiStreamTimer.Interval = TimeSpan.FromMilliseconds(120);
+            aiStreamTimer.Tick += delegate { FlushAiStreamText(false); };
             subscriber = new WebSocketSubscriber(
                 config.WebSocketUrl,
                 delegate(Dictionary<string, object> message)
@@ -3449,75 +3451,56 @@ namespace WasapiParaformerOverlay
 
         private void CancelAiRequest()
         {
-            StopAiTypewriter();
+            StopAiStream();
             CancellationTokenSource request = aiRequestCancellation;
             aiRequestCancellation = null;
             if (request == null) return;
             try { request.Cancel(); } catch { }
         }
 
-        private void ResetAiTypewriter()
+        private void ResetAiStream()
         {
-            aiTypewriterTimer.Stop();
-            aiGlyphQueue.Clear();
-            aiTypedText.Clear();
-            aiNetworkComplete = false;
-            aiTypeTick = 0;
-            aiTypingCompletion = new TaskCompletionSource<bool>();
+            aiStreamTimer.Stop();
+            aiStreamText.Clear();
+            aiStreamDirty = false;
         }
 
-        private void EnqueueAiDelta(string delta)
+        /// <summary>网络增量到达：累积到缓冲区，并按 120ms 节流刷新界面。</summary>
+        private void AppendAiDelta(string delta)
         {
             if (string.IsNullOrEmpty(delta)) return;
-            TextElementEnumerator elements = StringInfo.GetTextElementEnumerator(delta);
-            while (elements.MoveNext()) aiGlyphQueue.Enqueue(elements.GetTextElement());
-            if (!aiTypewriterTimer.IsEnabled) aiTypewriterTimer.Start();
+            aiStreamText.Append(delta);
+            aiStreamDirty = true;
+            if (!aiStreamTimer.IsEnabled) aiStreamTimer.Start();
         }
 
-        private void TypeNextAiCharacters()
+        /// <summary>
+        /// 把缓冲区内容刷到字幕控件。final=true 时停表并做收尾（结果已完整）。
+        /// 未变化时不重排，避免空刷新。
+        /// </summary>
+        private void FlushAiStreamText(bool final)
         {
+            if (final) aiStreamTimer.Stop();
+            if (!final && !aiStreamDirty) return;
             if (streamingAiEntry == null)
             {
-                aiTypewriterTimer.Stop();
+                aiStreamTimer.Stop();
                 return;
             }
-            int requested = (++aiTypeTick % 2 == 0) ? 2 : 1;
-            int emitted = 0;
-            while (emitted < requested && aiGlyphQueue.Count > 0)
-            {
-                aiTypedText.Append(aiGlyphQueue.Dequeue());
-                emitted++;
-            }
-            if (emitted > 0)
-            {
-                aiHasVisibleOutput = true;
-                streamingAiEntry.Text = aiTypedText.ToString();
-                streamingAiEntry.Streaming = true;
-                PhoneAiFeed.Post(streamingAiEntry.Text, false, null, aiTurnId);
-                RefreshText();
-                FadeTo(config.Opacity, 80);
-                AppLog.Write(string.Format(
-                    "ai type +{0} total={1} pending={2}",
-                    emitted, aiTypedText.Length, aiGlyphQueue.Count));
-            }
-            if (aiGlyphQueue.Count == 0)
-            {
-                aiTypewriterTimer.Stop();
-                if (aiNetworkComplete) CompleteAiTyping();
-            }
+            aiStreamDirty = false;
+            aiHasVisibleOutput = true;
+            streamingAiEntry.Text = aiStreamText.ToString();
+            streamingAiEntry.Streaming = !final;
+            PhoneAiFeed.Post(streamingAiEntry.Text, false, null, aiTurnId);
+            RefreshText();
+            FadeTo(config.Opacity, 80);
         }
 
-        private void CompleteAiTyping()
+        private void StopAiStream()
         {
-            if (aiTypingCompletion != null) aiTypingCompletion.TrySetResult(true);
-        }
-
-        private void StopAiTypewriter()
-        {
-            aiTypewriterTimer.Stop();
-            aiGlyphQueue.Clear();
-            aiNetworkComplete = false;
-            if (aiTypingCompletion != null) aiTypingCompletion.TrySetCanceled();
+            aiStreamTimer.Stop();
+            aiStreamText.Clear();
+            aiStreamDirty = false;
         }
 
         private async void StartAiRequest()
@@ -3551,7 +3534,7 @@ namespace WasapiParaformerOverlay
             chatEntries.Add(streamingAiEntry);
             TrimChatEntries();
             RefreshText();
-            ResetAiTypewriter();
+            ResetAiStream();
             // 题目立刻发给手机（不等第一个字）：手机能先看到问题，再看着回答逐步长出来。
             // 同一 turn 的后续帧只更新回答气泡，题目气泡不会重复。
             aiCurrentQuestion = transcript.Length > 600 ? transcript.Substring(0, 600) : transcript;
@@ -3576,20 +3559,19 @@ namespace WasapiParaformerOverlay
                         Action update = delegate
                         {
                             if (requestCancellation.IsCancellationRequested) return;
-                            EnqueueAiDelta(delta);
+                            AppendAiDelta(delta);
                         };
                         if (Dispatcher.CheckAccess()) update(); else Dispatcher.Invoke(update);
                     },
                     requestCancellation.Token);
                 if (requestCancellation.IsCancellationRequested) return;
-                aiNetworkComplete = true;
                 AppLog.Write("ai sse complete chars=" + result.Length
-                    + " pending_glyphs=" + aiGlyphQueue.Count);
-                if (aiGlyphQueue.Count == 0) CompleteAiTyping();
-                await aiTypingCompletion.Task;
-                if (requestCancellation.IsCancellationRequested) return;
-                streamingAiEntry.Text = result;
-                streamingAiEntry.Streaming = false;
+                    + " buffered=" + aiStreamText.Length);
+                // 收尾：以网络返回的完整文本为准（可能与增量拼接有细微差异），
+                // 直接显示，不再等任何动画。
+                aiStreamText.Clear();
+                aiStreamText.Append(result);
+                FlushAiStreamText(true);
                 PhoneAiFeed.Post(result, true, null, aiTurnId);
                 conversationHistory.Add(new ConversationMessage("user", transcript));
                 conversationHistory.Add(new ConversationMessage("assistant", result));
@@ -3601,7 +3583,7 @@ namespace WasapiParaformerOverlay
             }
             catch (OperationCanceledException)
             {
-                StopAiTypewriter();
+                StopAiStream();
                 if (streamingAiEntry != null) chatEntries.Remove(streamingAiEntry);
                 PhoneAiFeed.Post("", true);
                 RefreshText();
@@ -3609,7 +3591,7 @@ namespace WasapiParaformerOverlay
             }
             catch (Exception error)
             {
-                StopAiTypewriter();
+                StopAiStream();
                 if (streamingAiEntry != null)
                 {
                     streamingAiEntry.Text = "请求失败，请检查 AI 设置。";
