@@ -2165,7 +2165,6 @@ namespace WasapiParaformerOverlay
         private bool bossHidden;
         private bool capturePaused;
         private readonly bool demoAllowCapture;
-        private int ignoredSpeechSegment = -1;
         internal bool IsClosing { get; private set; }
         private readonly LinkedList<SpeechBatch> aiQueue = new LinkedList<SpeechBatch>();
         private readonly List<ChatEntry> chatEntries = new List<ChatEntry>();
@@ -2669,22 +2668,8 @@ namespace WasapiParaformerOverlay
                 int segment = message.ContainsKey("segment_id")
                     ? Convert.ToInt32(message["segment_id"])
                     : -1;
-                if (bossHidden)
-                {
-                    if (type == "partial") ignoredSpeechSegment = segment;
-                    else if (type == "final" && ignoredSpeechSegment == segment)
-                        ignoredSpeechSegment = -1;
-                    AppLog.Write(string.Format(
-                        "speech ignored hidden=True type={0} segment={1}", type, segment));
-                    return;
-                }
-                if (ignoredSpeechSegment >= 0 && segment == ignoredSpeechSegment)
-                {
-                    if (type == "final") ignoredSpeechSegment = -1;
-                    AppLog.Write(string.Format(
-                        "speech ignored hidden_tail=True type={0} segment={1}", type, segment));
-                    return;
-                }
+                // 老板键隐藏期间照常处理语音：只把窗口设为不可见，识别、AI 回答与手机
+                // 投屏都继续工作，恢复时立刻显示这期间累积的完整内容。
                 string loggedText = fullText;
                 if (loggedText.Length > 120) loggedText = loggedText.Substring(0, 120);
                 AppLog.Write(type + " text=" + loggedText);
@@ -3195,10 +3180,8 @@ namespace WasapiParaformerOverlay
             BeginAnimation(Window.OpacityProperty, null);
             if (bossHidden)
             {
-                CancelLocalTranslation(true);
-                if (subtitle.PartialSegment >= 0)
-                    ignoredSpeechSegment = subtitle.PartialSegment;
-                subtitle.DiscardPartial();
+                // 隐藏 = 只让窗口不可见。识别 / AI 回答 / 手机投屏全部继续，
+                // 标题栏与编辑框收起以免残留可交互元素。
                 if (editMode) SetEditMode(false);
                 lockIndicator.Hide();
                 SetResizeFrame(false);
@@ -3210,8 +3193,8 @@ namespace WasapiParaformerOverlay
                 Opacity = config.Opacity;
             }
             AppLog.Write(string.Format(
-                "boss_hidden={0} speech_accepting={1} ignored_segment={2}",
-                bossHidden, !bossHidden, ignoredSpeechSegment));
+                "boss_hidden={0} background_working={1}",
+                bossHidden, true));
         }
 
         internal void RequestShutdown()
