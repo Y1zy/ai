@@ -35,3 +35,8 @@ Thumbs.db
 
 # Local security-scan plugin state
 .mimosa/
+
+# 独立仓库 / 本地工具产物：不属于本仓库，避免被误提交，也避免安全扫描误判
+deepseek-harness-codearts/
+dsh-reasoning-effort/
+.dsh-vision-toolkit/

@@ -68,6 +68,37 @@ def test_clipboard_roundtrip():
             phone_share.set_clipboard_text(original)
 
 
+def test_clipboard_write_retries_when_busy(monkeypatch):
+    """剪贴板被其他进程短暂占用（OpenClipboard 失败）时必须重试，而不是直接失败。"""
+    attempts = []
+
+    def flaky_once(text: str) -> bool:
+        attempts.append(text)
+        return len(attempts) >= 3  # 前两次模拟被占用
+
+    monkeypatch.setattr(phone_share, "_set_clipboard_text_once", flaky_once)
+    monkeypatch.setattr(phone_share.time, "sleep", lambda _seconds: None)
+    assert phone_share.set_clipboard_text("重试后的文本") is True
+    assert len(attempts) == 3
+
+
+def test_clipboard_write_gives_up_after_limit(monkeypatch):
+    """持续占用时最多重试固定次数后返回 False，不无限阻塞。"""
+    attempts = []
+    monkeypatch.setattr(
+        phone_share, "_set_clipboard_text_once",
+        lambda text: attempts.append(text) or False,
+    )
+    monkeypatch.setattr(phone_share.time, "sleep", lambda _seconds: None)
+    assert phone_share.set_clipboard_text("写不进去") is False
+    assert len(attempts) == phone_share.CLIPBOARD_WRITE_ATTEMPTS
+
+
+def test_clipboard_poll_is_responsive():
+    """轮询间隔必须明显小于旧的 0.8 秒，否则电脑→手机要等半秒以上。"""
+    assert phone_share.CLIPBOARD_POLL_SECONDS <= 0.25
+
+
 def test_clipboard_watcher_poll_and_echo_guard(monkeypatch):
     relay = phone_share.PhoneRelay()
     watcher = phone_share.ClipboardWatcher()

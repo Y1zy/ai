@@ -33,7 +33,11 @@ MAX_IMAGE_WIDTH = 1600
 JPEG_QUALITY = 75
 TRANSCRIPT_EVENT_TYPES = {"partial", "final", "status"}
 MAX_CLIPBOARD_CHARS = 50000
-CLIPBOARD_POLL_SECONDS = 0.8
+CLIPBOARD_POLL_SECONDS = 0.2
+# 剪贴板被其他进程短暂占用（OpenClipboard 失败）时的重试节奏：
+# 轮询间隔 25ms、最多 8 次，覆盖住浏览器/输入法锁定剪贴板的瞬时窗口。
+CLIPBOARD_WRITE_ATTEMPTS = 8
+CLIPBOARD_WRITE_RETRY_SECONDS = 0.025
 
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
@@ -97,7 +101,7 @@ def get_clipboard_text() -> str:
         _user32.CloseClipboard()
 
 
-def set_clipboard_text(text: str) -> bool:
+def _set_clipboard_text_once(text: str) -> bool:
     payload = text.encode("utf-16-le") + b"\x00\x00"
     if not _user32.OpenClipboard(None):
         return False
@@ -120,6 +124,23 @@ def set_clipboard_text(text: str) -> bool:
         return True
     finally:
         _user32.CloseClipboard()
+
+
+def set_clipboard_text(text: str) -> bool:
+    """写入剪贴板；被其他进程短暂占用时重试。
+
+    OpenClipboard 是独占的：浏览器、输入法等会随机短暂持有剪贴板，实测约 10%
+    的写入会立刻失败。这里按 25ms 间隔重试若干次，把它压到可忽略。
+    """
+    for attempt in range(CLIPBOARD_WRITE_ATTEMPTS):
+        try:
+            if _set_clipboard_text_once(text):
+                return True
+        except Exception:
+            pass
+        if attempt < CLIPBOARD_WRITE_ATTEMPTS - 1:
+            time.sleep(CLIPBOARD_WRITE_RETRY_SECONDS)
+    return False
 
 
 def load_phone_config(path: Path | None = None) -> dict[str, Any]:
@@ -390,81 +411,33 @@ class SolveEngine:
         context_block = ("\n\n".join(context_parts) + "\n\n") if context_parts else ""
         user_text = context_block + vision["prompt"]
 
-        payload = {
-            "model": vision["model"],
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                        {"type": "text", "text": user_text},
-                    ],
-                }
-            ],
-            "stream": True,
-            "max_tokens": 1500,
-            "temperature": 0.2,
-        }
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                    {"type": "text", "text": user_text},
+                ],
+            }
+        ]
 
-        accumulated: list[str] = []
-        pending: list[str] = []
-        pending_lock = threading.Lock()
-        last_flush = time.monotonic()
+        from .ai_stream import stream_chat_completion
 
-        def flush(force: bool = False) -> None:
-            nonlocal last_flush
-            with pending_lock:
-                if not pending:
-                    return
-                elapsed = time.monotonic() - last_flush
-                if not force and elapsed < SOLVE_STREAM_FLUSH_SECONDS and len(pending) < 8:
-                    return
-                chunk = "".join(pending)
-                pending.clear()
-            last_flush = time.monotonic()
-            accumulated.append(chunk)
-            self._emit(chunk, False)
-
-        with httpx.Client(
-            timeout=httpx.Timeout(90.0, read=90.0),
-            # Cloudflare 站点（如部分中转 API）会按 UA 封禁默认的 python-httpx 签名
-            headers={"User-Agent": "VoxRibbon/0.1"},
-        ) as client:
-            with client.stream(
-                "POST",
-                vision["baseUrl"] + "/chat/completions",
-                json=payload,
-                headers={
-                    "Authorization": "Bearer " + api_key,
-                    "Accept": "text/event-stream",
-                },
-            ) as response:
-                if response.status_code >= 400:
-                    body = response.read().decode("utf-8", errors="replace")
-                    raise RuntimeError(f"HTTP {response.status_code}: {body[:300]}")
-                for line in response.iter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except ValueError:
-                        continue
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    content = delta.get("content")
-                    if content:
-                        with pending_lock:
-                            pending.append(content)
-                        flush()
-
-        flush(force=True)
-        final_text = "".join(accumulated).strip()
-        self._emit(final_text if final_text else "（模型未返回内容）", True)
+        # max_tokens 放大到 2048：部分网关把思考 token 也计入上限，
+        # 1500 在长题目下可能返回 200 但 content 为空。
+        final_text = stream_chat_completion(
+            url=vision["baseUrl"] + "/chat/completions",
+            api_key=api_key,
+            model=vision["model"],
+            messages=messages,
+            on_snapshot=self._emit,
+            max_tokens=2048,
+            temperature=0.2,
+            flush_seconds=SOLVE_STREAM_FLUSH_SECONDS,
+            validate=False,  # 上面已用更具体的文案校验过
+        )
+        if not final_text:
+            self._emit("（模型未返回内容）", True)
 
 
 class ClipboardWatcher:
@@ -679,7 +652,7 @@ class PhoneRelay:
 
     async def _handle_ask(self, question: str) -> None:
         """手机文字提问：系统提示词 + 最近对话历史（追问）+ 本次问题走真实 AI 管线。"""
-        from .server import _ask_ai_blocking, effective_system_prompt
+        from .server import effective_system_prompt
         from .settings import load_settings, load_api_key
 
         settings = await asyncio.to_thread(load_settings)
@@ -694,18 +667,33 @@ class PhoneRelay:
         with self._chat_lock:
             history = list(self.phone_chat_history)
 
+        from .ai_stream import build_messages, stream_chat_completion
+
+        endpoint = settings["aiBaseUrl"].rstrip("/") + "/chat/completions"
+        messages = build_messages(prompt, question, history)
+
         def run():
-            return _ask_ai_blocking(prompt, question, settings, api_key, history=history)
+            # 流式：每个快照即时推给手机，避免等全文返回才显示（长回答体感差别很大）。
+            return stream_chat_completion(
+                url=endpoint,
+                api_key=api_key,
+                model=settings["aiModel"],
+                messages=messages,
+                on_snapshot=lambda text, done: self.schedule_json(
+                    {"type": "ai", "text": text, "done": done, "source": "ask"}
+                ),
+            )
 
         try:
-            result = await asyncio.to_thread(run)
-            answer = result["answer"]
+            answer = await asyncio.to_thread(run)
+            if not answer:
+                answer = "（模型未返回内容）"
+                self.schedule_json({"type": "ai", "text": answer, "done": True, "source": "ask"})
             with self._chat_lock:
                 self.phone_chat_history.append({"role": "user", "content": question})
                 self.phone_chat_history.append({"role": "assistant", "content": answer})
                 while len(self.phone_chat_history) > 12:
                     self.phone_chat_history.pop(0)
-            self.schedule_json({"type": "ai", "text": answer, "done": True, "source": "ask"})
         except Exception as exc:
             self.schedule_json({"type": "ai", "text": f"请求失败：{exc}", "done": True, "source": "ask"})
 

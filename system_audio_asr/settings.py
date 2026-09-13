@@ -17,6 +17,9 @@ APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")
 CONFIG_PATH = APP_DIR / "config.json"
 KEY_PATH = APP_DIR / "deepseek.key"
 ENTROPY = b"WasapiParaformerOverlay.DeepSeek.v1"
+# 「允许本机/内网接口」开关独立存盘：C# Overlay 保存时整体重写 config.json，
+# 放在 config.json 里会被抹掉（与 knowledge.json / phone_share.json 同理）。
+ALLOW_LOCAL_PATH = APP_DIR / "allow_local.json"
 
 DEFAULTS: dict[str, Any] = {
     "left": None,
@@ -194,6 +197,7 @@ def public_settings() -> dict[str, Any]:
     return {
         "settings": load_settings(),
         "apiKeySet": bool(load_api_key()),
+        "allowLocalEndpoints": _allow_local_endpoints(),
         "monitors": monitor_names(),
     }
 
@@ -269,13 +273,21 @@ def builtin_prompts() -> dict[str, Any]:
     extra = str(settings.get("aiSystemPrompt") or "").strip()
 
     modes: dict[str, str] = {}
+    templates: dict[str, str] = {}
+    # 设置页改过的内置模板（aiBuiltInPrompt）：非空时整体替换默认模板正文，
+    # 与 C# OverlayApp.PromptForMode 的分支保持一致，否则网页「回答测试」/手机端
+    # 会与实际字幕 AI 发出不同的提示词。
+    builtin = str(settings.get("aiBuiltInPrompt") or "").strip()
     for mode, instruction in _MODE_INSTRUCTIONS.items():
-        prompt = (
-            context_block
-            + "这是连续的面试转写内容。请结合前几轮上下文理解当前消息，并先默默修正明显的识别错误。\n"
+        template = (
+            "这是连续的面试转写内容。请结合前几轮上下文理解当前消息，并先默默修正明显的识别错误。\n"
             + persona + "\n" + instruction
             + "\n" + _NO_MARKDOWN_LINE
         )
+        # templates：不含简历/JD 上下文、不含「附加要求」的默认模板正文，
+        # 供设置页把它直接放进「AI 自定义指令」框里编辑。
+        templates[mode] = template
+        prompt = context_block + (builtin or template)
         if extra:
             prompt += "\n附加要求：" + extra
         modes[mode] = prompt
@@ -292,6 +304,7 @@ def builtin_prompts() -> dict[str, Any]:
     return {
         "contextBlock": context_block,
         "modes": modes,
+        "templates": templates,
         "overridePrompt": override_prompt or None,
         "solveDefault": SOLVE_PROMPT,
         "solveCustom": str(settings.get("solvePrompt") or "").strip() or None,
@@ -373,7 +386,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
 
 
-def _resolve_public_ips(hostname: str, port: int) -> list[str]:
+def _resolve_public_ips(hostname: str, port: int, *, allow_local: bool = False) -> list[str]:
     try:
         infos = socket.getaddrinfo(hostname, port)
     except socket.gaierror as exc:
@@ -381,20 +394,51 @@ def _resolve_public_ips(hostname: str, port: int) -> list[str]:
     ips: list[str] = []
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_reserved
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_unspecified
-        ):
+        # 始终拦截：组播/未指定地址不是有效的模型服务地址；链路本地
+        # （169.254.0.0/16、fe80::/10）含云元数据端点，任何设置下都不放行。
+        if ip.is_multicast or ip.is_unspecified or ip.is_link_local:
+            raise ValueError("接口地址不允许指向本机或内网/保留地址")
+        # 回环与私有网段：默认拦截（SSRF 防护）；用户显式开启「允许本机/内网接口」
+        # 后放行，供自建 Ollama / LM Studio / vLLM / 局域网推理机使用。
+        if ip.is_loopback or ip.is_private:
+            if not allow_local:
+                raise ValueError(
+                    "接口地址不允许指向本机或内网/保留地址"
+                    "（自建模型请在设置页勾选「允许本机/内网接口」）"
+                )
+        elif ip.is_reserved:
             raise ValueError("接口地址不允许指向本机或内网/保留地址")
         if info[4][0] not in ips:
             ips.append(info[4][0])
     if not ips:
         raise ValueError("接口地址无法解析：" + hostname)
     return ips
+
+
+def _allow_local_endpoints(path: Path | None = None) -> bool:
+    """读取用户设置：是否允许把本机/内网地址配成模型接口（默认否）。
+
+    开关存在独立的 allow_local.json：C# Overlay 保存设置时会整体重写
+    config.json，放在那里会被抹掉。读取失败一律按「不允许」处理。
+    """
+    target = path or ALLOW_LOCAL_PATH
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    return bool(isinstance(raw, dict) and raw.get("allowLocalEndpoints"))
+
+
+def save_allow_local_endpoints(value: bool, path: Path | None = None) -> bool:
+    target = path or ALLOW_LOCAL_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"allowLocalEndpoints": bool(value)}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, target)
+    return bool(value)
 
 
 def request_public_http(
@@ -415,7 +459,7 @@ def request_public_http(
     if not hostname:
         raise ValueError("接口地址缺少主机名")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    target_ip = _resolve_public_ips(hostname, port)[0]
+    target_ip = _resolve_public_ips(hostname, port, allow_local=_allow_local_endpoints())[0]
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
@@ -438,7 +482,10 @@ def request_public_http(
 
 
 def validate_public_http_url(url: str) -> str:
-    """SSRF 防护：服务端只请求公网 http(s) 地址，拒绝本机/内网/保留地址。"""
+    """SSRF 防护：服务端只请求公网 http(s) 地址，默认拒绝本机/内网/保留地址。
+
+    用户在设置页显式勾选 allowLocalEndpoints 后放行回环与私有网段，供自建模型使用。
+    """
     from urllib.parse import urlparse
 
     parsed = urlparse(url)
@@ -447,7 +494,11 @@ def validate_public_http_url(url: str) -> str:
     host = parsed.hostname
     if not host:
         raise ValueError("接口地址缺少主机名")
-    _resolve_public_ips(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    _resolve_public_ips(
+        host,
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+        allow_local=_allow_local_endpoints(),
+    )
     return url
 
 

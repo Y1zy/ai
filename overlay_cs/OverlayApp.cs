@@ -588,13 +588,24 @@ namespace WasapiParaformerOverlay
         internal static bool HasApiKey { get { return Store.HasApiKey; } }
     }
 
+    // 手机端 AI 推送：把流式回答按节流转发给手机。
+    // 必须用「节流」而不是「防抖」：打字机每 ~35ms 就调一次 Post，若每次都重置计时器
+    // （防抖），计时器在整条回答期间永远不会触发，手机会在回答结束后才一次性收到全文，
+    // 表现为「没有流式输出」。
     internal static class PhoneAiFeed
     {
+        // 最小发送间隔。打字机 35ms/tick、每 tick 1-2 字，120ms 约合 4-8 字/帧。
+        private const int FlushIntervalMs = 120;
+
         private static readonly object Sync = new object();
         private static System.Threading.Timer flushTimer;
         private static string endpoint = "";
         private static string pendingText = "";
         private static bool pendingDone;
+        private static string pendingQuestion = "";
+        private static int pendingTurn;
+        // 已排定一次待发送：期间的新调用只覆盖内容，不再顺延计时器（这是节流的关键）。
+        private static bool flushScheduled;
 
         internal static void Configure(string webSocketUrl)
         {
@@ -610,39 +621,64 @@ namespace WasapiParaformerOverlay
 
         internal static void Post(string text, bool done)
         {
+            Post(text, done, null, 0);
+        }
+
+        /// <summary>
+        /// question 非空时随本帧下发（手机据此先渲染题目气泡）；
+        /// turn 为本轮编号，手机用它把同一轮的多帧流式更新归到同一条回答上。
+        /// </summary>
+        internal static void Post(string text, bool done, string question, int turn)
+        {
             if (endpoint.Length == 0) return;
+            bool schedule;
             lock (Sync)
             {
                 pendingText = text ?? "";
                 pendingDone = done;
-                if (flushTimer == null)
-                    flushTimer = new System.Threading.Timer(
-                        delegate { Flush(); }, null, 150, Timeout.Infinite);
-                else
-                    flushTimer.Change(150, Timeout.Infinite);
+                if (!string.IsNullOrEmpty(question)) pendingQuestion = question;
+                if (turn > 0) pendingTurn = turn;
+                schedule = !flushScheduled;
+                if (schedule) flushScheduled = true;
             }
+            if (!schedule) return;
+            if (flushTimer == null)
+                flushTimer = new System.Threading.Timer(
+                    delegate { Flush(); }, null, FlushIntervalMs, Timeout.Infinite);
+            else
+                flushTimer.Change(FlushIntervalMs, Timeout.Infinite);
         }
 
         private static void Flush()
         {
             string text;
             bool done;
+            string question;
+            int turn;
             lock (Sync)
             {
                 text = pendingText;
                 done = pendingDone;
+                question = pendingQuestion;
+                turn = pendingTurn;
                 pendingText = "";
                 pendingDone = false;
+                pendingQuestion = "";
+                flushScheduled = false;
             }
-            if (text.Length == 0 && !done) return;
+            // 题目可单独成帧（请求刚发起、还没有回答文本），故 question 非空也要发送。
+            if (text.Length == 0 && !done && question.Length == 0) return;
             try
             {
                 JavaScriptSerializer serializer = new JavaScriptSerializer();
-                string body = serializer.Serialize(new Dictionary<string, object>
+                Dictionary<string, object> payload = new Dictionary<string, object>
                 {
                     { "text", text },
                     { "done", done }
-                });
+                };
+                if (question.Length > 0) payload["question"] = question;
+                if (turn > 0) payload["turn"] = turn;
+                string body = serializer.Serialize(payload);
                 byte[] bytes = Encoding.UTF8.GetBytes(body);
                 HttpWebRequest request = (HttpWebRequest)WebRequest.Create(endpoint);
                 request.Method = "POST";
@@ -653,6 +689,54 @@ namespace WasapiParaformerOverlay
                 using (HttpWebResponse response = (HttpWebResponse)request.GetResponse()) { }
             }
             catch { }
+        }
+    }
+
+    // 「开始新一场」：桌面侧清完对话后，再通知本机服务端清其内存状态。
+    // 服务端 /api/session/reset 也会反向广播 reset_session 让桌面清，故用重入标志避免打环。
+    internal static class SessionResetFeed
+    {
+        private static readonly object Sync = new object();
+        private static string endpoint = "";
+        private static bool notifying;
+
+        internal static void Configure(string webSocketUrl)
+        {
+            try
+            {
+                Uri uri = new Uri(webSocketUrl
+                    .Replace("wss://", "https://")
+                    .Replace("ws://", "http://"));
+                endpoint = uri.GetLeftPart(UriPartial.Authority) + "/api/session/reset";
+            }
+            catch { endpoint = ""; }
+        }
+
+        /// <summary>通知服务端重置会话。fromServer=true 表示这是服务端广播触发的，跳过以免互相触发。</summary>
+        internal static void Notify(bool fromServer)
+        {
+            if (fromServer || endpoint.Length == 0) return;
+            lock (Sync)
+            {
+                if (notifying) return;
+                notifying = true;
+            }
+            try
+            {
+                byte[] bytes = Encoding.UTF8.GetBytes("{}");
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(endpoint);
+                request.Method = "POST";
+                request.ContentType = "application/json";
+                request.ContentLength = bytes.Length;
+                request.Timeout = 1500;
+                using (Stream stream = request.GetRequestStream()) stream.Write(bytes, 0, bytes.Length);
+                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse()) { }
+            }
+            catch { }
+            finally
+            {
+                lock (Sync) { notifying = false; }
+            }
         }
     }
 
@@ -1940,6 +2024,8 @@ namespace WasapiParaformerOverlay
             {
                 AppLog.Write("control_reset_click");
                 overlay.ResetConversation();
+                // 同时清服务端内存记录与手机端聊天流，避免桌面干净而手机上还留着上一场内容。
+                SessionResetFeed.Notify(false);
             }
             else if (index == 1)
             {
@@ -2110,6 +2196,10 @@ namespace WasapiParaformerOverlay
         private TaskCompletionSource<bool> aiTypingCompletion;
         private bool aiNetworkComplete;
         private int aiTypeTick;
+        // 本轮 AI 的题目：手机端据此把「识别出的问题 → 回答」显示成问答对。
+        // aiTurnId 每轮自增，手机用它把同一轮的多帧流式更新归到同一条回答气泡。
+        private string aiCurrentQuestion = "";
+        private int aiTurnId;
         private bool controlMouseWasDown;
         private int controlPressedIndex = -1;
         private bool followLatest = true;
@@ -2125,6 +2215,7 @@ namespace WasapiParaformerOverlay
             this.config = config;
             this.demoAllowCapture = demoAllowCapture;
             PhoneAiFeed.Configure(config.WebSocketUrl);
+            SessionResetFeed.Configure(config.WebSocketUrl);
             PromptFeed.Configure(config.WebSocketUrl);
             Title = "系统声音实时字幕 Overlay";
             WindowStyle = WindowStyle.None;
@@ -2562,6 +2653,14 @@ namespace WasapiParaformerOverlay
         private void HandleMessage(Dictionary<string, object> message)
         {
             string type = message.ContainsKey("type") ? Convert.ToString(message["type"]) : "";
+            if (type == "reset_session")
+            {
+                // 「开始新一场」由服务端广播（设置页按钮触发）：清桌面侧对话/字幕/AI 输出。
+                // fromServer=true 防止 Notify 再回调服务端形成循环。
+                ResetConversation();
+                SessionResetFeed.Notify(true);
+                return;
+            }
             if (type == "partial" || type == "final")
             {
                 string fullText = message.ContainsKey("text") ? Convert.ToString(message["text"]) : "";
@@ -3069,6 +3168,7 @@ namespace WasapiParaformerOverlay
             aiBusy = false;
             streamingAiEntry = null;
             PhoneAiFeed.Post("", true);
+            aiCurrentQuestion = "";
             conversationHistory.Clear();
             chatEntries.Clear();
             subtitle.Clear();
@@ -3393,7 +3493,7 @@ namespace WasapiParaformerOverlay
                 aiHasVisibleOutput = true;
                 streamingAiEntry.Text = aiTypedText.ToString();
                 streamingAiEntry.Streaming = true;
-                PhoneAiFeed.Post(streamingAiEntry.Text, false);
+                PhoneAiFeed.Post(streamingAiEntry.Text, false, null, aiTurnId);
                 RefreshText();
                 FadeTo(config.Opacity, 80);
                 AppLog.Write(string.Format(
@@ -3452,6 +3552,11 @@ namespace WasapiParaformerOverlay
             TrimChatEntries();
             RefreshText();
             ResetAiTypewriter();
+            // 题目立刻发给手机（不等第一个字）：手机能先看到问题，再看着回答逐步长出来。
+            // 同一 turn 的后续帧只更新回答气泡，题目气泡不会重复。
+            aiCurrentQuestion = transcript.Length > 600 ? transcript.Substring(0, 600) : transcript;
+            aiTurnId++;
+            PhoneAiFeed.Post("", false, aiCurrentQuestion, aiTurnId);
             AppLog.Write(string.Format(
                 "ai request model={0} mode={1} segments={2} chars={3} context_messages={4} queued_batches={5}",
                 config.AiModel,
@@ -3485,7 +3590,7 @@ namespace WasapiParaformerOverlay
                 if (requestCancellation.IsCancellationRequested) return;
                 streamingAiEntry.Text = result;
                 streamingAiEntry.Streaming = false;
-                PhoneAiFeed.Post(result, true);
+                PhoneAiFeed.Post(result, true, null, aiTurnId);
                 conversationHistory.Add(new ConversationMessage("user", transcript));
                 conversationHistory.Add(new ConversationMessage("assistant", result));
                 TrimConversationHistory();
@@ -3509,7 +3614,7 @@ namespace WasapiParaformerOverlay
                 {
                     streamingAiEntry.Text = "请求失败，请检查 AI 设置。";
                     streamingAiEntry.Streaming = false;
-                    PhoneAiFeed.Post(streamingAiEntry.Text, true);
+                    PhoneAiFeed.Post(streamingAiEntry.Text, true, null, aiTurnId);
                     RefreshText();
                 }
                 AppLog.Write("ai error=" + error.Message);

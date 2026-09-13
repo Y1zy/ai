@@ -26,6 +26,7 @@ from .settings import (
     load_api_key,
     load_settings,
     public_settings,
+    save_allow_local_endpoints,
     test_deepseek,
     update_from_web,
     validate_public_http_url,
@@ -253,6 +254,11 @@ def create_app(config: AppConfig) -> FastAPI:
     async def put_settings(request: Request, payload: dict) -> dict:
         require_local(request)
         saved = await asyncio.to_thread(update_from_web, payload)
+        # 「允许本机/内网接口」独立存盘（见 save_allow_local_endpoints 注释）。
+        if "allowLocalEndpoints" in payload:
+            await asyncio.to_thread(
+                save_allow_local_endpoints, bool(payload.get("allowLocalEndpoints"))
+            )
         restarted = saved.get("asrLanguage", "zh") != engine.config.language
         if restarted:
             await restart_engine(saved.get("asrLanguage", "zh"))
@@ -396,10 +402,17 @@ def create_app(config: AppConfig) -> FastAPI:
         text = str(payload.get("text", ""))
         if len(text) > 20000:
             text = text[:20000]
-        session_recorder.add_ai(text, bool(payload.get("done")))
-        phone_relay.schedule_json(
-            {"type": "ai", "text": text, "done": bool(payload.get("done"))}
-        )
+        done = bool(payload.get("done"))
+        session_recorder.add_ai(text, done)
+        # question/turn 由桌面端随本轮回答一起下发，供手机把「题目 → 回答」配成问答对。
+        # 放在同一条消息里可保证顺序（先题目后回答），不必依赖两次 HTTP 的先后。
+        event: dict = {"type": "ai", "text": text, "done": done}
+        question = str(payload.get("question", ""))
+        if question:
+            event["question"] = question[:4000]
+        if payload.get("turn"):
+            event["turn"] = int(payload["turn"])
+        phone_relay.schedule_json(event)
         return {"ok": True}
 
     @app.post("/api/ai/prompt")
@@ -470,6 +483,22 @@ def create_app(config: AppConfig) -> FastAPI:
         require_local(request)
         session_recorder.clear()
         return {"ok": True}
+
+    @app.post("/api/session/reset")
+    async def session_reset(request: Request) -> dict:
+        """开始新一场面试：清空跨场次残留状态。
+
+        服务端侧清内存记录、手机追问上下文与上一次实际发送的提示词缓存；
+        再广播 reset_session 通知桌面 Overlay 清空对话历史/字幕/AI 输出，
+        以及手机端清空聊天流。配置、知识库、简历等长期资料不受影响。
+        """
+        session_recorder.clear()
+        with phone_relay._chat_lock:
+            phone_relay.phone_chat_history.clear()
+        last_ai_prompt["prompt"] = ""
+        hub.publish({"type": "reset_session"})
+        phone_relay.schedule_json({"type": "session_reset"})
+        return {"ok": True, "resetAt": datetime.now(timezone.utc).isoformat()}
 
     # ---------------------------------------------------------------- 热词
     @app.get("/api/hotwords/detected")

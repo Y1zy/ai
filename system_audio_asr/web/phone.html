@@ -2,32 +2,39 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VoxRibbon · 手机投屏</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Microsoft YaHei UI",system-ui,sans-serif;background:#0a0a1a;color:#e0e0e0;min-height:100vh;min-height:100dvh}
-header{position:sticky;top:0;z-index:10;padding:12px 16px;background:rgba(10,10,26,.95);backdrop-filter:blur(12px);border-bottom:1px solid rgba(255,255,255,.06);display:flex;align-items:center;justify-content:space-between}
-.title{font-size:15px;font-weight:700;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.badge{font-size:11px;padding:3px 8px;border-radius:99px;font-weight:600}
+/* 字号档位：--fs 由右上角「Aa」切换（小/中/大/特大），存 localStorage。
+   默认「大」，手机竖屏远看的场景比桌面更需要大字号。 */
+:root{--fs:17px}
+body{font-family:-apple-system,BlinkMacSystemFont,"Microsoft YaHei UI",system-ui,sans-serif;background:#0a0a1a;color:#e0e0e0;min-height:100vh;min-height:100dvh;font-size:var(--fs)}
+header{position:sticky;top:0;z-index:10;padding:12px 16px;background:rgba(10,10,26,.95);backdrop-filter:blur(12px);border-bottom:1px solid rgba(255,255,255,.06);display:flex;align-items:center;justify-content:space-between;gap:10px}
+.title{font-size:calc(var(--fs) + 1px);font-weight:700;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge{font-size:calc(var(--fs) - 5px);padding:3px 8px;border-radius:99px;font-weight:600;white-space:nowrap}
 .b-on{background:rgba(34,197,94,.15);color:#4ade80}
 .b-off{background:rgba(239,68,68,.15);color:#f87171}
+.fs-btn{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#e2e8f0;border-radius:8px;padding:4px 9px;font-size:calc(var(--fs) - 3px);font-weight:700;cursor:pointer;white-space:nowrap}
+.fs-btn:active{opacity:.7}
 main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
 .img-wrap{border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02)}
 .img-wrap img{width:100%;display:block}
 .actions{display:flex;gap:8px}
-.btn{flex:1;padding:10px 12px;font-size:13px;font-weight:600;border:none;border-radius:10px;cursor:pointer}
+.btn{flex:1;padding:11px 12px;font-size:calc(var(--fs) - 2px);font-weight:600;border:none;border-radius:10px;cursor:pointer}
 .btn-primary{background:linear-gradient(135deg,#60a5fa,#a78bfa);color:#fff}
 .btn-secondary{background:rgba(255,255,255,.06);color:#e2e8f0;border:1px solid rgba(255,255,255,.1);display:flex;align-items:center;justify-content:center;gap:6px}
 .btn:active{opacity:.7}
-.switchline{display:flex;align-items:center;gap:8px;font-size:13px;color:#cbd5e1}
-.switchline input{width:18px;height:18px;accent-color:#60a5fa}
-.card{background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:12px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
-.card .q{font-size:11px;color:#60a5fa;margin-bottom:6px;font-weight:600}
+.switchline{display:flex;align-items:center;gap:8px;font-size:calc(var(--fs) - 2px);color:#cbd5e1}
+.switchline input{width:20px;height:20px;accent-color:#60a5fa}
+#ask-input{flex:1;min-width:0;padding:11px 12px;font-size:calc(var(--fs) - 2px);color:#f1f5f9;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.12);border-radius:10px;outline:none}
+#ask-input:focus{border-color:#60a5fa}
+.card{background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:12px;font-size:var(--fs);line-height:1.65;white-space:pre-wrap;word-break:break-word}
+.card .q{font-size:calc(var(--fs) - 4px);color:#60a5fa;margin-bottom:6px;font-weight:600}
 .card.old{opacity:.55}
-.partial{font-size:12px;color:#64748b;padding:6px 10px;border-left:2px solid rgba(255,255,255,.1);margin:2px 0}
-.err{color:#f87171;font-size:12px}
-.tip{color:#64748b;font-size:11px;text-align:center;padding:6px}
+.partial{font-size:calc(var(--fs) - 2px);color:#64748b;padding:6px 10px;border-left:2px solid rgba(255,255,255,.1);margin:2px 0}
+.err{color:#f87171;font-size:calc(var(--fs) - 3px)}
+.tip{color:#64748b;font-size:calc(var(--fs) - 4px);text-align:center;padding:6px}
 .cursor::after{content:"▌";color:#60a5fa;animation:blink .8s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
 .hidden{display:none}
@@ -36,7 +43,10 @@ main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
 <body>
 <header>
   <span class="title">VoxRibbon · 手机投屏</span>
-  <span id="status" class="badge b-off">未连接</span>
+  <span style="display:flex;align-items:center;gap:8px">
+    <button id="fs-btn" class="fs-btn" type="button" title="切换字号">Aa</button>
+    <span id="status" class="badge b-off">未连接</span>
+  </span>
 </header>
 <main>
   <div id="banner" class="err hidden"></div>
@@ -64,6 +74,7 @@ main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
       <button id="copy-btn" class="btn btn-secondary">复制到手机</button>
       <button id="clip-send" class="btn btn-primary">把手机剪贴板发到电脑</button>
     </div>
+    <label class="switchline" style="margin-top:8px"><input id="clip-auto" type="checkbox">自动同步手机剪贴板到电脑（开启时需授权一次）</label>
     <div id="clip-status" class="tip hidden"></div>
   </div>
   <div id="feed"></div>
@@ -87,6 +98,8 @@ var $banner = document.getElementById("banner");
 var currentImgUrl = null;
 // 追问流：本机渲染的问答气泡（服务端另有历史供 AI 上下文，刷新页面不回放）。
 var pendingAskText = "";
+// 电脑端当前轮次：同一 turn 的流式更新归到同一条回答气泡；题目气泡每轮只渲染一次。
+var lastDesktopTurn = 0;
 
 function setStatus(on){
   $status.className = "badge " + (on ? "b-on" : "b-off");
@@ -159,12 +172,36 @@ function handleText(raw){
     case "status":
       break;
     case "ai":
+      // source: ask=手机追问 / solve=截图解题 / 无 source（C# PhoneAiFeed）=电脑端字幕 AI。
+      // 电脑端在请求发起时就单独发一帧「只有题目、没有正文」的消息，手机先显示问题，
+      // 再看着回答逐步长出来；同一 turn 的后续帧只更新回答气泡，题目不会重复。
+      // 空文本且无题目（桌面重置时的 Post("", true)）只用于封口，不建气泡。
+      var turn = msg.turn || 0;
+      if (msg.question && turn && turn !== lastDesktopTurn) {
+        lastDesktopTurn = turn;
+        appendChat("question", stripMarkdown(msg.question), false);
+      }
+      if (!String(msg.text || "").trim()) {
+        if (msg.source === "ask") pendingAskText = "";
+        break;
+      }
       if (msg.source === "ask") {
         appendChat("ai", stripMarkdown(msg.text || ""), !msg.done);
         if (msg.done) pendingAskText = "";
       } else if (msg.source === "solve") {
         appendChat("solve", stripMarkdown(msg.text || ""), !msg.done);
+      } else {
+        appendChat("desktop", stripMarkdown(msg.text || ""), !msg.done, turn);
       }
+      break;
+    case "session_reset":
+      // 「开始新一场」：清空本场聊天流，避免上一场问答残留在手机上。
+      $chatFlow.innerHTML = "";
+      pendingAskText = "";
+      lastDesktopTurn = 0;
+      $partial.classList.add("hidden");
+      $partial.textContent = "";
+      setErr("");
       break;
     case "chat_cleared":
       $chatFlow.innerHTML = "";
@@ -190,7 +227,6 @@ function showPcClipboard(text){
   document.getElementById("pc-clip").textContent = text.length > 600 ? text.slice(0, 600) + "…" : text;
   card.classList.remove("hidden");
 }
-
 function addTranscript(text){
   var div = document.createElement("div");
   div.className = "card";
@@ -202,38 +238,63 @@ function addTranscript(text){
 
 // 追问聊天流：me=我的问题（蓝） / ai=AI 回答 / solve=截图解题（绿标记）。
 // 单条气泡原地更新（流式），新气泡追加，历史保留（上限 50 条），不再互相覆盖。
-function appendChat(kind, text, streaming){
+// 气泡前缀：原地更新时也要带上，否则流式改写会丢掉图标。
+function chatPrefix(kind){
+  if (kind === "me") return "🧑 ";
+  if (kind === "solve") return "📸 ";
+  if (kind === "desktop") return "🖥 ";
+  if (kind === "question") return "❓ ";
+  return "🤖 ";
+}
+function appendChat(kind, text, streaming, turn){
   var last = $chatFlow.lastChild;
-  var expected = kind === "me" ? "chat-me" : (kind === "solve" ? "chat-solve" : "chat-ai");
-  if (streaming && last && last.dataset && last.dataset.kind === expected && last.dataset.open === "1") {
+  var expected = kind === "me" ? "chat-me"
+    : (kind === "solve" ? "chat-solve"
+    : (kind === "desktop" ? "chat-desktop"
+    : (kind === "question" ? "chat-question" : "chat-ai")));
+  var prefix = chatPrefix(kind);
+  // 上一条仍是"打开"状态就原地改写（含最终 done 封口）。
+  // 条件不能要求 streaming：done 消息也要落到同一条气泡，否则会多出一个重复气泡。
+  // 带 turn 的（电脑端）额外校验轮次，避免前一轮没收尾时串到下一轮。
+  var sameTurn = !turn || !last || !last.dataset || String(last.dataset.turn) === String(turn);
+  if (last && last.dataset && last.dataset.kind === expected
+      && last.dataset.open === "1" && sameTurn) {
     last.dataset.open = streaming ? "1" : "0";
-    last.textContent = text + (streaming ? " ▍" : "");
+    last.textContent = prefix + text + (streaming ? " ▍" : "");
     window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
     return;
   }
   var div = document.createElement("div");
   div.dataset.kind = expected;
   div.dataset.open = streaming ? "1" : "0";
+  if (turn) div.dataset.turn = String(turn);
   div.style.padding = "8px 10px";
   div.style.borderRadius = "10px";
   div.style.whiteSpace = "pre-wrap";
   div.style.wordBreak = "break-word";
-  div.style.fontSize = "13px";
-  div.style.lineHeight = "1.6";
+  div.style.fontSize = "var(--fs)";
+  div.style.lineHeight = "1.65";
   if (kind === "me") {
     div.style.background = "rgba(96,165,250,.18)";
     div.style.border = "1px solid rgba(96,165,250,.35)";
     div.style.alignSelf = "flex-end";
-    div.textContent = "🧑 " + text;
   } else if (kind === "solve") {
     div.style.background = "rgba(34,197,94,.10)";
     div.style.border = "1px solid rgba(34,197,94,.25)";
-    div.textContent = "📸 " + text + (streaming ? " ▍" : "");
+  } else if (kind === "question") {
+    // 电脑端识别出的题目：蓝色描边、无底色，和下面的回答明显成对。
+    div.style.background = "rgba(96,165,250,.10)";
+    div.style.border = "1px dashed rgba(96,165,250,.45)";
+    div.style.fontWeight = "600";
+  } else if (kind === "desktop") {
+    // 电脑端 AI 回答：紫色标记，与手机追问的普通回答区分开。
+    div.style.background = "rgba(167,139,250,.12)";
+    div.style.border = "1px solid rgba(167,139,250,.3)";
   } else {
     div.style.background = "rgba(255,255,255,.05)";
     div.style.border = "1px solid rgba(255,255,255,.10)";
-    div.textContent = "🤖 " + text + (streaming ? " ▍" : "");
   }
+  div.textContent = prefix + text + (streaming ? " ▍" : "");
   $chatFlow.appendChild(div);
   while ($chatFlow.children.length > 50) $chatFlow.removeChild($chatFlow.firstChild);
   window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
@@ -279,14 +340,70 @@ document.getElementById("copy-btn").onclick = function(){
   setTimeout(function(){ document.getElementById("copy-btn").textContent = "复制到手机"; }, 2000);
 };
 // 手机剪贴板 → 电脑：浏览器无法后台读剪贴板，需一次用户点击授权。
-// 点击后读取手机剪贴板并推送到电脑；之后每次点这个按钮都会同步最新内容。
+// 勾选「自动同步」后：首次点击触发授权，之后按固定间隔轮询并推送变化，
+// 不再需要每次手点按钮（Chrome/Edge 支持；iOS Safari 不支持则回落为手动）。
+var clipAutoTimer = null;
+var CLIP_AUTO_INTERVAL_MS = 1500;
+
+function pushPhoneClipboard(text, silent){
+  var trimmed = (text || "").trim();
+  if (!trimmed) {
+    if (!silent) showClipStatus("手机剪贴板是空的，先在手机上复制一段文字");
+    return false;
+  }
+  if (trimmed === lastPhonePush) return false;
+  lastPhonePush = trimmed;
+  if (send({ type: "clipboard", text: trimmed })) {
+    if (!silent) showClipStatus("已发送到电脑剪贴板");
+    return true;
+  }
+  return false;
+}
+
+function stopClipAuto(){
+  if (clipAutoTimer) { clearInterval(clipAutoTimer); clipAutoTimer = null; }
+}
+
+async function clipAutoTick(){
+  if (!navigator.clipboard || !navigator.clipboard.readText) { stopClipAuto(); return; }
+  try {
+    pushPhoneClipboard(await navigator.clipboard.readText(), true);
+  } catch (err) {
+    // 授权被撤销或页面转后台：停止轮询并复位开关，避免无意义的报错。
+    stopClipAuto();
+    var box = document.getElementById("clip-auto");
+    if (box) box.checked = false;
+    showClipStatus("自动同步已停止：浏览器未授予剪贴板读取权限");
+  }
+}
+
+document.getElementById("clip-auto").onchange = function(e){
+  if (!e.target.checked) { stopClipAuto(); showClipStatus("已关闭自动同步"); return; }
+  if (!navigator.clipboard || !navigator.clipboard.readText) {
+    e.target.checked = false;
+    showClipStatus("当前浏览器不支持自动读取剪贴板，请继续用下方按钮手动发送");
+    return;
+  }
+  navigator.clipboard.readText().then(function(text){
+    pushPhoneClipboard(text, true);
+    stopClipAuto();
+    clipAutoTimer = setInterval(clipAutoTick, CLIP_AUTO_INTERVAL_MS);
+    showClipStatus("自动同步已开启，手机上复制的文字会自动发到电脑");
+  }, function(){
+    e.target.checked = false;
+    showClipStatus("浏览器拒绝读取手机剪贴板：请在弹出的提示中选择允许，或改用下方按钮");
+  });
+};
+
+// 页面回到前台时补一次同步，避免后台被浏览器挂起期间漏掉内容。
+document.addEventListener("visibilitychange", function(){
+  if (!document.hidden && clipAutoTimer) clipAutoTick();
+});
+
+// 手机剪贴板 → 电脑：手动按钮（未开启自动同步时的入口）。
 document.getElementById("clip-send").onclick = function(){
   var finish = function(text){
-    var trimmed = (text || "").trim();
-    if (!trimmed) { showClipStatus("手机剪贴板是空的，先在手机上复制一段文字"); return; }
-    if (trimmed === lastPhonePush) { showClipStatus("内容未变化"); return; }
-    lastPhonePush = trimmed;
-    send({ type: "clipboard", text: trimmed });
+    pushPhoneClipboard(text, false);
   };
   if (navigator.clipboard && navigator.clipboard.readText) {
     navigator.clipboard.readText().then(function(text){
@@ -305,6 +422,32 @@ function showClipStatus(message){
   clipStatus.classList.remove("hidden");
   setTimeout(function(){ clipStatus.classList.add("hidden"); }, 3000);
 }
+
+// 字号档位：点「Aa」循环切换，记住选择。默认「大」——面试时手机常放在远处看。
+var FS_STEPS = [{name:"小",px:15},{name:"中",px:17},{name:"大",px:19},{name:"特大",px:22}];
+var FS_DEFAULT = 2;
+function fsIndex(){
+  var saved = parseInt(localStorage.getItem("voxribbon.fs") || "", 10);
+  return (saved >= 0 && saved < FS_STEPS.length) ? saved : FS_DEFAULT;
+}
+function applyFs(index){
+  var step = FS_STEPS[index];
+  document.documentElement.style.setProperty("--fs", step.px + "px");
+  var btn = document.getElementById("fs-btn");
+  btn.textContent = "Aa " + step.name;
+  btn.title = "字号：" + step.name + "（点击切换）";
+  localStorage.setItem("voxribbon.fs", String(index));
+}
+// 切换后在按钮上回显档位名，1.2 秒后收回 "Aa"，避免顶栏被撑宽。
+var fsResetTimer = null;
+document.getElementById("fs-btn").onclick = function(){
+  applyFs((fsIndex() + 1) % FS_STEPS.length);
+  var btn = document.getElementById("fs-btn");
+  btn.textContent = FS_STEPS[fsIndex()].name + "字号";
+  if (fsResetTimer) clearTimeout(fsResetTimer);
+  fsResetTimer = setTimeout(function(){ btn.textContent = "Aa"; }, 1200);
+};
+applyFs(fsIndex());
 
 connect();
 </script>

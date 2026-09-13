@@ -34,7 +34,13 @@ class SessionRecorder:
             self._add_solve(str(event.get("text", "")), bool(event.get("done")))
 
     def add_ai(self, text: str, done: bool) -> None:
-        """C# 每次推送的是累计全量文本；done=True 封口。"""
+        """C# 每次推送的是累计全量文本；done=True 封口。
+
+        文本为空即视为"取消/重置"信号（C# ResetConversation 会 Post("", true)）：
+        此时不能新建条目，否则每次重置都会在记录里留下一条空回答。
+        """
+        if not text.strip():
+            return
         with self._lock:
             entry = self._last_open("ai_open")
             if entry is None:
@@ -156,24 +162,24 @@ class SessionRecorder:
             self._trim_locked()
 
     def _add_solve(self, text: str, done: bool) -> None:
+        """截图解题流：text 始终是累计全文快照（与桌面/手机气泡的替换式渲染一致），
+        因此这里必须整体覆盖，不能累加——否则会把每次快照重复拼接。"""
         with self._lock:
             entry = self._last_open("solve_open")
             if entry is None:
                 if not text.strip():
                     return
                 if done:
-                    # 无前续增量的完整消息（如「解题失败：…」）
+                    # 无前续快照的完整消息（如「解题失败：…」）
                     self._entries.append({"ts": time.time(), "kind": "solve", "text": text})
                     self._trim_locked()
                     return
                 entry = {"ts": time.time(), "kind": "solve_open", "text": ""}
                 self._entries.append(entry)
+            if text.strip():
+                entry["text"] = text
             if done:
-                if text.strip():
-                    entry["text"] = text  # 流结束时推送全文
                 entry["kind"] = "solve"
-            else:
-                entry["text"] += text
             self._trim_locked()
 
     def _last_open(self, kind: str) -> dict | None:
