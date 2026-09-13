@@ -31,6 +31,16 @@ main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
 #ask-input:focus{border-color:#60a5fa}
 .card{background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:12px;font-size:var(--fs);line-height:1.65;white-space:pre-wrap;word-break:break-word}
 .card .q{font-size:calc(var(--fs) - 4px);color:#60a5fa;margin-bottom:6px;font-weight:600}
+/* 剪贴板卡片：默认折叠，点标题展开。标题行显示简要状态（有没有内容可复制）。
+   .card 的 white-space:pre-wrap 会把 details 标签间的换行/缩进当可见空白渲染，
+   从而把折叠态撑高，这里必须复位为 normal。 */
+.clip-card{padding:0;overflow:hidden;white-space:normal}
+.clip-card > summary{display:flex;align-items:center;gap:8px;padding:12px;cursor:pointer;list-style:none}
+.clip-card > summary::-webkit-details-marker{display:none}
+.clip-card > summary::before{content:"▸";color:#64748b;font-size:calc(var(--fs) - 4px);flex:none}
+.clip-card[open] > summary::before{content:"▾"}
+.clip-brief{margin-left:auto;font-size:calc(var(--fs) - 5px);color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
+.clip-body{padding:0 12px 12px}
 /* 聊天流限定高度并在内部滚动：回答长短不一时页面高度保持稳定，
    输入框也始终留在可见位置，不会被长回答顶出屏幕。 */
 #chat-flow{max-height:min(52vh,460px);overflow-y:auto;overscroll-behavior:contain}
@@ -70,16 +80,21 @@ main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
     <div id="chat-flow" style="display:flex;flex-direction:column;gap:8px;margin:8px 0"></div>
     <div class="actions" style="margin:8px 0 0"><input id="ask-input" type="text" placeholder="继续追问…"><button id="ask-send" class="btn btn-primary">发送</button></div>
   </div>
-  <div id="clipboard-card" class="card hidden">
-    <div class="q">📋 剪贴板双向同步（自动）</div>
-    <div id="pc-clip" style="color:#cbd5e1"></div>
-    <div class="actions" style="margin-top:8px">
-      <button id="copy-btn" class="btn btn-secondary">复制到手机</button>
-      <button id="clip-send" class="btn btn-primary">把手机剪贴板发到电脑</button>
+  <details id="clipboard-card" class="card clip-card">
+    <summary>
+      <span class="q" style="margin:0">📋 剪贴板双向同步</span>
+      <span id="clip-brief" class="clip-brief"></span>
+    </summary>
+    <div class="clip-body">
+      <div id="pc-clip" style="color:#cbd5e1"></div>
+      <div class="actions" style="margin-top:8px">
+        <button id="copy-btn" class="btn btn-secondary">复制到手机</button>
+        <button id="clip-send" class="btn btn-primary">把手机剪贴板发到电脑</button>
+      </div>
+      <label class="switchline" style="margin-top:8px"><input id="clip-auto" type="checkbox">自动同步手机剪贴板到电脑（需浏览器授权，HTTP 局域网下多数手机不支持）</label>
+      <div id="clip-status" class="tip hidden"></div>
     </div>
-    <label class="switchline" style="margin-top:8px"><input id="clip-auto" type="checkbox">自动同步手机剪贴板到电脑（开启时需授权一次）</label>
-    <div id="clip-status" class="tip hidden"></div>
-  </div>
+  </details>
   <div id="feed"></div>
   <div id="err"></div>
   <div class="tip">本地直连 · 手机与电脑同一网络 · 低延迟</div>
@@ -223,12 +238,21 @@ function handleText(raw){
 
 var pcClipText = "";
 var lastPhonePush = "";
+// 折叠卡片常驻显示，标题行用一行摘要提示"电脑剪贴板里有什么"，
+// 有内容时自动展开一次，避免用户不知道要来看这里。
+function setClipBrief(text){
+  var brief = document.getElementById("clip-brief");
+  if (!brief) return;
+  var oneLine = (text || "").replace(/\s+/g, " ").trim();
+  brief.textContent = oneLine ? oneLine.slice(0, 40) + (oneLine.length > 40 ? "…" : "") : "暂无电脑剪贴板内容";
+}
 function showPcClipboard(text){
   if (!text) return;
   pcClipText = text;
   var card = document.getElementById("clipboard-card");
   document.getElementById("pc-clip").textContent = text.length > 600 ? text.slice(0, 600) + "…" : text;
-  card.classList.remove("hidden");
+  setClipBrief(text);
+  if (card) card.open = true;
 }
 // 聊天流内滚动到底。不能用 window.scrollTo(document.body.scrollHeight)：
 // 页面底部是字幕历史与页脚，那样会把聊天卡片顶出视野，回答越长推得越远。
@@ -467,6 +491,7 @@ document.getElementById("fs-btn").onclick = function(){
   fsResetTimer = setTimeout(function(){ btn.textContent = "Aa"; }, 1200);
 };
 applyFs(fsIndex());
+setClipBrief("");
 
 connect();
 </script>
