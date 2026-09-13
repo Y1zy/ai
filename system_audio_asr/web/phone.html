@@ -31,6 +31,9 @@ main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
 #ask-input:focus{border-color:#60a5fa}
 .card{background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:12px;font-size:var(--fs);line-height:1.65;white-space:pre-wrap;word-break:break-word}
 .card .q{font-size:calc(var(--fs) - 4px);color:#60a5fa;margin-bottom:6px;font-weight:600}
+/* 聊天流限定高度并在内部滚动：回答长短不一时页面高度保持稳定，
+   输入框也始终留在可见位置，不会被长回答顶出屏幕。 */
+#chat-flow{max-height:min(52vh,460px);overflow-y:auto;overscroll-behavior:contain}
 .card.old{opacity:.55}
 .partial{font-size:calc(var(--fs) - 2px);color:#64748b;padding:6px 10px;border-left:2px solid rgba(255,255,255,.1);margin:2px 0}
 .err{color:#f87171;font-size:calc(var(--fs) - 3px)}
@@ -227,13 +230,25 @@ function showPcClipboard(text){
   document.getElementById("pc-clip").textContent = text.length > 600 ? text.slice(0, 600) + "…" : text;
   card.classList.remove("hidden");
 }
+// 聊天流内滚动到底。不能用 window.scrollTo(document.body.scrollHeight)：
+// 页面底部是字幕历史与页脚，那样会把聊天卡片顶出视野，回答越长推得越远。
+// 滚动的是 #chat-flow（限高并 overflow-y:auto），不是外层卡片。
+function chatAtBottom(){
+  var flow = document.getElementById("chat-flow");
+  if (!flow) return true;
+  return flow.scrollHeight - flow.scrollTop - flow.clientHeight < 80;
+}
+function scrollChatToBottom(){
+  var flow = document.getElementById("chat-flow");
+  if (!flow) return;
+  flow.scrollTop = flow.scrollHeight;
+}
 function addTranscript(text){
   var div = document.createElement("div");
   div.className = "card";
   div.textContent = text;
   $feed.appendChild(div);
   while ($feed.children.length > 40) $feed.removeChild($feed.firstChild);
-  window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
 }
 
 // 追问聊天流：me=我的问题（蓝） / ai=AI 回答 / solve=截图解题（绿标记）。
@@ -253,6 +268,9 @@ function appendChat(kind, text, streaming, turn){
     : (kind === "desktop" ? "chat-desktop"
     : (kind === "question" ? "chat-question" : "chat-ai")));
   var prefix = chatPrefix(kind);
+  // 必须在写入前判断"用户是否本来就在底部"：长回答一帧可能长高几百像素，
+  // 写完再判断会被误当成"用户正在翻看历史"，从而停止跟随。
+  var follow = chatAtBottom();
   // 上一条仍是"打开"状态就原地改写（含最终 done 封口）。
   // 条件不能要求 streaming：done 消息也要落到同一条气泡，否则会多出一个重复气泡。
   // 带 turn 的（电脑端）额外校验轮次，避免前一轮没收尾时串到下一轮。
@@ -261,7 +279,7 @@ function appendChat(kind, text, streaming, turn){
       && last.dataset.open === "1" && sameTurn) {
     last.dataset.open = streaming ? "1" : "0";
     last.textContent = prefix + text + (streaming ? " ▍" : "");
-    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+    if (follow || kind === "me") scrollChatToBottom();
     return;
   }
   var div = document.createElement("div");
@@ -297,7 +315,8 @@ function appendChat(kind, text, streaming, turn){
   div.textContent = prefix + text + (streaming ? " ▍" : "");
   $chatFlow.appendChild(div);
   while ($chatFlow.children.length > 50) $chatFlow.removeChild($chatFlow.firstChild);
-  window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+  // 新气泡出现时，只有用户原本就在底部才跟随（自己发的提问除外）。
+  if (follow || kind === "me") scrollChatToBottom();
 }
 
 function send(obj){
