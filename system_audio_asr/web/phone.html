@@ -17,7 +17,7 @@ header{position:sticky;top:0;z-index:10;padding:12px 16px;background:rgba(10,10,
 .b-off{background:rgba(239,68,68,.15);color:#f87171}
 .fs-btn{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#e2e8f0;border-radius:8px;padding:4px 9px;font-size:calc(var(--fs) - 3px);font-weight:700;cursor:pointer;white-space:nowrap}
 .fs-btn:active{opacity:.7}
-main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
+main{padding:12px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .img-wrap{border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02)}
 .img-wrap img{width:100%;display:block}
 .actions{display:flex;gap:8px}
@@ -30,20 +30,42 @@ main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
 #ask-input{flex:1;min-width:0;padding:11px 12px;font-size:calc(var(--fs) - 2px);color:#f1f5f9;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.12);border-radius:10px;outline:none}
 #ask-input:focus{border-color:#60a5fa}
 .card{background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:12px;font-size:var(--fs);line-height:1.65;white-space:pre-wrap;word-break:break-word}
+/* 结构型卡片不能继承 pre-wrap：HTML 源码里的换行与缩进会被当成可见空白渲染，
+   把卡片撑高数百像素（聊天卡片曾因此比实际内容高 298px）。
+   气泡文本靠各自的内联样式保留 pre-wrap，不受影响。 */
+#chat-card,#clipboard-card{white-space:normal}
 .card .q{font-size:calc(var(--fs) - 4px);color:#60a5fa;margin-bottom:6px;font-weight:600}
-/* 剪贴板卡片：默认折叠，点标题展开。标题行显示简要状态（有没有内容可复制）。
-   .card 的 white-space:pre-wrap 会把 details 标签间的换行/缩进当可见空白渲染，
-   从而把折叠态撑高，这里必须复位为 normal。 */
-.clip-card{padding:0;overflow:hidden;white-space:normal}
+/* 剪贴板卡片：默认折叠，点标题展开。标题行显示简要状态（有没有内容可复制）。 */
+.clip-card{padding:0;overflow:hidden}
 .clip-card > summary{display:flex;align-items:center;gap:8px;padding:12px;cursor:pointer;list-style:none}
 .clip-card > summary::-webkit-details-marker{display:none}
 .clip-card > summary::before{content:"▸";color:#64748b;font-size:calc(var(--fs) - 4px);flex:none}
 .clip-card[open] > summary::before{content:"▾"}
 .clip-brief{margin-left:auto;font-size:calc(var(--fs) - 5px);color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
 .clip-body{padding:0 12px 12px}
-/* 聊天流限定高度并在内部滚动：回答长短不一时页面高度保持稳定，
-   输入框也始终留在可见位置，不会被长回答顶出屏幕。 */
-#chat-flow{max-height:min(52vh,460px);overflow-y:auto;overscroll-behavior:contain}
+/* 聊天流限定高度并在内部滚动：回答长短不一时页面高度保持稳定。
+   高度按视口给足（一条 500 字回答在默认字号下约需 800px），
+   上限用 dvh 保证小屏也不会撑出屏幕。 */
+#chat-flow{max-height:min(62dvh,900px);overflow-y:auto;overscroll-behavior:contain}
+/* 展开模式：仅保留聊天卡片，其余区块收起，聊天区吃满剩余视口高度。
+   同时收紧页头与内边距，把省下的空间全部让给回答（仍受屏幕物理高度限制，
+   比整屏还长的回答需在框内滚动）。 */
+body.chat-expanded main > .actions,
+body.chat-expanded main > .switchline,
+body.chat-expanded main > .tip,
+body.chat-expanded #img-wrap,
+body.chat-expanded #save-tip,
+body.chat-expanded #partial,
+body.chat-expanded #clipboard-card,
+body.chat-expanded #feed{display:none}
+body.chat-expanded header{padding:6px 12px}
+body.chat-expanded main{padding:8px 10px 8px}
+body.chat-expanded #chat-card{padding:10px}
+/* 空的状态区不占高度（#err 为空时仍有 line-height 高度） */
+body.chat-expanded #err:empty{display:none}
+/* 高度 = 视口 - 页头 - main 上下内边距 - 卡片内边距 - 卡片标题行 - 输入行 - 间隙 */
+body.chat-expanded #chat-flow{max-height:calc(100dvh - 210px)}
+.chat-expand-btn{flex:none;padding:4px 10px;font-size:calc(var(--fs) - 6px)}
 .card.old{opacity:.55}
 .partial{font-size:calc(var(--fs) - 2px);color:#64748b;padding:6px 10px;border-left:2px solid rgba(255,255,255,.1);margin:2px 0}
 .err{color:#f87171;font-size:calc(var(--fs) - 3px)}
@@ -73,9 +95,12 @@ main{padding:12px 16px 200px;display:flex;flex-direction:column;gap:12px}
   <div class="tip hidden" id="save-tip">提示：iOS 浏览器长按图片也可保存</div>
   <div id="partial" class="partial hidden"></div>
   <div id="chat-card" class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <div class="q">💬 AI 对话（支持追问）</div>
-      <button id="chat-clear" class="btn btn-secondary" style="flex:none;padding:4px 10px;font-size:11px">清空</button>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+      <div class="q" style="margin:0">💬 AI 对话（支持追问）</div>
+      <span style="display:flex;gap:6px;flex:none">
+        <button id="chat-expand" class="btn btn-secondary chat-expand-btn" type="button">⤢ 放大</button>
+        <button id="chat-clear" class="btn btn-secondary chat-expand-btn" type="button">清空</button>
+      </span>
     </div>
     <div id="chat-flow" style="display:flex;flex-direction:column;gap:8px;margin:8px 0"></div>
     <div class="actions" style="margin:8px 0 0"><input id="ask-input" type="text" placeholder="继续追问…"><button id="ask-send" class="btn btn-primary">发送</button></div>
@@ -490,6 +515,24 @@ document.getElementById("fs-btn").onclick = function(){
   if (fsResetTimer) clearTimeout(fsResetTimer);
   fsResetTimer = setTimeout(function(){ btn.textContent = "Aa"; }, 1200);
 };
+// 放大/还原聊天区：展开时收起其余区块，让长回答一屏尽量多显示。
+// 选择记在 localStorage，面试中刷新页面不会退回小窗。
+var CHAT_EXPAND_KEY = "voxribbon.chatExpanded";
+function applyChatExpanded(on){
+  document.body.classList.toggle("chat-expanded", on);
+  var btn = document.getElementById("chat-expand");
+  if (btn) {
+    btn.textContent = on ? "⤡ 还原" : "⤢ 放大";
+    btn.title = on ? "还原为常规布局" : "放大对话区，收起其他区块";
+  }
+  try { localStorage.setItem(CHAT_EXPAND_KEY, on ? "1" : "0"); } catch(_){}
+  if (on) scrollChatToBottom();
+}
+document.getElementById("chat-expand").onclick = function(){
+  applyChatExpanded(!document.body.classList.contains("chat-expanded"));
+};
+try { applyChatExpanded(localStorage.getItem(CHAT_EXPAND_KEY) === "1"); } catch(_){}
+
 applyFs(fsIndex());
 setClipBrief("");
 
