@@ -179,3 +179,35 @@ def test_entry_count_limit(store) -> None:
 def test_public_entries_includes_char_count(store) -> None:
     kb.upsert_entry({"title": "t", "content": "hello"})
     assert kb.public_entries()[0]["chars"] == 5
+
+
+# ---------------------------------------------------------------- 空内容与返回语义
+# 早期「更新为空内容」会被 _normalize_entry 过滤掉条目，表现为静默删除，
+# 且返回值指向另一条无关条目，调用方无法察觉写入失败。
+
+
+def test_upsert_empty_content_raises_instead_of_deleting(store) -> None:
+    kb.upsert_entry({"id": "a", "title": "我的项目", "content": "原始内容"})
+    with pytest.raises(ValueError, match="不能为空"):
+        kb.upsert_entry({"id": "a", "title": "我的项目", "content": ""})
+    entries = kb.load_entries()
+    assert len(entries) == 1, "条目被静默删除"
+    assert entries[0]["content"] == "原始内容", "原有内容被清空"
+
+
+def test_upsert_whitespace_content_raises(store) -> None:
+    with pytest.raises(ValueError, match="不能为空"):
+        kb.upsert_entry({"title": "t", "content": "   \n  "})
+
+
+def test_upsert_container_content_raises(store) -> None:
+    with pytest.raises(ValueError, match="格式不合法"):
+        kb.upsert_entry({"title": "t", "content": ["不是", "文本"]})
+
+
+def test_upsert_returns_written_entry(store) -> None:
+    """返回值必须指向实际写入的那条，而不是无关条目的兜底。"""
+    kb.upsert_entry({"id": "x", "title": "别的", "content": "别的内容"})
+    entry = kb.upsert_entry({"id": "y", "title": "目标", "content": "目标内容"})
+    assert entry["id"] == "y"
+    assert entry["content"] == "目标内容"

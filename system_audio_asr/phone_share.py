@@ -150,6 +150,11 @@ def load_phone_config(path: Path | None = None) -> dict[str, Any]:
             raw = json.loads(target.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             raw = {}
+    # 文件可能被外部写坏成数组/字符串/null；非 dict 一律按空配置处理，
+    # 否则 raw.get 抛 AttributeError，会让 /api/phone/* 返回 500、
+    # 且 /relay 握手异常关闭（手机扫码后一直"未连接"且无明确报错）。
+    if not isinstance(raw, dict):
+        raw = {}
     config = {
         "enabled": bool(raw.get("enabled", False)),
         "sid": str(raw.get("sid") or ""),
@@ -459,47 +464,53 @@ class ClipboardWatcher:
         self._stop.set()
 
     def accept_from_phone(self, text: str) -> bool:
-        """手机推送的文本写入电脑剪贴板；记录来源防止回环广播。
+        """手机推送的文本写入电脑剪贴板；抑制由此产生的回环广播。
 
-        先取当前序列号再做写入：若在写入瞬间其它程序也改了剪贴板，其序列号
-        一定晚于这里记录的值，poll_once 仍能把它当作真实更新推送出去，不会
-        因「先写后读」而把它误认成本次写入。
+        写入前先打回环标记（poll_once 在别的线程轮询，写剪贴板与更新序列号
+        之间有极短窗口，其间它可能读到本次写入的内容）；写入成功后把序列号
+        推进到当前值并清掉标记——此后序列号再变化就一定是用户的新复制。
+        序列号必须在写入**之后**取：若取写入前的值，poll_once 会因"序列号未变"
+        提前返回，清不掉标记，之后用户真正重新复制时会被误判成回环而漏推。
         """
         self._last_pushed_from_phone = text
-        try:
-            before = clipboard_sequence()
-        except Exception:
-            before = None
         ok = False
         try:
             ok = set_clipboard_text(text)
         except Exception:
             ok = False
         if ok:
-            if before is not None:
-                self._last_sequence = before
-            else:
-                try:
-                    self._last_sequence = clipboard_sequence()
-                except Exception:
-                    pass
-            self._last_text = text
+            try:
+                self._last_sequence = clipboard_sequence()
+            except Exception:
+                pass
+            self._last_pushed_from_phone = ""
             if self.relay is not None:
                 self.relay.latest_clipboard_text = text
+        else:
+            self._last_pushed_from_phone = ""
         return ok
 
     def poll_once(self) -> str | None:
         sequence = clipboard_sequence()
         if sequence == self._last_sequence:
             return None
-        self._last_sequence = sequence
         try:
             text = get_clipboard_text()
         except Exception:
             return None
-        if not text or text == self._last_text or text == self._last_pushed_from_phone:
+        # 读取失败（剪贴板被其他进程占用时 get_clipboard_text 返回空）不能消费
+        # 序列号，否则这次复制会被永久丢弃——序列号不再变化，也就不会再重试。
+        if not text:
             return None
-        self._last_text = text
+        self._last_sequence = sequence
+        # 用「序列号是否变化」判断是否有新复制，而不是比对文本内容：
+        # 用户重新复制同一段文字时内容与上次相同，按内容比对会漏推。
+        # 只保留回环抑制——手机推来的文本会在电脑剪贴板里再出现一次。
+        # 该抑制只作用于「紧接着的那次」：命中一次后即复位，之后用户
+        # 主动重新复制同一段文字仍能正常推送。
+        if text == self._last_pushed_from_phone:
+            self._last_pushed_from_phone = ""
+            return None
         if len(text) > MAX_CLIPBOARD_CHARS:
             text = text[:MAX_CLIPBOARD_CHARS]
         if self.relay is not None:
@@ -527,6 +538,10 @@ class PhoneRelay:
         self._phones: set[Any] = set()
         self._latest_jpeg: bytes | None = None
         self._auto_generation = 0
+        # 场次编号：开始新一场时自增，用于丢弃旧场次在途的解题流；
+        # _solve_generation 记录当前正在跑的解题属于哪一场。
+        self._session_generation = 0
+        self._solve_generation = 0
         self.clipboard_handler: Any = None
         self.latest_clipboard_text = ""
         self.solve_engine = SolveEngine()
@@ -548,6 +563,11 @@ class PhoneRelay:
         task.add_done_callback(self._tasks.discard)
 
     def _on_solve_delta(self, text: str, done: bool) -> None:
+        # 「开始新一场」之后，上一场在途的解题流可能还在推快照。
+        # 丢弃属于旧场次的增量，避免它污染新一场的记录与手机聊天流；
+        # 但最后一条 done 仍要放行，否则旧气泡永远停在流式状态。
+        if self._solve_generation != self._session_generation and not done:
+            return
         self.schedule_json({"type": "ai", "text": text, "done": done, "source": "solve"})
         publisher = self.desktop_publisher
         if publisher is not None:
@@ -556,13 +576,19 @@ class PhoneRelay:
             except Exception:
                 pass
 
+    def begin_new_session(self) -> None:
+        """标记新一场开始：停自动截图、丢弃缓存帧，并让旧场次的在途流失效。"""
+        self._session_generation += 1
+        self.stop_auto_capture()
+
     def request_solve(self) -> bool:
         """触发一次截图解题；返回 False 表示引擎未启用或正在进行。
 
-        注意：busy 分支不发提示——并发竞争由 SolveEngine.solve() 内部的
-        非阻塞加锁兜底并统一发出一次提示，避免此处与 solve() 重复提示。
+        busy 时主动推一条 done 提示给手机：否则手机点了「截题+回答」后
+        只会看到自己插入的"正在截屏解题…"气泡永远不封口，以为卡住了。
         """
         if self.solve_engine.busy:
+            self._on_solve_delta("上一个解题请求还在进行中，请稍候", True)
             return False
         try:
             jpeg = capture_screen_jpeg()
@@ -574,6 +600,8 @@ class PhoneRelay:
         session_recorder.add_solve_image(jpeg)
         self._latest_jpeg = jpeg
         self._drain_bytes_threadsafe(jpeg)
+        # 记录本次解题属于哪一场，供 _on_solve_delta 判断增量是否已过期
+        self._solve_generation = self._session_generation
         self.solve_engine.solve(jpeg)
         return True
 
@@ -646,6 +674,9 @@ class PhoneRelay:
             pass
         finally:
             self._phones.discard(websocket)
+            # 最后一台手机断开时停掉自动截图：否则 auto_loop 会继续空转截屏。
+            if not self._phones:
+                self.stop_auto_capture()
 
     async def _handle_solve(self) -> None:
         await asyncio.to_thread(self.request_solve)
@@ -750,12 +781,16 @@ class PhoneRelay:
             await websocket.send_text(message)
         except Exception:
             self._phones.discard(websocket)
+            if not self._phones:
+                self.stop_auto_capture()
 
     async def _safe_send_bytes(self, websocket: Any, data: bytes) -> None:
         try:
             await websocket.send_bytes(data)
         except Exception:
             self._phones.discard(websocket)
+            if not self._phones:
+                self.stop_auto_capture()
 
     def _set_auto(self, on: bool, interval_ms: Any) -> None:
         self._auto_generation += 1
@@ -776,6 +811,10 @@ class PhoneRelay:
         self._spawn(auto_loop())
 
     async def _capture_and_push(self) -> None:
+        # 先判断有没有手机再截屏：手机断开后 auto_loop 可能还没退出，
+        # 若无条件截屏就会在没有消费者的情况下持续采集屏幕（隐私 + 资源）。
+        if not self._phones:
+            return
         try:
             jpeg = await asyncio.to_thread(capture_screen_jpeg)
         except Exception:
@@ -786,3 +825,11 @@ class PhoneRelay:
         self._latest_jpeg = jpeg
         if self._phones:
             self._call_soon_threadsafe(self._drain_bytes, jpeg)
+
+    def stop_auto_capture(self) -> None:
+        """停止自动刷新截图并丢弃缓存帧（手机断开、开始新一场时调用）。
+
+        仅递增 generation 让 auto_loop 自然退出，不在此处打断正在进行的截屏。
+        """
+        self._auto_generation += 1
+        self._latest_jpeg = None

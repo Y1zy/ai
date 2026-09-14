@@ -109,9 +109,12 @@ def test_clipboard_watcher_poll_and_echo_guard(monkeypatch):
     assert relay.latest_clipboard_text == "第一段"
     assert watcher.poll_once() is None  # 序列号未变化
 
+    # 序列号变化 = 剪贴板确实被写入过（GetClipboardSequenceNumber 只在写入时自增）。
+    # 即使用户重新复制的是同一段文字也应推送：早期按内容比对去重，
+    # 会让「重新复制同一段话」被静默跳过，用户无法把内容再同步到手机。
     monkeypatch.setattr(phone_share, "clipboard_sequence", lambda: 2)
     monkeypatch.setattr(phone_share, "get_clipboard_text", lambda: "第一段")
-    assert watcher.poll_once() is None  # 内容未变不重复推送
+    assert watcher.poll_once() == "第一段"
 
     monkeypatch.setattr(phone_share, "clipboard_sequence", lambda: 3)
     monkeypatch.setattr(phone_share, "get_clipboard_text", lambda: "第二段")
@@ -125,6 +128,60 @@ def test_clipboard_watcher_poll_and_echo_guard(monkeypatch):
     monkeypatch.setattr(phone_share, "clipboard_sequence", lambda: 4)
     monkeypatch.setattr(phone_share, "get_clipboard_text", lambda: "第三段")
     assert watcher.poll_once() == "第三段"
+
+
+def test_clipboard_read_failure_does_not_consume_sequence(monkeypatch):
+    """读取失败（剪贴板被其他进程占用）不能消费序列号。
+
+    早期实现先记序列号再读内容，读取失败时序列号已被消费，
+    该次复制会被永久丢弃——序列号不再变化，也就不会再重试。
+    """
+    relay = phone_share.PhoneRelay()
+    watcher = phone_share.ClipboardWatcher()
+    watcher.relay = relay
+    watcher.latest_clipboard_text = "初始"
+    monkeypatch.setattr(phone_share, "clipboard_sequence", lambda: 42)
+
+    # 第一次：读取返回空（模拟 OpenClipboard 失败）
+    monkeypatch.setattr(phone_share, "get_clipboard_text", lambda: "")
+    assert watcher.poll_once() is None
+    assert watcher.latest_clipboard_text == "初始"
+
+    # 第二次：同一序列号，这次能读到内容 → 必须成功推送
+    monkeypatch.setattr(phone_share, "get_clipboard_text", lambda: "用户复制的文本")
+    assert watcher.poll_once() == "用户复制的文本"
+    assert relay.latest_clipboard_text == "用户复制的文本"
+
+
+def test_clipboard_phone_text_recopied_later_is_pushed(monkeypatch):
+    """手机推来的文本之后在电脑上重新复制，应能再次推送（回环抑制只作用于紧接的一次）。"""
+    relay = phone_share.PhoneRelay()
+    watcher = phone_share.ClipboardWatcher()
+    watcher.relay = relay
+    monkeypatch.setattr(phone_share, "set_clipboard_text", lambda text: True)
+    monkeypatch.setattr(phone_share, "clipboard_sequence", lambda: 1)
+    monkeypatch.setattr(phone_share, "get_clipboard_text", lambda: "手机文本")
+    watcher.accept_from_phone("手机文本")
+
+    # 紧接的那次（回环）应被抑制
+    assert watcher.poll_once() is None, "回环应被抑制"
+    # 之后序列号再变化（用户重新复制同一段文字）→ 应正常推送到手机
+    monkeypatch.setattr(phone_share, "clipboard_sequence", lambda: 2)
+    assert watcher.poll_once() == "手机文本", "重新复制同一段文字被永久跳过"
+
+
+def test_broken_phone_config_falls_back_to_defaults(phone_path: Path):
+    """phone_share.json 被写坏成数组/字符串/null 时不应抛异常。
+
+    早期 raw.get 会抛 AttributeError，导致 /api/phone/* 返回 500、
+    /relay 握手异常关闭（手机扫码后一直"未连接"且无明确报错）。
+    """
+    for content in ('[1,2,3]', '"str"', 'null', '123'):
+        phone_path.write_text(content, encoding="utf-8")
+        config = phone_share.load_phone_config(phone_path)
+        assert config["enabled"] is False
+        assert len(config["sid"]) == 8
+        assert len(config["token"]) == 32
 
 
 def test_vision_key_roundtrip(tmp_path: Path, monkeypatch):
@@ -429,3 +486,82 @@ class TestRelayEndpoints:
         assert data["enabled"] is True
         assert data["shareUrl"].startswith("http://")
         assert data["port"] == 8765
+
+
+class TestAutoCaptureLifecycle:
+    """自动刷新截图的生命周期：没有手机时不应继续截屏。"""
+
+    def test_capture_skipped_without_phones(self, monkeypatch):
+        """没有手机连接时不截屏。
+
+        早期实现先截屏再判断 _phones：手机断开后 auto_loop 仍会按间隔持续
+        全屏截图，既浪费资源，又对隐私工具而言在无人消费时仍采集屏幕。
+        """
+        import asyncio
+
+        relay = phone_share.PhoneRelay()
+        calls = {"n": 0}
+
+        def fake_capture():
+            calls["n"] += 1
+            return b"\xff\xd8fake"
+
+        monkeypatch.setattr(phone_share, "capture_screen_jpeg", fake_capture)
+        asyncio.run(relay._capture_and_push())
+        assert calls["n"] == 0, "无手机连接时仍在截屏"
+
+    def test_stop_auto_capture_clears_frame(self):
+        relay = phone_share.PhoneRelay()
+        relay._latest_jpeg = b"\xff\xd8old"
+        before = relay._auto_generation
+        relay.stop_auto_capture()
+        assert relay._auto_generation == before + 1, "generation 未递增，auto_loop 不会退出"
+        assert relay._latest_jpeg is None, "缓存帧未清空"
+
+    def test_solve_busy_notifies_phone(self):
+        """解题忙碌时要给手机一条 done 提示，否则气泡永远停在"正在解题"。"""
+        relay = phone_share.PhoneRelay()
+        relay.solve_engine._busy.acquire()
+        events: list[tuple[str, bool]] = []
+        original = relay._on_solve_delta
+        relay._on_solve_delta = lambda text, done: events.append((text, done))
+        try:
+            assert relay.request_solve() is False
+        finally:
+            relay._on_solve_delta = original
+            relay.solve_engine._busy.release()
+        assert events and events[-1][1] is True, "忙碌时未通知手机"
+        assert "进行中" in events[-1][0]
+
+    def test_stale_solve_stream_dropped_after_new_session(self):
+        """「开始新一场」后，上一场在途的解题快照不应污染新一场。"""
+        relay = phone_share.PhoneRelay()
+        sent: list[dict] = []
+        relay.schedule_json = lambda payload: sent.append(payload)
+
+        relay._solve_generation = relay._session_generation  # 当前场次的解题
+        relay.begin_new_session()                             # 用户点了「开始新一场」
+        sent.clear()
+
+        relay._on_solve_delta("上一场的答案片段", False)
+        assert sent == [], "旧场次的流式快照泄漏到新一场"
+
+        # 末帧仍要放行，否则手机上那条气泡会永远停在流式状态
+        relay._on_solve_delta("上一场的完整答案", True)
+        assert len(sent) == 1 and sent[0]["done"] is True
+
+
+def test_phone_status_ok_when_config_broken(tmp_path: Path, monkeypatch):
+    """phone_share.json 被写坏时 /api/phone/status 不应 500。"""
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    pytest.importorskip("soundcard")
+    from system_audio_asr.config import AppConfig
+    from system_audio_asr.server import create_app
+
+    broken = tmp_path / "phone_share.json"
+    broken.write_text("[1,2,3]", encoding="utf-8")
+    monkeypatch.setattr(phone_share, "PHONE_CONFIG_PATH", broken)
+    client = fastapi_testclient.TestClient(
+        create_app(AppConfig()), client=("127.0.0.1", 51000)
+    )
+    assert client.get("/api/phone/status").status_code == 200

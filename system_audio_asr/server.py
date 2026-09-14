@@ -37,6 +37,10 @@ from .translation import LocalEnglishChineseTranslator
 # 供设置页回显与手机端复用；桌面未触发过 AI 时回落到 effective_system_prompt() 计算。
 last_ai_prompt: dict[str, str] = {"prompt": ""}
 
+# 代表服务处于正常工作的状态：收到这些状态说明此前的问题已自愈，
+# 可以清除 latest_error（见 EventHub.publish）。
+_HEALTHY_STATES = {"capturing", "model_ready", "paused"}
+
 
 def effective_system_prompt() -> str:
     """当前实际生效的字幕 AI 系统提示词：优先用桌面端最近一次真实发送的；
@@ -84,7 +88,9 @@ def _ask_ai_blocking(
             "model": settings["aiModel"],
             "messages": messages,
             "stream": False,
-            "max_tokens": 500,
+            # 与字幕 AI / 截图解题一致：思考型模型的 reasoning token 也计入上限，
+            # 500 常被思考过程吃光导致正文为空。
+            "max_tokens": 2048,
             "temperature": 0.3,
         },
         ensure_ascii=False,
@@ -127,7 +133,6 @@ class EventHub:
         self._sequence = 0
         self.latest_status: dict | None = None
         self.latest_error: dict | None = None
-
     def bind(self) -> None:
         self.loop = asyncio.get_running_loop()
         self.queue = asyncio.Queue(maxsize=256)
@@ -142,6 +147,11 @@ class EventHub:
             }
             if event.get("type") == "status":
                 self.latest_status = payload
+                # 引擎重新报出运行态说明已恢复正常，清掉此前的错误记录。
+                # 否则一次瞬时错误（如某段音频识别跟不上）之后 /health 会
+                # 永远返回 ok=false，启动脚本据此误判服务故障。
+                if event.get("state") in _HEALTHY_STATES:
+                    self.latest_error = None
             elif event.get("type") == "error":
                 self.latest_error = payload
         if self.loop and self.queue:
@@ -202,7 +212,18 @@ def create_app(config: AppConfig) -> FastAPI:
             if engine.config.language == language:
                 return
             hub.publish({"type": "status", "state": "switching_language", "language": language})
-            await asyncio.to_thread(engine.stop)
+            stopped = await asyncio.to_thread(engine.stop)
+            if not stopped:
+                # 旧引擎仍在收尾（CPU 长音频推理可能超过等待上限）。
+                # 此时立刻启动新引擎会让两份模型共存，且旧 worker 的 stopped 状态
+                # 可能晚于新的 model_ready 到达。先等其自然退出，再切换。
+                released = await asyncio.to_thread(engine.wait_stopped)
+                if not released:
+                    hub.publish({
+                        "type": "error",
+                        "where": "recognizer",
+                        "message": "切换识别语言时旧引擎未在预期时间内退出，可能出现短暂资源占用",
+                    })
             runtime_config = replace(runtime_config, language=language)
             engine = TranscriptionEngine(runtime_config, hub.publish)
             engine.start()
@@ -488,7 +509,9 @@ def create_app(config: AppConfig) -> FastAPI:
     async def session_reset(request: Request) -> dict:
         """开始新一场面试：清空跨场次残留状态。
 
-        服务端侧清内存记录、手机追问上下文与上一次实际发送的提示词缓存；
+        服务端侧清内存记录、手机追问上下文、上一次实际发送的提示词缓存，
+        并停掉自动截图、丢弃缓存帧、让上一场在途的解题流失效
+        （否则新一场手机扫进来会先看到上一场截图，旧解题答案也会混进新一场）；
         再广播 reset_session 通知桌面 Overlay 清空对话历史/字幕/AI 输出，
         以及手机端清空聊天流。配置、知识库、简历等长期资料不受影响。
         """
@@ -496,6 +519,7 @@ def create_app(config: AppConfig) -> FastAPI:
         with phone_relay._chat_lock:
             phone_relay.phone_chat_history.clear()
         last_ai_prompt["prompt"] = ""
+        phone_relay.begin_new_session()
         hub.publish({"type": "reset_session"})
         phone_relay.schedule_json({"type": "session_reset"})
         return {"ok": True, "resetAt": datetime.now(timezone.utc).isoformat()}

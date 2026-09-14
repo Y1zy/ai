@@ -98,10 +98,21 @@ def save_entries(entries: list[dict[str, Any]], path: Path | None = None) -> lis
 def upsert_entry(
     entry: dict[str, Any], path: Path | None = None
 ) -> dict[str, Any]:
-    """新增或按 id 更新一条；返回写入后的条目。"""
-    entries = load_entries(path)
-    entry_id = str((entry or {}).get("id") or "").strip()
+    """新增或按 id 更新一条；返回写入后的条目。
+
+    内容为空时抛 ValueError：_normalize_entry 会过滤掉空内容条目，
+    若放任写入，「更新为空」会表现为条目被静默删除，且返回值指向另一条
+    无关条目，调用方无法察觉。删除请走 delete_entry。
+    """
     candidate = dict(entry or {})
+    raw_content = candidate.get("content")
+    if isinstance(raw_content, (list, dict, tuple, set)):
+        raise ValueError("条目内容格式不合法")
+    if not str(raw_content or "").strip():
+        raise ValueError("条目内容不能为空（如需删除请使用删除操作）")
+
+    entries = load_entries(path)
+    entry_id = str(candidate.get("id") or "").strip()
     candidate["id"] = entry_id or secrets.token_hex(8)
     if entry_id:
         for index, existing in enumerate(entries):
@@ -117,7 +128,8 @@ def upsert_entry(
     for item in saved:
         if item["id"] == target_id:
             return item
-    return saved[-1] if saved else {}
+    # 走到这里说明写入被 normalize 拒绝（如字段类型非法），不能返回无关条目
+    raise ValueError("条目未能保存，请检查标题与内容格式")
 
 
 def delete_entry(entry_id: str, path: Path | None = None) -> list[dict[str, Any]]:

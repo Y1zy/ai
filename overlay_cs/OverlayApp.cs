@@ -622,6 +622,8 @@ namespace WasapiParaformerOverlay
         private static int pendingTurn;
         // 已排定一次待发送：期间的新调用只覆盖内容，不再顺延计时器（这是节流的关键）。
         private static bool flushScheduled;
+        // 发送在途标志：防止两次 HTTP 并发导致快照乱序。
+        private static bool sending;
 
         internal static void Configure(string webSocketUrl)
         {
@@ -654,7 +656,9 @@ namespace WasapiParaformerOverlay
                 pendingDone = done;
                 if (!string.IsNullOrEmpty(question)) pendingQuestion = question;
                 if (turn > 0) pendingTurn = turn;
-                schedule = !flushScheduled;
+                // 发送在途时也视为已排定：那次发送结束后会补发最新内容，
+                // 避免两次 HTTP 并发导致快照乱序（旧帧晚于 done=true 到达）。
+                schedule = !flushScheduled && !sending;
                 if (schedule) flushScheduled = true;
             }
             if (!schedule) return;
@@ -681,9 +685,34 @@ namespace WasapiParaformerOverlay
                 pendingDone = false;
                 pendingQuestion = "";
                 flushScheduled = false;
+                sending = true;
             }
             // 题目可单独成帧（请求刚发起、还没有回答文本），故 question 非空也要发送。
-            if (text.Length == 0 && !done && question.Length == 0) return;
+            try
+            {
+                if (text.Length != 0 || done || question.Length != 0)
+                    SendPayload(text, done, question, turn);
+            }
+            catch { }
+            finally
+            {
+                bool reschedule;
+                lock (Sync)
+                {
+                    sending = false;
+                    // 发送期间又累积了新内容 → 立即补发一帧，保证末帧（尤其 done）不丢。
+                    reschedule = pendingText.Length != 0 || pendingDone || pendingQuestion.Length != 0;
+                    if (reschedule) flushScheduled = true;
+                }
+                if (reschedule && flushTimer != null)
+                {
+                    try { flushTimer.Change(0, Timeout.Infinite); } catch { }
+                }
+            }
+        }
+
+        private static void SendPayload(string text, bool done, string question, int turn)
+        {
             try
             {
                 JavaScriptSerializer serializer = new JavaScriptSerializer();
@@ -974,7 +1003,10 @@ namespace WasapiParaformerOverlay
             payload["model"] = config.AiModel;
             payload["messages"] = messages.ToArray();
             payload["stream"] = true;
-            payload["max_tokens"] = 500;
+            // 2048 而非 500：思考型模型（如 deepseek-v4.x）的 reasoning token
+            // 也计入上限，500 常被思考过程吃光，正文为空（实测一句短问句的
+            // 思考就能用满 50+ token）。这与截图解题链路保持同一取值。
+            payload["max_tokens"] = 2048;
             payload["temperature"] = 0.3;
 
             string endpoint = config.AiBaseUrl.TrimEnd('/') + "/chat/completions";
