@@ -130,6 +130,10 @@ def clear_api_key(path: Path = KEY_PATH) -> None:
         pass
 
 
+class ConfigCorruptError(RuntimeError):
+    """配置文件内容非法（如字段类型错误），与「正在被写入」的暂态失败区分开。"""
+
+
 def load_settings(path: Path = CONFIG_PATH, *, strict: bool = False) -> dict[str, Any]:
     if not path.exists():
         return normalize_settings(dict(DEFAULTS))
@@ -141,28 +145,72 @@ def load_settings(path: Path = CONFIG_PATH, *, strict: bool = False) -> dict[str
             if isinstance(raw, dict):
                 result.update({key: value for key, value in raw.items() if key in DEFAULTS})
             return normalize_settings(result)
-        except (OSError, ValueError, TypeError) as exc:
+        except json.JSONDecodeError as exc:
+            # 文件被读到半个（正在写入）→ 值得重试
             last_error = exc
             if attempt < 3:
                 time.sleep(0.04)
+        except OSError as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(0.04)
+        except (ValueError, TypeError) as exc:
+            # 类型/取值错误不会因重试而消失，交给 normalize_settings 的逐字段兜底。
+            # 这里只是保底：正常路径下 normalize_settings 已不再整体抛错。
+            last_error = exc
+            break
     if strict:
+        # 区分「文件正在更新」与「内容非法」：前者可稍后重试，后者需要用户修文件
+        if isinstance(last_error, (ValueError, TypeError)) and not isinstance(last_error, json.JSONDecodeError):
+            raise ConfigCorruptError("配置文件内容有误（字段类型不合法），请检查 config.json") from last_error
         raise RuntimeError("配置文件正在更新，请稍后重试") from last_error
     return normalize_settings(dict(DEFAULTS))
 
 
 def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
+    """把配置规范化为合法值。
+
+    每个字段独立容错：单个字段类型不合法只让该字段回退默认值，
+    不会牵连整份配置。此前任一字段强转失败都会让 load_settings 整体
+    回退 DEFAULTS——设置页表现为「所有配置丢失」，而磁盘文件其实完好。
+    """
     result = dict(DEFAULTS)
     result.update({key: item for key, item in value.items() if key in DEFAULTS})
-    result["width"] = max(280.0, min(2200.0, float(result["width"])))
-    result["height"] = max(72.0, min(800.0, float(result["height"])))
-    result["fontSize"] = max(12.0, min(96.0, float(result["fontSize"])))
-    result["maxLines"] = max(1, min(10, int(result["maxLines"])))
-    result["opacity"] = max(0.45, min(0.98, float(result["opacity"])))
-    result["frameOpacity"] = max(0.0, min(1.0, float(result["frameOpacity"])))
-    result["aiSilenceSeconds"] = max(0.5, min(8.0, float(result["aiSilenceSeconds"])))
-    result["aiEnabled"] = bool(result["aiEnabled"])
-    result["liveTranslateEnabled"] = bool(result["liveTranslateEnabled"])
-    result["locked"] = bool(result["locked"])
+
+    def numeric(key: str, low: float, high: float) -> None:
+        try:
+            result[key] = max(low, min(high, float(result[key])))
+        except (TypeError, ValueError):
+            result[key] = float(DEFAULTS[key])
+
+    def integer(key: str, low: int, high: int) -> None:
+        try:
+            result[key] = max(low, min(high, int(result[key])))
+        except (TypeError, ValueError):
+            result[key] = int(DEFAULTS[key])
+
+    def boolean(key: str) -> None:
+        try:
+            result[key] = bool(result[key])
+        except (TypeError, ValueError):
+            result[key] = bool(DEFAULTS[key])
+
+    def text(key: str) -> None:
+        try:
+            result[key] = str(result[key] or DEFAULTS[key])
+        except (TypeError, ValueError):
+            result[key] = str(DEFAULTS[key])
+
+    numeric("width", 280.0, 2200.0)
+    numeric("height", 72.0, 800.0)
+    numeric("fontSize", 12.0, 96.0)
+    integer("maxLines", 1, 10)
+    numeric("opacity", 0.45, 0.98)
+    numeric("frameOpacity", 0.0, 1.0)
+    numeric("aiSilenceSeconds", 0.5, 8.0)
+    boolean("aiEnabled")
+    boolean("liveTranslateEnabled")
+    boolean("locked")
     if result["asrLanguage"] not in {"zh", "en"}:
         result["asrLanguage"] = "zh"
     if result["aiModel"] not in {"deepseek-v4-flash", "deepseek-v4-pro"} and not result["aiModel"]:
@@ -180,10 +228,10 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
                 "hotwordExtra", "solvePrompt", "webSocketUrl",
                 "visionBaseUrl", "visionModel",
                 "resumeContext", "jdContext", "targetCompany", "extraContext"):
-        result[key] = str(result[key] or DEFAULTS[key])
-    result["visionEnabled"] = bool(result["visionEnabled"])
-    result["hotwordEnabled"] = bool(result.get("hotwordEnabled", True))
-    result["captureInvisible"] = bool(result.get("captureInvisible", True))
+        text(key)
+    boolean("visionEnabled")
+    boolean("hotwordEnabled")
+    boolean("captureInvisible")
     return result
 
 
@@ -544,7 +592,9 @@ def test_deepseek() -> dict[str, Any]:
                 {"role": "user", "content": "请只回复：连接成功"},
             ],
             "stream": False,
-            "max_tokens": 100,
+            # 思考型模型的 reasoning token 也计入上限；100 会让「连接测试」
+            # 在正常模型上误报失败（思考没结束就被截断，正文为空）。
+            "max_tokens": 512,
         },
         ensure_ascii=False,
     ).encode("utf-8")

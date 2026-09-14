@@ -193,3 +193,73 @@ def test_extract_zh_keeps_real_terms() -> None:
     result = _extract_zh_hotwords("负责高并发系统优化，掌握分布式事务")
     assert "高并发" in result
     assert "分布式事务" in result
+
+
+# ---------------------------------------------------------------- 提取阶段不丢词
+# 早期 _extract_hotwords 内部先截断一轮，被它丢掉的词根本没机会进入
+# _select_hotwords 的统计，设置页「超出上限」提示远少于实际丢弃数量。
+
+
+def test_extraction_does_not_truncate() -> None:
+    """提取阶段不做数量截断：上限判断集中在一处，才统计得准。"""
+    payload = {"resumeContext": ", ".join(f"Term{i}" for i in range(_MAX_HOTWORDS + 40))}
+    extracted = _extract_hotwords(payload)
+    assert len(extracted) == _MAX_HOTWORDS + 40, "提取阶段提前截断了"
+
+
+def test_every_candidate_is_either_kept_or_reported_dropped() -> None:
+    """每个候选词都要有归属：要么生效，要么出现在 dropped 里。"""
+    from system_audio_asr.recognizer import describe_hotwords
+
+    en = ", ".join(f"Term{i}" for i in range(_MAX_HOTWORDS + 30))
+    payload = {"resumeContext": en}
+    candidates = _extract_hotwords(payload)
+    info = describe_hotwords(payload)
+    kept = {e["word"] for e in info["words"]}
+    dropped = {e["word"] for e in info["dropped"]}
+    missing = set(candidates) - kept - dropped
+    assert not missing, f"这些词被静默丢弃且未报告: {sorted(missing)[:5]}"
+    assert len(kept) == _MAX_HOTWORDS
+    assert len(dropped) == len(candidates) - _MAX_HOTWORDS
+
+
+# ---------------------------------------------------------------- 长串与标点
+
+
+def test_long_chinese_run_is_not_sliced() -> None:
+    """整段连续汉字应先剥离前后缀再判长，不能按固定窗口切碎。
+
+    早期用 {2,12} 定长窗口，会把「熟练掌握高并发分布式系统设计与优化能力」
+    从中间切断，产生碎片混进热词表。
+    """
+    from system_audio_asr.recognizer import _extract_zh_hotwords
+
+    result = _extract_zh_hotwords("熟练掌握高并发分布式系统设计与优化能力")
+    assert result, "整段串不应被丢弃"
+    for term in result:
+        assert not term.startswith("描述"), f"出现切片碎片: {term!r}"
+        assert len(term) <= 12, f"超长碎片: {term!r}"
+
+
+def test_overlong_chinese_run_is_dropped_not_sliced() -> None:
+    """剥离后仍超长的整句直接丢弃，绝不切碎。"""
+    from system_audio_asr.recognizer import _extract_zh_hotwords
+
+    sentence = "这句话明显是一个完整的句子而不是术语" * 2
+    assert _extract_zh_hotwords(sentence) == []
+
+
+def test_english_hotword_trailing_punctuation_stripped() -> None:
+    result = _extract_hotwords({"resumeContext": "using Redis. Kafka and docker-compose."})
+    assert "Redis" in result
+    assert "Redis." not in result
+    assert "docker-compose" in result, "词内连字符应保留"
+    assert "using" not in result and "and" not in result, "停用词应过滤"
+
+
+def test_clean_en_hotword_keeps_inner_symbols() -> None:
+    from system_audio_asr.recognizer import _clean_en_hotword
+
+    assert _clean_en_hotword("Redis.") == "Redis"
+    assert _clean_en_hotword("Node.js") == "Node.js"
+    assert _clean_en_hotword("C++") == "C++"

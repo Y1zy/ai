@@ -274,3 +274,51 @@ def test_public_settings_includes_hotkeys(tmp_path, monkeypatch) -> None:
     path.write_text(json.dumps({"lockCombo": "Ctrl+Shift+L"}), encoding="utf-8")
     monkeypatch.setattr(settings, "HOTKEY_PATH", path)
     assert settings.public_settings()["hotkeys"]["lockCombo"] == "Ctrl+Shift+L"
+
+
+# ---------------------------------------------------------------- 坏字段隔离
+# 早期任一字段强转失败都会让 load_settings 整体回退 DEFAULTS，设置页表现为
+# 「所有配置丢失」（磁盘其实完好），保存也会失败并给出"文件正在更新"的错误解释。
+
+
+def test_bad_field_does_not_discard_other_fields(tmp_path, monkeypatch) -> None:
+    """单字段类型不合法只回退该字段，其他字段必须保留。"""
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"width": "abc", "hotwordExtra": "Redis", "resumeContext": "我的简历"}),
+        encoding="utf-8",
+    )
+    loaded = settings.load_settings(path)
+    assert loaded["width"] == settings.DEFAULTS["width"], "坏字段未回退默认值"
+    assert loaded["hotwordExtra"] == "Redis", "好字段被牵连丢失"
+    assert loaded["resumeContext"] == "我的简历"
+
+
+def test_multiple_bad_fields_are_isolated(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"width": None, "height": "x", "maxLines": [], "fontSize": 30}),
+        encoding="utf-8",
+    )
+    loaded = settings.load_settings(path)
+    assert loaded["width"] == settings.DEFAULTS["width"]
+    assert loaded["height"] == settings.DEFAULTS["height"]
+    assert loaded["maxLines"] == settings.DEFAULTS["maxLines"]
+    assert loaded["fontSize"] == 30, "未损坏的字段不应被牵连"
+
+
+def test_truncated_config_still_reports_busy(tmp_path) -> None:
+    """文件被读到半个（正在写入）仍是可重试的暂态失败，文案指向"正在更新"。"""
+    path = tmp_path / "config.json"
+    path.write_text('{"width": 1000, "hei', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="正在更新"):
+        settings.load_settings(path, strict=True)
+
+
+def test_save_accepts_settings_after_bad_field(tmp_path) -> None:
+    """坏字段存在时保存不应整体失败。"""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"width": "abc", "hotwordExtra": "Redis"}), encoding="utf-8")
+    saved = settings.update_from_web({"settings": {"aiEnabled": True}}, path=path)
+    assert saved["aiEnabled"] is True
+    assert saved["hotwordExtra"] == "Redis", "保存时把好字段弄丢了"

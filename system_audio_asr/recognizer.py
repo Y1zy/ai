@@ -18,9 +18,28 @@ from .settings import load_settings
 
 
 # 英文技术词：字母开头，允许 C++/C#/.NET/Node.js 这类符号
+# （尾部标点由 _clean_en_hotword 剥离，正则本身允许 . 与 - 以便保留词内符号）
 _EN_HOTWORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#.\-]{1,30}")
-# 中文热词：连续 2-12 个汉字（项目代号、岗位术语、公司名等）
-_ZH_HOTWORD_RE = re.compile(r"[\u4e00-\u9fa5]{2,12}")
+# 中文热词：整段连续汉字，不限定长度，由 _extract_zh_hotwords 剥离前后缀后再判长。
+# 早期用 {2,12} 做定长窗口，会把「熟练掌握高并发分布式系统设计与优化能力」这类
+# 连续串从中间切断，产生「描述超过十二个字」这样的碎片混进热词表。
+_ZH_HOTWORD_RE = re.compile(r"[\u4e00-\u9fa5]{2,}")
+# 单个中文热词的长度上限：超过则视为整句而非术语，直接丢弃（不切碎）
+_MAX_ZH_HOTWORD_CHARS = 12
+# 英文提取时的停用词：简历里高频出现的普通词，进热词表只会占用配额
+_EN_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "and", "or", "but", "if", "then", "else", "for", "while",
+    "with", "without", "using", "used", "use", "to", "of", "in", "on", "at", "by",
+    "is", "are", "was", "were", "be", "been", "being", "do", "does", "did",
+    "have", "has", "had", "will", "would", "can", "could", "should", "may", "might",
+    "this", "that", "these", "those", "it", "its", "as", "from", "into", "about",
+    "over", "under", "between", "through", "during", "before", "after",
+    "also", "such", "than", "too", "very", "just", "only", "own", "same", "so",
+    "not", "no", "nor", "all", "any", "both", "each", "few", "more", "most",
+    "other", "some", "we", "our", "you", "your", "they", "their", "he", "she",
+    "work", "works", "working", "project", "projects", "team", "teams",
+    "good", "well", "new", "old", "high", "low", "large", "small",
+})
 # 热词表总上限：Paraformer 把热词拼成一整串送入，过长反而拉低识别率
 _MAX_HOTWORDS = 120
 _MAX_ZH_HOTWORDS = 40
@@ -89,10 +108,17 @@ def _strip_zh_affixes(word: str) -> str:
 
 
 def _extract_zh_hotwords(text: str) -> list[str]:
-    """从中文文本中提取候选术语：按连续汉字跑切分，再剥离动词前后缀。"""
+    """从中文文本中提取候选术语：取整段连续汉字，剥离动词前后缀后再判长。
+
+    先剥离前后缀再判长度，而不是先按固定窗口切断：完整串才能正确剥离
+    （「负责高并发系统优化」→「高并发」），切断后反而既丢语义又产生碎片。
+    剥离后仍超过 _MAX_ZH_HOTWORD_CHARS 的视为整句，直接丢弃（不切碎）。
+    """
     results: list[str] = []
     for run in _ZH_HOTWORD_RE.findall(text):
         stripped = _strip_zh_affixes(run)
+        if len(stripped) > _MAX_ZH_HOTWORD_CHARS:
+            continue
         if _is_meaningful_zh(stripped):
             results.append(stripped)
     return results
@@ -131,26 +157,40 @@ def _split_manual_hotwords(text: str) -> list[str]:
     # 防御：超长条目丢弃（绝不切碎）
     return [item for item in parts if item and len(item) <= _MAX_HOTWORD_CHARS]
 
+def _clean_en_hotword(word: str) -> str:
+    """剥离英文热词两端的句末标点，保留词内符号（Node.js / C++ / C#）。
+
+    句末的句号/逗号会被正则吞进词里（`Redis.`），带标点的热词无法匹配识别结果；
+    但 `+`/`#`/`.` 在词内是合法符号（C++、C#、Node.js），只能剥两端、
+    且不能剥掉 `+`/`#`（否则 C++ 会退化成 C）。
+    """
+    return word.strip(".,-")
+
+
 def _extract_hotwords(settings: dict) -> list[str]:
-    """从简历/JD/公司/附加背景中提取中英文技术词作为热词表。"""
+    """从简历/JD/公司/附加背景中提取中英文技术词作为热词表。
+
+    只做「提取 + 去噪」，不在这里做数量截断：所有上限判断集中在
+    _select_hotwords.push（那里会把被丢弃的词记入 dropped 供设置页提示）。
+    早期在这里就先截断一轮，导致被丢的词根本没机会被统计，
+    设置页显示的「超出上限」数量远少于实际被丢弃的数量。
+    """
     seen: set[str] = set()
     hotwords: list[str] = []
-    zh_count = 0
     for key in _CONTEXT_KEYS:
         text = str(settings.get(key) or "")
         if not text:
             continue
         for match in _EN_HOTWORD_RE.findall(text):
-            word = match.strip()
+            word = _clean_en_hotword(match)
             lowered = word.lower()
-            if word and lowered not in seen and len(hotwords) < _MAX_HOTWORDS:
+            if word and lowered not in seen and lowered not in _EN_STOPWORDS:
                 seen.add(lowered)
                 hotwords.append(word)
         for word in _extract_zh_hotwords(text):
-            if word not in seen and zh_count < _MAX_ZH_HOTWORDS:
+            if word not in seen:
                 seen.add(word)
                 hotwords.append(word)
-                zh_count += 1
     return hotwords
 
 
@@ -255,7 +295,14 @@ class TranscriptionEngine:
         self._worker = threading.Thread(target=self._run, name="paraformer-worker", daemon=True)
         self._worker.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """请求停止并等待线程退出；返回是否**确认已退出**。
+
+        返回 False 表示 worker 还卡在推理里（CPU 上长音频可能超过 5 秒），
+        此时不应立刻启动新引擎：两份模型会短暂共存，且旧 worker 退场时
+        还会 publish 一条 stopped，可能晚于新引擎的 model_ready 到达，
+        让界面显示「已停止」而实际在运行。
+        """
         self._stop.set()
         if self._capture:
             self._capture.stop()
@@ -263,6 +310,20 @@ class TranscriptionEngine:
             self._capture_thread.join(timeout=2)
         if self._worker:
             self._worker.join(timeout=5)
+            if self._worker.is_alive():
+                return False
+        return True
+
+    def wait_stopped(self, timeout: float = 30.0) -> bool:
+        """等 worker 自然退出（上限 timeout 秒，避免重启接口无限阻塞）。
+
+        返回是否已退出。未退出时调用方需自行决定：当前实现仍会继续切换，
+        但会留下日志，便于排查"两份模型共存"的场景。
+        """
+        if self._worker is None:
+            return True
+        self._worker.join(timeout=timeout)
+        return not self._worker.is_alive()
 
     def _run(self) -> None:
         try:
