@@ -13,6 +13,9 @@ from pathlib import Path
 
 MAX_ENTRIES = 3000
 MAX_IMAGES = 50
+# 未封口的流式条目（ai_open / solve_open）超过这个时长就视为已失效，
+# 不再接收新快照：否则被取消的请求会把后续无关内容吸附进同一条。
+OPEN_ENTRY_TTL_SECONDS = 300
 
 
 class SessionRecorder:
@@ -24,7 +27,7 @@ class SessionRecorder:
 
     # ------------------------------------------------------------------ 捕获
     def on_event(self, event: dict) -> None:
-        """EventHub 监听器：捕获字幕 final 与截图解题回答（增量流）。"""
+        """EventHub 监听器：捕获字幕 final 与截图解题回答（流式快照）。"""
         kind = str(event.get("type", ""))
         if kind == "final":
             text = str(event.get("text", "")).strip()
@@ -42,7 +45,7 @@ class SessionRecorder:
         if not text.strip():
             return
         with self._lock:
-            entry = self._last_open("ai_open")
+            entry = self._find_open("ai_open")
             if entry is None:
                 entry = {"ts": time.time(), "kind": "ai_open", "text": ""}
                 self._entries.append(entry)
@@ -69,8 +72,8 @@ class SessionRecorder:
     def stats(self) -> dict:
         with self._lock:
             finals = sum(1 for e in self._entries if e["kind"] == "final")
-            answers = sum(1 for e in self._entries if e["kind"] == "ai")
-            solves = sum(1 for e in self._entries if e["kind"] == "solve")
+            answers = sum(1 for e in self._entries if _base_kind(e["kind"]) == "ai")
+            solves = sum(1 for e in self._entries if _base_kind(e["kind"]) == "solve")
             oldest = self._entries[0]["ts"] if self._entries else None
         return {
             "finals": finals,
@@ -110,6 +113,9 @@ class SessionRecorder:
                 blocks[-1]["text"] += "\n" + entry["text"]
             else:
                 blocks.append({"ts": entry["ts"], "kind": kind, "text": entry["text"]})
+        # 未封口的流式条目按其来源归位（AI / 解题），而不是掉进 else 被标成「截图解题」。
+        for block in blocks:
+            block["kind"] = _base_kind(block["kind"])
 
         used_images: set[str] = set()
         lines = [
@@ -165,7 +171,7 @@ class SessionRecorder:
         """截图解题流：text 始终是累计全文快照（与桌面/手机气泡的替换式渲染一致），
         因此这里必须整体覆盖，不能累加——否则会把每次快照重复拼接。"""
         with self._lock:
-            entry = self._last_open("solve_open")
+            entry = self._find_open("solve_open")
             if entry is None:
                 if not text.strip():
                     return
@@ -182,13 +188,32 @@ class SessionRecorder:
                 entry["kind"] = "solve"
             self._trim_locked()
 
-    def _last_open(self, kind: str) -> dict | None:
-        last = self._entries[-1] if self._entries else None
-        return last if (last is not None and last["kind"] == kind) else None
+    def _find_open(self, kind: str) -> dict | None:
+        """从尾部向前找最近的未封口条目。
+
+        不能只看最后一条：AI/解题流式期间常有字幕 final 插进来，那时最后一条
+        是字幕，只看最后一条会重新开一条，导致同一次回答被拆成两段、
+        未封口条目还会在落盘时被误标成「截图解题」。
+        超过 TTL 的陈旧 open 条目视为已失效，避免被取消的请求吸附后续内容。
+        """
+        cutoff = time.time() - OPEN_ENTRY_TTL_SECONDS
+        for entry in reversed(self._entries):
+            if entry["kind"] == kind:
+                return entry if entry["ts"] >= cutoff else None
+        return None
 
     def _trim_locked(self) -> None:
         while len(self._entries) > MAX_ENTRIES:
             self._entries.pop(0)
+
+
+def _base_kind(kind: str) -> str:
+    """把流式期间的临时类型归到最终类型，供统计与渲染统一处理。"""
+    if kind in ("ai", "ai_open"):
+        return "ai"
+    if kind in ("solve", "solve_open"):
+        return "solve"
+    return kind
 
 
 session_recorder = SessionRecorder()

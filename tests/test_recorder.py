@@ -97,3 +97,75 @@ def test_reset_then_new_ai_does_not_merge_into_old_entry() -> None:
     recorder.add_ai("新一场的回答", True)
     stats = recorder.stats()
     assert stats["answers"] == 1
+
+
+# ---------------------------------------------------------------- 流式期间插入字幕
+# 真实场景：AI 回答流式输出时面试官继续说话，会插入一条 final 字幕。
+# 早期实现 _last_open 只检查最后一条，导致同一次回答被拆成两段、
+# 未封口的前半段还会在落盘时被误标成「截图解题」。
+
+
+def test_ai_stream_survives_interleaved_final() -> None:
+    recorder = SessionRecorder()
+    recorder.add_ai("前半段", False)
+    recorder.on_event({"type": "final", "text": "面试官继续提问"})
+    recorder.add_ai("前半段完整答案", True)
+
+    stats = recorder.stats()
+    assert stats["answers"] == 1, "回答被拆成了多条"
+    assert stats["finals"] == 1
+    entries = recorder._entries
+    ai_entries = [e for e in entries if e["kind"] in ("ai", "ai_open")]
+    assert len(ai_entries) == 1, "流式期间插入字幕导致回答被拆段"
+    assert ai_entries[0]["text"] == "前半段完整答案", "快照未覆盖到同一条"
+
+
+def test_solve_stream_survives_interleaved_final() -> None:
+    recorder = SessionRecorder()
+    recorder.on_event({"type": "solve_answer", "text": "答", "done": False})
+    recorder.on_event({"type": "final", "text": "面试官说话"})
+    recorder.on_event({"type": "solve_answer", "text": "答案全文", "done": True})
+
+    stats = recorder.stats()
+    assert stats["solves"] == 1
+    assert stats["finals"] == 1
+    solves = [e for e in recorder._entries if e["kind"] in ("solve", "solve_open")]
+    assert len(solves) == 1
+
+
+def test_unclosed_stream_renders_with_its_own_type(tmp_path) -> None:
+    """未封口的流式条目要按来源渲染，不能掉进 else 被标成「截图解题」。"""
+    recorder = SessionRecorder()
+    recorder.add_ai("未封口的回答", False)          # 一直没有 done
+    recorder.on_event({"type": "final", "text": "字幕"})
+
+    recorder.save_to(tmp_path)
+    saved = next(tmp_path.glob("*/transcript.md")).read_text(encoding="utf-8")
+    timeline = saved.split("## 时间线")[1]
+    assert "AI 回答" in timeline, "未封口的 AI 条目丢失或类型错误"
+    assert "截图解题" not in timeline, "AI 条目被误标成截图解题"
+
+
+def test_open_entry_expires_after_ttl(monkeypatch) -> None:
+    """被取消的流式条目超过 TTL 后不再吸附后续内容。"""
+    import system_audio_asr.recorder as rec
+
+    recorder = SessionRecorder()
+    recorder.add_ai("被取消的旧回答", False)
+    # 把旧条目时间拨到 TTL 之外
+    recorder._entries[0]["ts"] -= rec.OPEN_ENTRY_TTL_SECONDS + 10
+
+    recorder.add_ai("新的回答", True)
+    ai_entries = [e for e in recorder._entries if e["kind"] in ("ai", "ai_open")]
+    assert len(ai_entries) == 2, "过期条目仍被复用"
+    assert ai_entries[-1]["text"] == "新的回答"
+
+
+def test_stats_count_unclosed_stream_entries() -> None:
+    """未封口的条目也要计入统计，否则设置页数字与实际内容不符。"""
+    recorder = SessionRecorder()
+    recorder.add_ai("流式中", False)
+    recorder.on_event({"type": "solve_answer", "text": "解题中", "done": False})
+    stats = recorder.stats()
+    assert stats["answers"] == 1
+    assert stats["solves"] == 1
