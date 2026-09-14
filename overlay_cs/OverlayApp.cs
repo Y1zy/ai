@@ -75,6 +75,7 @@ namespace WasapiParaformerOverlay
         internal const int MOVE_LEFT_HOTKEY_ID = 0xA55;
         internal const int MOVE_RIGHT_HOTKEY_ID = 0xA56;
         internal const int SOLVE_HOTKEY_ID = 0xA57;
+        internal const int LOCK_HOTKEY_ID = 0xA58;
 
         [StructLayout(LayoutKind.Sequential)]
         internal struct AccentPolicy
@@ -323,6 +324,21 @@ namespace WasapiParaformerOverlay
             {
                 string root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
                 return Path.Combine(root, "WasapiParaformerOverlay", "config.json");
+            }
+        }
+
+        /// <summary>
+        /// 热键实际生效组合的落盘路径。单独存一个文件，不放进 config.json：
+        /// C# 保存设置时会整体重写 config.json，且这些是运行时探测结果
+        /// （优先组合常被其他软件占用而回退），不是用户配置。
+        /// 设置页读取它来显示「当前生效」而不是硬编码的组合。
+        /// </summary>
+        internal static string HotkeyPath
+        {
+            get
+            {
+                string root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                return Path.Combine(root, "WasapiParaformerOverlay", "hotkeys.json");
             }
         }
 
@@ -2148,6 +2164,10 @@ namespace WasapiParaformerOverlay
         private readonly Border background;
         private readonly ScrollViewer scroll;
         private readonly TextBlock text;
+        // 热键反馈条（见 ShowToast）：短暂提示当前状态，避免"按了没反应"的困惑。
+        private readonly Border toast;
+        private readonly TextBlock toastText;
+        private readonly System.Windows.Threading.DispatcherTimer toastTimer;
         private readonly System.Windows.Threading.DispatcherTimer fadeTimer;
         private readonly System.Windows.Threading.DispatcherTimer aiTimer;
         private readonly System.Windows.Threading.DispatcherTimer configTimer;
@@ -2276,13 +2296,47 @@ namespace WasapiParaformerOverlay
             };
             scroll.Content = text;
             background.Child = scroll;
+
+            // 热键反馈条：按快捷键后短暂显示「已锁定 · 点击穿透」这类状态。
+            // 热键注册失败会自动回退到备用组合，若不给反馈，用户按了没反应
+            // 只会以为功能坏了。挂在 chrome 上、不参与鼠标命中。
+            toast = new Border
+            {
+                CornerRadius = new CornerRadius(6),
+                Background = new SolidColorBrush(Color.FromArgb(235, 17, 26, 42)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(255, 96, 165, 250)),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(10, 5, 10, 5),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Top,
+                Margin = new Thickness(0, 6, 0, 0),
+                IsHitTestVisible = false,
+                Visibility = Visibility.Collapsed,
+            };
+            toastText = new TextBlock
+            {
+                FontFamily = new FontFamily("Microsoft YaHei UI"),
+                FontSize = 13,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(Color.FromRgb(237, 244, 255)),
+            };
+            toast.Child = toastText;
+
             Grid chrome = new Grid();
             chrome.Children.Add(background);
+            chrome.Children.Add(toast);
             AddResizeHandles(chrome);
             Content = chrome;
 
             settings = new SettingsWindow(this);
             lockIndicator = new LockIndicatorWindow(this);
+            toastTimer = new System.Windows.Threading.DispatcherTimer();
+            toastTimer.Interval = TimeSpan.FromMilliseconds(1400);
+            toastTimer.Tick += delegate
+            {
+                toastTimer.Stop();
+                toast.Visibility = Visibility.Collapsed;
+            };
             fadeTimer = new System.Windows.Threading.DispatcherTimer();
             fadeTimer.Interval = TimeSpan.FromMilliseconds(config.FadeDelayMs);
             fadeTimer.Tick += delegate
@@ -2347,6 +2401,7 @@ namespace WasapiParaformerOverlay
             menu.Items.Add("编辑位置与样式  (Ctrl+Alt+O / Ctrl+Shift+O)", null, delegate { Dispatcher.BeginInvoke(new Action(ToggleEditMode)); });
             menu.Items.Add("显示字幕预览", null, delegate { Dispatcher.BeginInvoke(new Action(ShowPreview)); });
             menu.Items.Add("暂停接收并隐藏/恢复字幕  (Ctrl+Alt+H / Ctrl+Shift+H)", null, delegate { Dispatcher.BeginInvoke(new Action(ToggleBossVisibility)); });
+            menu.Items.Add("锁定/解锁字幕位置（点击穿透）  (Ctrl+Alt+L / Ctrl+Shift+L)", null, delegate { Dispatcher.BeginInvoke(new Action(TogglePositionLock)); });
             menu.Items.Add(new Forms.ToolStripSeparator());
             menu.Items.Add("退出 Overlay", null, delegate { Dispatcher.BeginInvoke(new Action(RequestShutdown)); });
             tray.ContextMenuStrip = menu;
@@ -2586,6 +2641,62 @@ namespace WasapiParaformerOverlay
             }
             AppLog.Write(string.Format(
                 "solve_hotkey={0} solve_combo={1}", solveHotkey, solveCombo));
+
+            // 锁定/解锁字幕位置（点击穿透）：面试中要快点到字幕后面的输入框，
+            // 悬停控制条再点图标太慢，这里给它配一个全局热键。
+            bool lockHotkey = NativeMethods.RegisterHotKey(
+                hwnd,
+                NativeMethods.LOCK_HOTKEY_ID,
+                NativeMethods.MOD_CONTROL | NativeMethods.MOD_ALT | NativeMethods.MOD_NOREPEAT,
+                (uint)KeyInterop.VirtualKeyFromKey(Key.L));
+            string lockCombo = "Ctrl+Alt+L";
+            if (!lockHotkey)
+            {
+                lockHotkey = NativeMethods.RegisterHotKey(
+                    hwnd,
+                    NativeMethods.LOCK_HOTKEY_ID,
+                    NativeMethods.MOD_CONTROL | NativeMethods.MOD_SHIFT | NativeMethods.MOD_NOREPEAT,
+                    (uint)KeyInterop.VirtualKeyFromKey(Key.L));
+                lockCombo = "Ctrl+Shift+L";
+            }
+            AppLog.Write(string.Format(
+                "lock_hotkey={0} lock_combo={1}", lockHotkey, lockCombo));
+
+            // 把实际生效的组合写给设置页：优先组合被占用时会回退，
+            // 硬编码提示会让用户按错键（真实踩过：Ctrl+Alt+L 被占用，
+            // 实际生效的是 Ctrl+Shift+L）。
+            SaveHotkeyInfo(new Dictionary<string, object>
+            {
+                { "hotkeyCombo", hotkeyCombo },
+                { "hotkeyOk", hotkey },
+                { "bossHotkeyCombo", bossHotkeyCombo },
+                { "bossHotkeyOk", bossHotkey },
+                { "moveCombo", moveModifier },
+                { "moveOk", upHotkey && downHotkey && leftHotkey && rightHotkey },
+                { "solveCombo", solveCombo },
+                { "solveOk", solveHotkey },
+                { "lockCombo", lockCombo },
+                { "lockOk", lockHotkey },
+            });
+        }
+
+        /// <summary>把热键探测结果写到 hotkeys.json，供设置页显示「当前生效」组合。</summary>
+        private static void SaveHotkeyInfo(Dictionary<string, object> info)
+        {
+            try
+            {
+                string path = OverlayConfig.HotkeyPath;
+                string directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                string temporary = path + ".tmp";
+                File.WriteAllText(temporary, new JavaScriptSerializer().Serialize(info), Encoding.UTF8);
+                if (File.Exists(path)) File.Replace(temporary, path, null);
+                else File.Move(temporary, path);
+            }
+            catch (Exception error)
+            {
+                AppLog.Write("hotkey_info_save_failed=" + error.Message);
+            }
         }
 
         private void NudgeWindowPosition(double deltaX, double deltaY)
@@ -2641,6 +2752,15 @@ namespace WasapiParaformerOverlay
                 && wParam.ToInt32() == NativeMethods.SOLVE_HOTKEY_ID)
             {
                 RequestSolve();
+                handled = true;
+            }
+            else if (message == NativeMethods.WM_HOTKEY
+                && wParam.ToInt32() == NativeMethods.LOCK_HOTKEY_ID)
+            {
+                // 编辑模式下先退出：编辑模式本身会清掉 WS_EX_TRANSPARENT，
+                // 不退出就切换锁定，穿透效果要等退出编辑才可见。
+                if (editMode) SetEditMode(false);
+                TogglePositionLock();
                 handled = true;
             }
             else if (message == 0x8030)
@@ -3056,6 +3176,21 @@ namespace WasapiParaformerOverlay
             fadeTimer.Stop();
         }
 
+        /// <summary>
+        /// 在字幕窗顶部短暂显示一行状态提示，1.4 秒后自动消失。
+        /// 用于热键反馈：热键可能因被占用而回退到备用组合，没有反馈时
+        /// 用户按了没反应会以为功能坏了。
+        /// </summary>
+        internal void ShowToast(string message)
+        {
+            if (string.IsNullOrEmpty(message)) return;
+            toastText.Text = message;
+            toast.Visibility = Visibility.Visible;
+            toastTimer.Stop();
+            toastTimer.Start();
+            AppLog.Write("toast=" + message);
+        }
+
         private static SolidColorBrush BrushFromHex(string value, byte alpha)
         {
             try
@@ -3195,6 +3330,9 @@ namespace WasapiParaformerOverlay
             AppLog.Write(string.Format(
                 "boss_hidden={0} background_working={1}",
                 bossHidden, true));
+            // 隐藏时窗口整体不可见，提示条也没意义，只在恢复时给反馈。
+            if (!bossHidden)
+                ShowToast("字幕已恢复 · 后台一直在运行");
         }
 
         internal void RequestShutdown()
@@ -3217,6 +3355,10 @@ namespace WasapiParaformerOverlay
             lockIndicator.UpdateState(config.Locked);
             SaveConfig();
             AppLog.Write("position_locked=" + config.Locked);
+            // 穿透生效时窗口收不到鼠标事件，提示条是本功能唯一的可见反馈。
+            ShowToast(config.Locked
+                ? "已锁定 · 鼠标可点击穿透到后面的窗口"
+                : "已解锁 · 可拖动调整字幕");
         }
 
         internal bool ApplyCaptureProtection(IntPtr target)
@@ -4028,6 +4170,7 @@ namespace WasapiParaformerOverlay
                 NativeMethods.UnregisterHotKey(hwnd, NativeMethods.MOVE_LEFT_HOTKEY_ID);
                 NativeMethods.UnregisterHotKey(hwnd, NativeMethods.MOVE_RIGHT_HOTKEY_ID);
                 NativeMethods.UnregisterHotKey(hwnd, NativeMethods.SOLVE_HOTKEY_ID);
+                NativeMethods.UnregisterHotKey(hwnd, NativeMethods.LOCK_HOTKEY_ID);
                 if (hwndSource != null) hwndSource.RemoveHook(WindowProc);
             }
             tray.Visible = false;

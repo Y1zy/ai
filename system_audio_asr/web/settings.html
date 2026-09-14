@@ -65,6 +65,7 @@
       <div class="row"><label for="frameOpacity">外框透明度</label><input id="frameOpacity" type="range" min="0" max="100" step="1"><output id="frameOpacityOut"></output></div>
       <div class="row two"><label for="screenName">显示器</label><select id="screenName"></select></div>
       <label class="switch"><input id="locked" type="checkbox">锁定字幕位置（锁定后字幕主体鼠标穿透）</label>
+      <p class="hint" style="margin-top:-6px" id="hotkeyHint">快捷键可随时切换锁定：锁定后鼠标可直接点击字幕后面的窗口，字幕本身照常显示与识别。</p>
       <p class="hint">老板键：<strong>Ctrl+Alt+H</strong>。若被其他软件占用，自动回退为 <strong>Ctrl+Shift+H</strong>；按一次隐藏，再按一次恢复。</p>
     </section>
 
@@ -215,6 +216,7 @@ async function load(){
     legacyOverride=String(loaded.aiOverridePrompt||'').trim();
     legacyExtra=String(loaded.aiSystemPrompt||'').trim();
     renderLegacyWarn();
+    renderHotkeyHint(data.hotkeys);
     await refreshTranslationStatus(); await loadCustomPrompt(); await loadEffectiveHotwords(); updatePreview(); showStatus('设置已加载'); refreshPromptPreview();
     $('allowLocalEndpoints').checked=Boolean(data.allowLocalEndpoints);
   }catch(e){showStatus('加载失败：'+e.message,true)}
@@ -298,6 +300,48 @@ $('aiMode').addEventListener('change',()=>{
 // 不放进 collect()：未点清除时 update_from_web 会保留磁盘原值，不会误删。
 let legacyOverride='', legacyExtra='';
 let legacyOverrideClear=false, legacyExtraClear=false;
+
+// 显示热键的「实际生效」组合：优先组合常被其他软件占用而自动回退
+// （典型：Ctrl+Alt+L → Ctrl+Shift+L），写出硬编码值会让用户按错键。
+function renderHotkeyHint(info){
+  const el=$('hotkeyHint');
+  if(!el)return;
+  if(!info||!info.lockCombo){
+    el.textContent='快捷键可随时切换锁定：锁定后鼠标可直接点击字幕后面的窗口，'
+      +'字幕本身照常显示与识别。（启动 Overlay 后此处会显示实际生效的组合）';
+    el.style.color='#91a1b8';
+    return;
+  }
+  el.innerHTML='';
+  const rows=[
+    ['锁定/穿透', info.lockCombo, info.lockOk],
+    ['编辑位置', info.hotkeyCombo, info.hotkeyOk],
+    ['隐藏/恢复', info.bossHotkeyCombo, info.bossHotkeyOk],
+    ['移动字幕', (info.moveCombo||'')+' + 方向键', info.moveOk],
+    ['截图解题', info.solveCombo, info.solveOk],
+  ];
+  const title=document.createElement('div');
+  title.textContent='当前生效的快捷键：';
+  el.appendChild(title);
+  rows.forEach(function(row){
+    if(!row[1])return;
+    const line=document.createElement('div');
+    const name=document.createElement('strong');
+    name.textContent=row[1];
+    if(row[2]===false)name.style.color='#fbbf24';
+    line.appendChild(document.createTextNode(row[0]+'：'));
+    line.appendChild(name);
+    if(row[2]===false)line.appendChild(document.createTextNode('（注册失败，可能被其他软件占用）'));
+    el.appendChild(line);
+  });
+  const note=document.createElement('div');
+  note.style.marginTop='4px';
+  note.textContent='提示：若你惯用的组合没生效，多半是被其他软件占用，程序已自动换用上面显示的组合。';
+  el.appendChild(note);
+  el.style.color='#91a1b8';
+  el.style.lineHeight='1.8';
+}
+
 function refreshResumeBadge(){
   const len=$('resumeContext').value.trim().length;
   const badge=$('resumeBadge');

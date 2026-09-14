@@ -20,6 +20,9 @@ ENTROPY = b"WasapiParaformerOverlay.DeepSeek.v1"
 # 「允许本机/内网接口」开关独立存盘：C# Overlay 保存时整体重写 config.json，
 # 放在 config.json 里会被抹掉（与 knowledge.json / phone_share.json 同理）。
 ALLOW_LOCAL_PATH = APP_DIR / "allow_local.json"
+# C# Overlay 启动时探测到的热键实际生效组合（优先组合被占用会自动回退）。
+# 由 C# 写入、设置页只读展示，避免把回退后的组合硬编码错。
+HOTKEY_PATH = APP_DIR / "hotkeys.json"
 
 DEFAULTS: dict[str, Any] = {
     "left": None,
@@ -193,12 +196,35 @@ def save_settings(value: dict[str, Any], path: Path = CONFIG_PATH) -> dict[str, 
     return normalized
 
 
+def load_hotkey_info(path: Path | None = None) -> dict[str, Any]:
+    """C# Overlay 探测到的热键实际生效组合。
+
+    优先组合可能被其他软件占用而回退（如 Ctrl+Alt+L → Ctrl+Shift+L），
+    设置页据此显示真实组合，而不是写出可能无效的硬编码值。
+    Overlay 未运行时返回空对象，设置页回落为默认文案。
+    """
+    target = path or HOTKEY_PATH
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    # 只透出字符串/布尔，避免把任意 JSON 原样抛给前端
+    info: dict[str, Any] = {}
+    for key, value in raw.items():
+        if isinstance(value, (str, bool)):
+            info[str(key)] = value
+    return info
+
+
 def public_settings() -> dict[str, Any]:
     return {
         "settings": load_settings(),
         "apiKeySet": bool(load_api_key()),
         "allowLocalEndpoints": _allow_local_endpoints(),
         "monitors": monitor_names(),
+        "hotkeys": load_hotkey_info(),
     }
 
 

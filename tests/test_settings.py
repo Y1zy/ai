@@ -228,3 +228,49 @@ def test_public_settings_exposes_allow_local_flag(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(settings, "CONFIG_PATH", tmp_path / "config.json")
     _allow_local_file(tmp_path, monkeypatch, True)
     assert settings.public_settings()["allowLocalEndpoints"] is True
+
+
+def test_load_hotkey_info_reads_csharp_output(tmp_path) -> None:
+    """热键实际生效组合由 C# 写盘，设置页据此显示而不是硬编码。
+
+    真实踩过的坑：Ctrl+Alt+L 被别的软件占用后程序回退到 Ctrl+Shift+L，
+    设置页却仍写着 Ctrl+Alt+L，用户按了没反应。
+    """
+    path = tmp_path / "hotkeys.json"
+    path.write_text(
+        json.dumps({
+            "lockCombo": "Ctrl+Shift+L", "lockOk": True,
+            "bossHotkeyCombo": "Ctrl+Alt+H", "bossHotkeyOk": True,
+        }),
+        encoding="utf-8",
+    )
+    info = settings.load_hotkey_info(path)
+    assert info["lockCombo"] == "Ctrl+Shift+L"
+    assert info["lockOk"] is True
+
+
+def test_load_hotkey_info_missing_file_returns_empty(tmp_path) -> None:
+    """Overlay 未运行时设置页回落为默认文案，不应报错。"""
+    assert settings.load_hotkey_info(tmp_path / "absent.json") == {}
+
+
+def test_load_hotkey_info_ignores_corrupt_and_non_scalar(tmp_path) -> None:
+    """坏 JSON 与非标量值不能让设置页拿到垃圾数据。"""
+    path = tmp_path / "hotkeys.json"
+    path.write_text("{ not json", encoding="utf-8")
+    assert settings.load_hotkey_info(path) == {}
+
+    path.write_text(
+        json.dumps({"lockCombo": "Ctrl+Alt+L", "nested": {"a": 1}, "num": 5, "ok": False}),
+        encoding="utf-8",
+    )
+    info = settings.load_hotkey_info(path)
+    assert info == {"lockCombo": "Ctrl+Alt+L", "ok": False}
+
+
+def test_public_settings_includes_hotkeys(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "CONFIG_PATH", tmp_path / "config.json")
+    path = tmp_path / "hotkeys.json"
+    path.write_text(json.dumps({"lockCombo": "Ctrl+Shift+L"}), encoding="utf-8")
+    monkeypatch.setattr(settings, "HOTKEY_PATH", path)
+    assert settings.public_settings()["hotkeys"]["lockCombo"] == "Ctrl+Shift+L"
