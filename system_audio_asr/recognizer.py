@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
@@ -153,45 +154,78 @@ def _extract_hotwords(settings: dict) -> list[str]:
     return hotwords
 
 
-def _get_hotwords(settings: dict) -> list[str]:
-    """三层叠加热词：手动补充（最精准，优先） + 简历提取 + 内置兜底，去重后截断。"""
-    result: list[str] = []
+def _select_hotwords(settings: dict) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """按「手动 → 简历提取 → 内置兜底」叠加热词。
+
+    返回 (生效词条, 因上限被丢弃的词条)；词条形如 {"word": str, "source": str}，
+    source ∈ manual / resume / builtin。_get_hotwords 与 describe_hotwords 共用本函数，
+    保证设置页看到的词表与实际送入模型的一字不差。
+    """
+    manual = _split_manual_hotwords(str(settings.get("hotwordExtra") or ""))
+    extracted = _extract_hotwords(settings)
+
+    entries: list[dict[str, str]] = []
+    dropped: list[dict[str, str]] = []
     seen: set[str] = set()
+    seen_dropped: set[str] = set()
     zh_total = 0
 
-    def push(word: str) -> bool:
-        """返回是否成功加入；中文受 _MAX_ZH_HOTWORDS 单独约束。"""
+    def push(word: str, source: str) -> None:
+        """加入词表；被总量/中文上限挡住时记入 dropped 供设置页提示。"""
         nonlocal zh_total
         word = word.strip()
         if not word:
-            return False
+            return
         is_zh = bool(re.search(r"[\u4e00-\u9fa5]", word))
         key = word if is_zh else word.lower()
         if key in seen:
-            return False
-        if len(result) >= _MAX_HOTWORDS:
-            return False
+            return
+        over_total = len(entries) >= _MAX_HOTWORDS
+        over_zh = is_zh and zh_total >= _MAX_ZH_HOTWORDS
+        if over_total or over_zh:
+            if key not in seen_dropped:
+                seen_dropped.add(key)
+                dropped.append({"word": word, "source": source})
+            return
         if is_zh:
-            if zh_total >= _MAX_ZH_HOTWORDS:
-                return False
             zh_total += 1
         seen.add(key)
-        result.append(word)
-        return True
+        entries.append({"word": word, "source": source})
 
     # ① 手动补充：用户显式指定，优先级最高，中英文都支持
-    for word in _split_manual_hotwords(str(settings.get("hotwordExtra") or "")):
-        push(word)
+    for word in manual:
+        push(word, "manual")
 
     # ② 简历/JD 自动提取
-    for word in _extract_hotwords(settings):
-        push(word)
+    for word in extracted:
+        push(word, "resume")
 
     # ③ 内置兜底：仅当上面两层都没有产出时才使用，避免方向词干扰
-    if not result:
-        result.extend(_BASE_HOTWORDS)
+    if not entries:
+        for word in _BASE_HOTWORDS:
+            push(word, "builtin")
 
-    return result[: _MAX_HOTWORDS]
+    return entries, dropped
+
+
+def _get_hotwords(settings: dict) -> list[str]:
+    """三层叠加热词：手动补充（最精准，优先） + 简历提取 + 内置兜底，去重后截断。"""
+    entries, _ = _select_hotwords(settings)
+    return [entry["word"] for entry in entries]
+
+
+def describe_hotwords(settings: dict) -> dict[str, Any]:
+    """当前生效热词的完整明细，供设置页把全部词表展示到「补充热词」框。
+
+    enabled 为 False 时词表不会送入模型，但仍如实返回，便于用户先编辑再开启。
+    """
+    entries, dropped = _select_hotwords(settings)
+    return {
+        "enabled": bool(settings.get("hotwordEnabled", True)),
+        "words": entries,
+        "dropped": dropped,
+        "limits": {"total": _MAX_HOTWORDS, "zh": _MAX_ZH_HOTWORDS},
+    }
 
 def choose_device(requested: str) -> str:
     if requested != "auto":

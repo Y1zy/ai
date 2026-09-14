@@ -2,6 +2,7 @@
 from system_audio_asr.recognizer import (
     _MAX_HOTWORDS,
     _MAX_HOTWORD_CHARS,
+    _MAX_ZH_HOTWORDS,
     _BASE_HOTWORDS,
     _extract_hotwords,
     _get_hotwords,
@@ -107,6 +108,70 @@ def test_base_hotwords_only_used_as_fallback() -> None:
 def test_hotwords_are_deduplicated() -> None:
     result = _get_hotwords({"hotwordExtra": "Kafka,kafka,KAFKA"})
     assert [w.lower() for w in result].count("kafka") == 1
+
+
+def test_describe_hotwords_reports_sources() -> None:
+    """设置页要把「全部生效热词」展示出来，必须能区分来源。"""
+    from system_audio_asr.recognizer import describe_hotwords
+
+    info = describe_hotwords(
+        {"hotwordExtra": "幂等", "resumeContext": "熟悉 Kubernetes 与 Redis"}
+    )
+    by_word = {entry["word"]: entry["source"] for entry in info["words"]}
+    assert by_word["幂等"] == "manual"
+    assert by_word["Kubernetes"] == "resume"
+    assert info["enabled"] is True
+    assert info["limits"] == {"total": _MAX_HOTWORDS, "zh": _MAX_ZH_HOTWORDS}
+
+
+def test_describe_hotwords_matches_get_hotwords() -> None:
+    """设置页展示的词表必须与实际送入模型的一字不差（共用同一套选择逻辑）。"""
+    from system_audio_asr.recognizer import describe_hotwords
+
+    settings = {"hotwordExtra": "幂等,Kubernetes", "resumeContext": "熟悉 Redis 与 Qt"}
+    shown = [entry["word"] for entry in describe_hotwords(settings)["words"]]
+    assert shown == _get_hotwords(settings)
+
+
+def test_describe_hotwords_reports_dropped_over_limit() -> None:
+    """超上限而未生效的词要如实报出，用户才知道「加了为什么不生效」。"""
+    from system_audio_asr.recognizer import describe_hotwords
+
+    payload = {"hotwordExtra": ",".join(f"term{i}" for i in range(_MAX_HOTWORDS + 25))}
+    info = describe_hotwords(payload)
+    assert len(info["words"]) == _MAX_HOTWORDS
+    assert len(info["dropped"]) == 25
+    assert {entry["source"] for entry in info["dropped"]} == {"manual"}
+
+
+def test_describe_hotwords_chinese_limit_reports_dropped() -> None:
+    """中文名额（_MAX_ZH_HOTWORDS）被占满时，多余中文词也算「未生效」。"""
+    from system_audio_asr.recognizer import describe_hotwords
+
+    payload = {"hotwordExtra": ",".join(f"术语{i}" for i in range(_MAX_ZH_HOTWORDS + 5))}
+    info = describe_hotwords(payload)
+    zh = [e for e in info["words"] if any("\u4e00" <= c <= "\u9fa5" for c in e["word"])]
+    assert len(zh) == _MAX_ZH_HOTWORDS
+    assert len(info["dropped"]) >= 5
+
+
+def test_describe_hotwords_disabled_flag_is_reported() -> None:
+    """关闭热词纠正时词表仍返回（便于编辑），但要标明当前不生效。"""
+    from system_audio_asr.recognizer import describe_hotwords
+
+    info = describe_hotwords({"hotwordExtra": "幂等", "hotwordEnabled": False})
+    assert info["enabled"] is False
+    assert any(entry["word"] == "幂等" for entry in info["words"])
+
+
+def test_describe_hotwords_fallback_source_is_builtin() -> None:
+    """三层全空时回落到内置词库，来源应标为 builtin。"""
+    from system_audio_asr.recognizer import describe_hotwords
+
+    info = describe_hotwords({})
+    assert info["words"], "兜底词表不应为空"
+    assert {entry["source"] for entry in info["words"]} == {"builtin"}
+    assert len(info["words"]) == len(_BASE_HOTWORDS)
 
 def test_zh_affixes_are_stripped() -> None:
     """「负责高并发系统优化」应剥离为「高并发」，而不是整段当作术语。"""

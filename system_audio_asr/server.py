@@ -522,6 +522,18 @@ def create_app(config: AppConfig) -> FastAPI:
             return {"terms": fresh, "count": len(fresh), "manualCount": len(manual)}
 
         return await asyncio.to_thread(collect)
+
+    @app.get("/api/hotwords/effective")
+    async def hotwords_effective(request: Request) -> dict:
+        """当前实际生效的完整热词表（手动 + 简历提取 + 内置兜底）。
+
+        设置页用它把全部词表回填到「补充热词」框：此前该框只显示手动词，
+        用户看不到简历提取与内置兜底贡献了什么，也看不出哪些词因上限被丢弃。
+        """
+        require_local(request)
+        from .recognizer import describe_hotwords
+
+        return await asyncio.to_thread(lambda: describe_hotwords(load_settings()))
     # ---------------------------------------------------------------- 知识库
     # 独立存 knowledge.json（不写 config.json）：C# Overlay 会整体重写 config.json，
     # 混写会导致浮窗保存设置时知识库被抹掉。

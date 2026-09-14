@@ -78,7 +78,7 @@
       <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><h2>本地实时翻译</h2><span id="translationBadge" class="badge">未加载</span></div>
       <div class="row two"><label for="asrLanguage">识别语言</label><select id="asrLanguage"><option value="zh">中文 · Paraformer Streaming</option><option value="en">英文 · Faster-Whisper</option></select></div>
       <label class="switch"><input id="hotwordEnabled" type="checkbox" checked>启用热词纠正（从简历/JD 自动提取技术词，减少 Kafka→卡夫卡 等错误）</label>
-      <div class="row two" style="align-items:flex-start"><label for="hotwordExtra" style="padding-top:9px">补充热词 <span id="hotwordCount" class="badge" style="display:none;margin-left:6px"></span><div style="font-weight:400;font-size:12px;color:#91a1b8;line-height:1.6;margin-top:4px">每行一个词，或用逗号 / 顿号分隔。<br>例：Kubernetes, CI/CD, 微服务</div></label><div><textarea id="hotwordExtra" style="min-height:74px" placeholder="Kubernetes, CI/CD, 微服务&#10;高并发、分布式锁、幂等"></textarea><div id="hotwordDetected" style="display:none;margin-top:6px;padding:8px 10px;border:1px solid rgba(251,191,36,.2);background:rgba(251,191,36,.1);border-radius:8px"></div><div style="font-size:12px;margin-top:4px;color:#91a1b8" id="hotwordExtraState">当前为空 = 仅使用内置词库与简历/JD 自动提取</div></div></div>
+      <div class="row two" style="align-items:flex-start"><label for="hotwordExtra" style="padding-top:9px">热词表 <span id="hotwordCount" class="badge" style="display:none;margin-left:6px"></span><div style="font-weight:400;font-size:12px;color:#91a1b8;line-height:1.6;margin-top:4px">此处显示<b>当前全部生效热词</b>（手动补充 + 简历/JD 提取 + 内置兜底），可直接编辑。<br>每行一个词，或用逗号 / 顿号分隔。<br>编辑并保存后，框内内容将作为「手动热词」固定生效（优先级最高）。</div></label><div><textarea id="hotwordExtra" style="min-height:150px" placeholder="Kubernetes, CI/CD, 微服务&#10;高并发、分布式锁、幂等"></textarea><div id="hotwordSources" style="display:none;margin-top:6px;padding:8px 10px;border:1px solid rgba(251,191,36,.2);background:rgba(251,191,36,.1);border-radius:8px;font-size:12px;line-height:1.7"></div><div style="font-size:12px;margin-top:4px;color:#91a1b8" id="hotwordExtraState">加载中…</div></div></div>
       <label class="switch"><input id="liveTranslateEnabled" type="checkbox">启用英文 → 中文实时翻译（本地模型，不使用 DeepSeek）</label>
       <p class="hint">英文模式使用约 78 MB 的 Faster-Whisper 英文模型；每次 partial 再由本机 OPUS-MT 翻译，final 到达后稳定定稿。模型下载后可离线使用。原英文直接显示，中文结果标为“译文”。</p>
       <div style="display:flex;justify-content:flex-end"><button id="warmTranslation" type="button">下载并预热翻译模型</button></div>
@@ -191,7 +191,7 @@
   <div class="actions"><span id="status">正在加载设置…</span><button id="save" class="primary" type="button">保存并应用</button></div>
 </main>
 <script>
-const ids=['fontSize','opacity','fontFamily','textColor','frameMode','frameColor','frameOpacity','screenName','locked','asrLanguage','hotwordEnabled','hotwordExtra','liveTranslateEnabled','aiEnabled','aiBaseUrl','aiModel','aiMode','aiSilenceSeconds','resumeContext','jdContext','targetCompany','extraContext'];
+const ids=['fontSize','opacity','fontFamily','textColor','frameMode','frameColor','frameOpacity','screenName','locked','asrLanguage','hotwordEnabled','liveTranslateEnabled','aiEnabled','aiBaseUrl','aiModel','aiMode','aiSilenceSeconds','resumeContext','jdContext','targetCompany','extraContext'];
 const $=id=>document.getElementById(id); let loaded=null, clearRequested=false;
 function stripMarkdown(t){
   if(!t) return t||"";
@@ -215,14 +215,20 @@ async function load(){
     legacyOverride=String(loaded.aiOverridePrompt||'').trim();
     legacyExtra=String(loaded.aiSystemPrompt||'').trim();
     renderLegacyWarn();
-    await refreshTranslationStatus(); await loadCustomPrompt(); updatePreview(); showStatus('设置已加载'); refreshPromptPreview();
+    await refreshTranslationStatus(); await loadCustomPrompt(); await loadEffectiveHotwords(); updatePreview(); showStatus('设置已加载'); refreshPromptPreview();
     $('allowLocalEndpoints').checked=Boolean(data.allowLocalEndpoints);
   }catch(e){showStatus('加载失败：'+e.message,true)}
 }
-function collect(){return {fontSize:Number($('fontSize').value),opacity:Number($('opacity').value)/100,fontFamily:$('fontFamily').value,textColor:$('textColor').value,frameMode:$('frameMode').value,frameColor:$('frameColor').value,frameOpacity:Number($('frameOpacity').value)/100,screenName:$('screenName').value,locked:$('locked').checked,asrLanguage:$('asrLanguage').value,hotwordEnabled:$('hotwordEnabled').checked,hotwordExtra:$('hotwordExtra').value.trim(),liveTranslateEnabled:$('liveTranslateEnabled').checked,aiEnabled:$('aiEnabled').checked,aiBaseUrl:$('aiBaseUrl').value.trim(),aiModel:$('aiModel').value.trim(),aiMode:$('aiMode').value,aiSilenceSeconds:Number($('aiSilenceSeconds').value),resumeContext:$('resumeContext').value,jdContext:$('jdContext').value,targetCompany:$('targetCompany').value.trim(),extraContext:$('extraContext').value}}
+function collect(){
+  const payload={fontSize:Number($('fontSize').value),opacity:Number($('opacity').value)/100,fontFamily:$('fontFamily').value,textColor:$('textColor').value,frameMode:$('frameMode').value,frameColor:$('frameColor').value,frameOpacity:Number($('frameOpacity').value)/100,screenName:$('screenName').value,locked:$('locked').checked,asrLanguage:$('asrLanguage').value,hotwordEnabled:$('hotwordEnabled').checked,liveTranslateEnabled:$('liveTranslateEnabled').checked,aiEnabled:$('aiEnabled').checked,aiBaseUrl:$('aiBaseUrl').value.trim(),aiModel:$('aiModel').value.trim(),aiMode:$('aiMode').value,aiSilenceSeconds:Number($('aiSilenceSeconds').value),resumeContext:$('resumeContext').value,jdContext:$('jdContext').value,targetCompany:$('targetCompany').value.trim(),extraContext:$('extraContext').value};
+  // 热词框展示的是派生词表（含简历提取/内置兜底），未编辑时不能回写，
+  // 否则等同于把它们固化成手动热词。不提交该键，服务端会保留磁盘原值。
+  if(hotwordEdited)payload.hotwordExtra=$('hotwordExtra').value.trim();
+  return payload;
+}
 async function refreshTranslationStatus(){try{const s=await fetch('/api/translate/status').then(r=>r.json());$('translationBadge').textContent=s.loaded?`已加载 · ${s.device||'本机'}${s.lastLatencyMs?` · ${s.lastLatencyMs} ms`:''}`:'尚未加载';$('translationBadge').className='badge '+(s.loaded?'ok':'')}catch{$('translationBadge').textContent='状态未知'}}
 async function save(){
-  $('save').disabled=true; showStatus('正在保存…'); try{const payload={settings:collect(),clearApiKey:clearRequested,allowLocalEndpoints:$('allowLocalEndpoints').checked}; payload.settings.aiBuiltInPrompt=customPromptPayload(); if(legacyOverrideClear)payload.settings.aiOverridePrompt=''; if(legacyExtraClear)payload.settings.aiSystemPrompt=''; if($('apiKey').value.trim())payload.apiKey=$('apiKey').value.trim(); const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const data=await r.json(); if(!r.ok)throw Error(data.detail||r.status); clearRequested=false;legacyOverrideClear=false;legacyExtraClear=false;customPromptSaved=String(payload.settings.aiBuiltInPrompt||'');customPromptDirty=false;refreshCustomPromptUi();$('apiKey').value='';$('keyState').dataset.saved=data.apiKeySet?'1':'0';refreshMainKeyState();$('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key';$('keyBadge').className='badge '+(data.apiKeySet?'ok':'');showStatus(data.asrRestarted?'已保存，正在切换识别模型…':'已保存，Overlay 将在约 1 秒内应用');return true}catch(e){showStatus('保存失败：'+e.message,true);return false}finally{$('save').disabled=false}
+  $('save').disabled=true; showStatus('正在保存…'); try{const payload={settings:collect(),clearApiKey:clearRequested,allowLocalEndpoints:$('allowLocalEndpoints').checked}; payload.settings.aiBuiltInPrompt=customPromptPayload(); if(legacyOverrideClear)payload.settings.aiOverridePrompt=''; if(legacyExtraClear)payload.settings.aiSystemPrompt=''; if($('apiKey').value.trim())payload.apiKey=$('apiKey').value.trim(); const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const data=await r.json(); if(!r.ok)throw Error(data.detail||r.status); clearRequested=false;legacyOverrideClear=false;legacyExtraClear=false;customPromptSaved=String(payload.settings.aiBuiltInPrompt||'');customPromptDirty=false;refreshCustomPromptUi();hotwordEdited=false;await loadEffectiveHotwords();$('apiKey').value='';$('keyState').dataset.saved=data.apiKeySet?'1':'0';refreshMainKeyState();$('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key';$('keyBadge').className='badge '+(data.apiKeySet?'ok':'');showStatus(data.asrRestarted?'已保存，正在切换识别模型…':'已保存，Overlay 将在约 1 秒内应用');return true}catch(e){showStatus('保存失败：'+e.message,true);return false}finally{$('save').disabled=false}
 }
 async function refreshPromptPreview(){try{const d=await fetch('/api/ai/prompt').then(r=>r.json());$('aiPromptPreview').value=d.prompt||'';}catch{}}
 // 「内部系统提示词」打开页面即有内容：接口未推送过时回落为按配置计算的生效提示词（effective fallback）。
@@ -422,6 +428,10 @@ function parseHotwordInput(text){
   });
   return {words:words,oversized:oversized};
 }
+// 热词框显示「全部生效热词」，其中多数来自简历/JD 自动提取与内置兜底，并非手动词。
+// hotwordEdited 未置位时保存沿用磁盘的手动词，避免仅改别的设置就把整份词表
+// 固化成手动热词（那会让它们脱离简历更新、且占满中文名额）。
+let hotwordEdited=false, hotwordEffective=null;
 function refreshHotwordState(){
   const el=$('hotwordExtraState'),badge=$('hotwordCount');
   const parsed=parseHotwordInput($('hotwordExtra').value);
@@ -435,60 +445,60 @@ function refreshHotwordState(){
     el.textContent='输入的 '+oversized.length+' 项都超过 '+HOTWORD_MAX_CHARS+' 字，已忽略。请拆成短词，例如「高并发」而不是一整句话。';
     el.style.color='#fbbf24';
   }else if(words.length){
-    el.textContent='当前有 '+words.length+' 个自定义热词，与内置词库/简历提取合并生效';
-    el.style.color='#86efac';
+    el.textContent=hotwordEdited
+      ? '已修改，保存后这 '+words.length+' 个词将作为「手动热词」固定生效（优先级最高）'
+      : '当前共 '+words.length+' 个生效热词（含简历/JD 自动提取与内置兜底），可直接编辑';
+    el.style.color=hotwordEdited?'#fbbf24':'#86efac';
   }else{
-    el.textContent='当前为空 = 仅使用内置词库与简历/JD 自动提取';
-    el.style.color='#91a1b8';
+    el.textContent=hotwordEdited
+      ? '已清空，保存后将不再使用任何热词'
+      : '当前为空 = 仅使用内置词库与简历/JD 自动提取';
+    el.style.color=hotwordEdited?'#fbbf24':'#91a1b8';
   }
+  renderHotwordSources();
 }
-$('hotwordExtra').addEventListener('input',refreshHotwordState);
-
-/* 从简历/JD 检测候选术语 + 一键添加 */
-let detectedTerms=[];
-async function loadDetectedHotwords(){
-  const box=$('hotwordDetected');
+// 来源明细：哪几个词来自简历提取、哪几个因超出上限没生效。
+function renderHotwordSources(){
+  const box=$('hotwordSources');
+  if(!box)return;
+  const info=hotwordEffective;
+  if(!info){box.style.display='none';return}
+  const counts={manual:0,resume:0,builtin:0};
+  (info.words||[]).forEach(function(e){counts[e.source]=(counts[e.source]||0)+1});
+  const dropped=info.dropped||[];
+  const limits=(info.limits||{});
+  const parts=[];
+  parts.push('共 '+(info.words||[]).length+' 词：手动 '+counts.manual+' · 简历提取 '+counts.resume
+    +(counts.builtin?' · 内置兜底 '+counts.builtin:''));
+  if(!info.enabled) parts.push('⚠ 热词纠正已关闭，以上词表当前不会送入模型');
+  if(dropped.length){
+    const names=dropped.slice(0,12).map(function(d){return d.word}).join('、');
+    parts.push('⚠ 有 '+dropped.length+' 个词超出上限（总量 '+limits.total+' / 中文 '+limits.zh
+      +'）未生效：'+names+(dropped.length>12?'…':''));
+  }
+  box.style.display='block';
+  box.innerHTML='';
+  parts.forEach(function(text,index){
+    const line=document.createElement('div');
+    line.textContent=text;
+    if(index)line.style.color='#fbbf24';
+    box.appendChild(line);
+  });
+}
+async function loadEffectiveHotwords(){
   try{
-    const r=await fetch('/api/hotwords/detected');
-    if(!r.ok){ box.style.display='none'; return; }
-    const data=await r.json();
-    detectedTerms=Array.isArray(data.terms)?data.terms:[];
-    if(!detectedTerms.length){ box.style.display='none'; return; }
-    const shown=detectedTerms.slice(0,20);
-    box.style.display='block'; box.innerHTML='';
-    const head=document.createElement('div');
-    head.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px';
-    const label=document.createElement('span');
-    label.style.cssText='font-size:12px;color:#fcd34d';
-    label.textContent='从简历/JD 中检测到 '+detectedTerms.length+' 个候选术语';
-    const addBtn=document.createElement('button');
-    addBtn.type='button'; addBtn.textContent='一键添加';
-    addBtn.style.cssText='padding:3px 9px;font-size:12px';
-    addBtn.onclick=function(){
-      const current=$('hotwordExtra').value.trim();
-      $('hotwordExtra').value=current?current+', '+detectedTerms.join(', '):detectedTerms.join(', ');
-      refreshHotwordState();
-      box.style.display='none';
-      showStatus('已添加 '+detectedTerms.length+' 个候选术语，记得点「保存并应用」');
-    };
-    head.appendChild(label); head.appendChild(addBtn);
-    const list=document.createElement('div');
-    list.style.cssText='display:flex;flex-wrap:wrap;gap:4px';
-    shown.forEach(function(term){
-      const chip=document.createElement('span');
-      chip.textContent=term;
-      chip.style.cssText='font-size:11px;color:#fde68a;background:rgba(251,191,36,.12);padding:2px 6px;border-radius:6px';
-      list.appendChild(chip);
-    });
-    if(detectedTerms.length>shown.length){
-      const more=document.createElement('span');
-      more.textContent='+'+(detectedTerms.length-shown.length);
-      more.style.cssText='font-size:11px;color:#a3a3a3;padding:2px 6px';
-      list.appendChild(more);
+    const r=await fetch('/api/hotwords/effective');
+    if(!r.ok)return;
+    hotwordEffective=await r.json();
+    if(!hotwordEdited&&hotwordEffective.words){
+      // 回填全部生效热词，按换行分隔便于阅读与编辑
+      $('hotwordExtra').value=hotwordEffective.words.map(function(e){return e.word}).join('\n');
     }
-    box.appendChild(head); box.appendChild(list);
-  }catch(err){ box.style.display='none'; }
+    refreshHotwordState();
+  }catch(e){}
 }
+$('hotwordExtra').addEventListener('input',function(){hotwordEdited=true;refreshHotwordState();});
+
 $('solvePrompt').addEventListener('input',refreshSolvePromptState);
 $('saveVision').onclick=async()=>{$('saveVision').disabled=true;showStatus('正在保存视觉模型配置…');
   try{const payload={settings:{visionEnabled:$('visionEnabled').checked,visionBaseUrl:$('visionBaseUrl').value.trim(),visionModel:$('visionModel').value.trim(),solvePrompt:$('solvePrompt').value.trim()},allowLocalEndpoints:$('allowLocalEndpoints').checked};
@@ -500,7 +510,7 @@ $('saveVision').onclick=async()=>{$('saveVision').disabled=true;showStatus('正�
 $('clearVisionKey').onclick=()=>{clearVisionRequested=true;$('visionApiKey').value='';refreshVisionKeyState($('visionKeyState').dataset.saved==='1');showStatus('保存后清除视觉模型 Key')};
 $('visionApiKey').addEventListener('input',()=>{clearVisionRequested=false;refreshVisionKeyState($('visionKeyState').dataset.saved==='1')});
 $('visionEnabled').addEventListener('change',refreshVisionStatus);
-loadVisionConfig(); refreshVisionStatus(); loadDetectedHotwords();
+loadVisionConfig(); refreshVisionStatus();
 for(const id of ['fontSize','opacity','fontFamily','textColor','frameColor','frameOpacity','aiSilenceSeconds'])$(id).addEventListener('input',updatePreview);
 $('liveTranslateEnabled').addEventListener('change',()=>{if($('liveTranslateEnabled').checked)$('asrLanguage').value='en'}); async function refreshRecords(){try{const s=await fetch('/api/records/stats').then(r=>r.json());$('recordsBadge').textContent=`${s.finals} 字幕 · ${s.answers} 回答 · ${s.solves} 解题 · ${s.images} 图`;refreshSessionWarn(s)}catch{$('recordsBadge').textContent='—'}}
 // 防呆：上一场还有内容却没清空时给出提醒（不阻断，面试中停顿很正常）。
