@@ -255,6 +255,8 @@ Overlay 直接订阅现有 `ws://127.0.0.1:8765/ws`。正常模式只有类似�
 
 设置页将“本地实时翻译”和“DeepSeek AI”分开。本地英文 → 中文翻译直接处理每次 `partial/final`，不调用 API；DeepSeek 仍负责自动判断/总结/问答/解释和中文翻译为英文。AI 回答通过 SSE 流式返回。API Key 使用 Windows DPAPI 按当前用户加密保存在 `%LOCALAPPDATA%\WasapiParaformerOverlay\deepseek.key`，不会写进 JSON、源码或运行日志。
 
+思考型模型（如 `deepseek-v4.x`）默认先输出 reasoning 再作答，首字延迟可达 10 秒以上，而面试是实时场景。设置页与桌面设置窗提供「思考模式」两档：`关闭`（推荐）与 `自动`。实测同一道题，关闭思考后从 12.3 秒 / 443 字变为 7.2 秒 / 1723 字——更快且更完整，因为 token 预算不再被思考过程占用。若网关不支持该参数，程序会自动退回自动模式。
+
 识别语言可以在设置页切换：中文使用 Paraformer Streaming，英文使用 Faster-Whisper Tiny English。切换时只重启本地识别引擎，Web 页面、WebSocket 和 Overlay 不退出。英文模型保存在 `%LOCALAPPDATA%\VoxRibbon\models\faster-whisper-tiny.en`。
 
 字幕采用左对齐连续视图：每段 `final` 直接显示原文，不再添加“语音”标签；本地翻译结果标为“译文”，DeepSeek 回答标为“AI”。英文 partial 变化时会丢弃过期翻译结果，只显示最新版本；final 到达后生成稳定译文。显示范围不足时自动滚动到最新消息。

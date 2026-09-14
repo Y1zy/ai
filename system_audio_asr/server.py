@@ -56,6 +56,24 @@ def effective_system_prompt() -> str:
     return prompts["modes"]["auto"]
 
 
+def _post_chat(endpoint: str, request_body: dict, api_key: str) -> tuple[int, bytes]:
+    """发送一次非流式 chat 请求，返回 (状态码, 响应体)。"""
+    import json
+
+    from .settings import request_public_http
+
+    return request_public_http(
+        endpoint,
+        body=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "VoxRibbon/0.1",
+            "Authorization": f"Bearer {api_key}",
+        },
+        timeout=90,
+    )
+
+
 def _ask_ai_blocking(
     prompt: str,
     question: str,
@@ -68,10 +86,7 @@ def _ask_ai_blocking(
     history 为 [{"role": "user"|"assistant", "content": str}, ...]，按时间顺序，
     供手机端追问使用；桌面字幕 AI 的多轮上下文由 C# 侧自己维护。
     """
-    import json
     import time
-
-    from .settings import request_public_http
 
     endpoint = settings["aiBaseUrl"].rstrip("/") + "/chat/completions"
     if not endpoint.startswith(("http://", "https://")):
@@ -83,29 +98,24 @@ def _ask_ai_blocking(
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": question})
-    body = json.dumps(
-        {
-            "model": settings["aiModel"],
-            "messages": messages,
-            "stream": False,
-            # 与字幕 AI / 截图解题一致：思考型模型的 reasoning token 也计入上限，
-            # 500 常被思考过程吃光导致正文为空。
-            "max_tokens": 2048,
-            "temperature": 0.3,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+    from .ai_stream import apply_thinking_mode, is_thinking_unsupported
+
+    request_body: dict = {
+        "model": settings["aiModel"],
+        "messages": messages,
+        "stream": False,
+        # 与字幕 AI / 截图解题一致：思考型模型的 reasoning token 也计入上限，
+        # 500 常被思考过程吃光导致正文为空。
+        "max_tokens": 2048,
+        "temperature": 0.3,
+    }
+    apply_thinking_mode(request_body, settings.get("aiThinkingMode"))
     started = time.monotonic()
-    status, payload = request_public_http(
-        endpoint,
-        body=body,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "VoxRibbon/0.1",
-            "Authorization": f"Bearer {api_key}",
-        },
-        timeout=90,
-    )
+    status, payload = _post_chat(endpoint, request_body, api_key)
+    # 网关不认 thinking 字段时自动去掉该字段重试一次，避免开关导致完全不可用。
+    if status >= 400 and "thinking" in request_body and is_thinking_unsupported(status, payload):
+        request_body.pop("thinking", None)
+        status, payload = _post_chat(endpoint, request_body, api_key)
     seconds = round(time.monotonic() - started, 1)
     if status >= 400:
         raise RuntimeError(f"AI HTTP {status}: {payload.decode('utf-8', errors='replace')[:300]}")

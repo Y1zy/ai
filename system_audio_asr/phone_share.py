@@ -341,6 +341,10 @@ def load_vision_config() -> dict[str, Any]:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
     except (OSError, ValueError):
         raw = {}
+    # 视觉模型独立配置，但思考模式与文字助手共用同一个开关：
+    # 解题也是面试实时场景，思考会显著拉长首字延迟。
+    from .ai_stream import normalize_thinking_mode
+
     return {
         "enabled": bool(raw.get("visionEnabled", False)),
         "baseUrl": str(raw.get("visionBaseUrl", "")).rstrip("/"),
@@ -349,6 +353,7 @@ def load_vision_config() -> dict[str, Any]:
         "jd": str(raw.get("jdContext", "")),
         # 允许用户在设置里自定义解题提示词；为空回落内置默认。
         "prompt": str(raw.get("solvePrompt", "")).strip() or SOLVE_PROMPT,
+        "thinkingMode": normalize_thinking_mode(raw.get("aiThinkingMode")),
     }
 
 
@@ -440,6 +445,7 @@ class SolveEngine:
             temperature=0.2,
             flush_seconds=SOLVE_STREAM_FLUSH_SECONDS,
             validate=False,  # 上面已用更具体的文案校验过
+            thinking_mode=vision.get("thinkingMode"),
         )
         if not final_text:
             self._emit("（模型未返回内容）", True)
@@ -713,6 +719,7 @@ class PhoneRelay:
                 on_snapshot=lambda text, done: self.schedule_json(
                     {"type": "ai", "text": text, "done": done, "source": "ask"}
                 ),
+                thinking_mode=settings.get("aiThinkingMode"),
             )
 
         try:

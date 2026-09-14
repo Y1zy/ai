@@ -46,6 +46,9 @@ DEFAULTS: dict[str, Any] = {
     "aiEnabled": False,
     "aiModel": "deepseek-v4-flash",
     "aiMode": "auto",
+    # 思考模式：off=关闭思考（首字约 1 秒，面试实时推荐） / auto=模型自行决定。
+    # 必须纳入 DEFAULTS，否则网页保存时该键会被抹掉。
+    "aiThinkingMode": "auto",
     "aiSilenceSeconds": 0.6,
     "aiSystemPrompt": "",
     "aiOverridePrompt": "",
@@ -217,6 +220,8 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
         result["aiModel"] = "deepseek-v4-flash"
     if result["aiMode"] not in {"auto", "summary", "qa", "explain", "translate"}:
         result["aiMode"] = "auto"
+    if result["aiThinkingMode"] not in {"off", "auto"}:
+        result["aiThinkingMode"] = "auto"
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(result["textColor"])):
         result["textColor"] = "#FFFFFF"
     if result["frameMode"] not in {"hover", "always"}:

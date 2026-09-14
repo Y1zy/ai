@@ -175,3 +175,126 @@ def test_build_messages_caps_history_at_twelve():
     ]
     messages = ai_stream.build_messages("s", "q", history)
     assert len(messages) == 1 + 12 + 1
+
+
+# ---------------------------------------------------------------- 思考模式
+# 思考型模型默认先输出 reasoning_content 再给正文，首字延迟可达 10 秒以上。
+# 关闭思考可把首字降到 1 秒内，且正文更完整（token 不再被思考占用）。
+
+
+def test_apply_thinking_mode_off_sends_disabled() -> None:
+    payload: dict = {"model": "m"}
+    ai_stream.apply_thinking_mode(payload, "off")
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+def test_apply_thinking_mode_auto_sends_nothing() -> None:
+    """auto 表示不干预，不能发送任何相关字段（保持模型默认行为）。"""
+    payload: dict = {"model": "m"}
+    ai_stream.apply_thinking_mode(payload, "auto")
+    assert "thinking" not in payload
+    assert "reasoning_effort" not in payload, "不得使用 reasoning_effort：实测会让正文返回空"
+
+
+@pytest.mark.parametrize("value", ["forced", "", None, "AUTO", "unknown"])
+def test_normalize_thinking_mode_falls_back_to_auto(value) -> None:
+    assert ai_stream.normalize_thinking_mode(value) == "auto"
+
+
+def test_normalize_thinking_mode_accepts_off() -> None:
+    assert ai_stream.normalize_thinking_mode("off") == "off"
+    assert ai_stream.normalize_thinking_mode("OFF") == "off"
+
+
+def test_thinking_mode_is_sent_in_stream_payload(monkeypatch) -> None:
+    captured = _fake_stream(monkeypatch, [
+        'data: {"choices":[{"delta":{"content":"X"}}]}',
+        "data: [DONE]",
+    ])
+    ai_stream.stream_chat_completion(
+        url="https://api.example/v1/chat/completions",
+        api_key="k", model="m",
+        messages=[{"role": "user", "content": "q"}],
+        on_snapshot=lambda t, d: None,
+        thinking_mode="off",
+    )
+    assert captured["payload"]["thinking"] == {"type": "disabled"}
+
+
+def test_thinking_mode_auto_omits_field(monkeypatch) -> None:
+    captured = _fake_stream(monkeypatch, [
+        'data: {"choices":[{"delta":{"content":"X"}}]}',
+        "data: [DONE]",
+    ])
+    ai_stream.stream_chat_completion(
+        url="https://api.example/v1/chat/completions",
+        api_key="k", model="m",
+        messages=[{"role": "user", "content": "q"}],
+        on_snapshot=lambda t, d: None,
+        thinking_mode="auto",
+    )
+    assert "thinking" not in captured["payload"]
+
+
+def test_is_thinking_unsupported_detects_rejection() -> None:
+    assert ai_stream.is_thinking_unsupported(400, b'{"error":"unknown field thinking"}')
+    assert ai_stream.is_thinking_unsupported(422, b"unsupported parameter: thinking")
+    assert not ai_stream.is_thinking_unsupported(400, b'{"error":"model not found"}')
+    assert not ai_stream.is_thinking_unsupported(500, b"thinking blew up"), "5xx 不是参数问题"
+
+
+def test_stream_downgrades_when_gateway_rejects_thinking(monkeypatch) -> None:
+    """网关不认 thinking 字段时应自动去掉该字段重试，而不是直接失败。
+
+    否则用户开启「关闭思考」后可能反而完全不可用。
+    """
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, status_code, lines=None):
+            self.status_code = status_code
+            self._lines = lines or []
+
+        def iter_lines(self):
+            return iter(self._lines)
+
+        def read(self):
+            return b'{"error":"unknown parameter thinking"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stream(self, method, url, json=None, headers=None):
+            calls.append(dict(json))
+            if len(calls) == 1:
+                return FakeResponse(400)
+            return FakeResponse(200, ['data: {"choices":[{"delta":{"content":"重试成功"}}]}', "data: [DONE]"])
+
+    monkeypatch.setattr("httpx.Client", FakeClient)
+    monkeypatch.setattr("system_audio_asr.settings.validate_public_http_url", lambda url: url)
+
+    seen: list[str] = []
+    final = ai_stream.stream_chat_completion(
+        url="https://api.example/v1/chat/completions",
+        api_key="k", model="m",
+        messages=[{"role": "user", "content": "q"}],
+        on_snapshot=lambda t, d: seen.append(t),
+        thinking_mode="off",
+    )
+    assert len(calls) == 2, "未触发降级重试"
+    assert calls[0].get("thinking") == {"type": "disabled"}
+    assert "thinking" not in calls[1], "重试请求仍带 thinking 字段"
+    assert final == "重试成功"

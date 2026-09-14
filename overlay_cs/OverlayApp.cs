@@ -297,6 +297,8 @@ namespace WasapiParaformerOverlay
         internal bool AiEnabled = false;
         internal string AiModel = "deepseek-v4-flash";
         internal string AiMode = "auto";
+        // 思考模式：off=关闭思考（首字约 1 秒，面试实时推荐） / auto=模型自行决定。
+        internal string AiThinkingMode = "auto";
         internal double AiSilenceSeconds = 0.6;
         internal string AiSystemPrompt = "";
         internal string AiBaseUrl = "https://api.deepseek.com";
@@ -358,6 +360,7 @@ namespace WasapiParaformerOverlay
             if (string.IsNullOrWhiteSpace(FrameColor)) FrameColor = "#7DBEFF";
             if (string.IsNullOrWhiteSpace(AiModel)) AiModel = "deepseek-v4-flash";
             if (string.IsNullOrWhiteSpace(AiMode)) AiMode = "auto";
+            if (AiThinkingMode != "off") AiThinkingMode = "auto";
             if (string.IsNullOrWhiteSpace(AiBaseUrl)) AiBaseUrl = "https://api.deepseek.com";
             if (AsrLanguage != "en") AsrLanguage = "zh";
         }
@@ -393,6 +396,7 @@ namespace WasapiParaformerOverlay
                 if (data.ContainsKey("aiEnabled")) result.AiEnabled = Convert.ToBoolean(data["aiEnabled"]);
                 if (data.ContainsKey("aiModel")) result.AiModel = Convert.ToString(data["aiModel"]);
                 if (data.ContainsKey("aiMode")) result.AiMode = Convert.ToString(data["aiMode"]);
+                if (data.ContainsKey("aiThinkingMode")) result.AiThinkingMode = Convert.ToString(data["aiThinkingMode"]);
                 if (data.ContainsKey("aiSilenceSeconds")) result.AiSilenceSeconds = Convert.ToDouble(data["aiSilenceSeconds"]);
                 if (data.ContainsKey("aiSystemPrompt")) result.AiSystemPrompt = Convert.ToString(data["aiSystemPrompt"]);
                 if (data.ContainsKey("aiBaseUrl")) result.AiBaseUrl = Convert.ToString(data["aiBaseUrl"]);
@@ -440,6 +444,7 @@ namespace WasapiParaformerOverlay
             data["aiEnabled"] = AiEnabled;
             data["aiModel"] = AiModel;
             data["aiMode"] = AiMode;
+            data["aiThinkingMode"] = AiThinkingMode;
             data["aiSilenceSeconds"] = AiSilenceSeconds;
             data["aiSystemPrompt"] = AiSystemPrompt;
             data["aiBaseUrl"] = AiBaseUrl;
@@ -493,6 +498,7 @@ namespace WasapiParaformerOverlay
             AiEnabled = other.AiEnabled;
             AiModel = other.AiModel;
             AiMode = other.AiMode;
+            AiThinkingMode = other.AiThinkingMode;
             AiSilenceSeconds = other.AiSilenceSeconds;
             AiSystemPrompt = other.AiSystemPrompt;
             AiBaseUrl = other.AiBaseUrl;
@@ -919,6 +925,27 @@ namespace WasapiParaformerOverlay
             return result.Content;
         }
 
+        /// <summary>
+        /// 按配置给请求体加思考控制字段。面试实时场景下思考会让首字延迟从约 1 秒
+        /// 拉长到 10 秒以上，故提供关闭开关；auto 时不发送任何字段、保持模型默认。
+        /// 注意不要改用 reasoning_effort：实测本机网关对其响应相反（none 会让
+        /// 模型把预算全用于思考、正文返回 0 字）。
+        /// </summary>
+        internal static void ApplyThinkingMode(Dictionary<string, object> payload, OverlayConfig config)
+        {
+            if (config != null && config.AiThinkingMode == "off")
+                payload["thinking"] = new Dictionary<string, object> { { "type", "disabled" } };
+        }
+
+        /// <summary>响应是否表示网关不认 thinking 字段（用于自动降级重试）。</summary>
+        internal static bool IsThinkingUnsupported(int statusCode, string body)
+        {
+            if (statusCode != 400 && statusCode != 422) return false;
+            string text = (body ?? "").ToLowerInvariant();
+            return text.Contains("thinking") || text.Contains("unknown")
+                || text.Contains("unsupported") || text.Contains("invalid");
+        }
+
         // 一次非流式对话：返回答案、响应里的实际模型名（中转站可能改路由）与耗时。
         internal static async Task<AiProbeResult> SendChatAsync(
             OverlayConfig config, string apiKey, string userText, CancellationToken token)
@@ -937,40 +964,75 @@ namespace WasapiParaformerOverlay
             payload["model"] = config.AiModel;
             payload["messages"] = new object[] { system, user };
             payload["stream"] = false;
-            payload["max_tokens"] = 500;
+            // 与流式路径一致：思考型模型的 reasoning token 也计入上限，500 容易被思考吃光。
+            payload["max_tokens"] = 2048;
             payload["temperature"] = 0.3;
+            ApplyThinkingMode(payload, config);
 
             string endpoint = config.AiBaseUrl.TrimEnd('/') + "/chat/completions";
             if (!endpoint.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
                 && !endpoint.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("接口地址必须以 http:// 或 https:// 开头");
+
+            string body = await SendChatOnce(serializer, endpoint, apiKey, payload, token, true);
+            Dictionary<string, object> root;
+            try
+            {
+                root = serializer.Deserialize<Dictionary<string, object>>(body);
+            }
+            catch (Exception)
+            {
+                throw new InvalidOperationException("AI 返回内容无法解析");
+            }
+
+            IList choices = root.ContainsKey("choices") ? root["choices"] as IList : null;
+            if (choices == null || choices.Count == 0) throw new InvalidOperationException("AI 返回中没有 choices");
+            Dictionary<string, object> choice = choices[0] as Dictionary<string, object>;
+            // 兼容中转站：reasoning 模型可能缺 message 或 content 字段
+            Dictionary<string, object> message = choice == null || !choice.ContainsKey("message")
+                ? null
+                : choice["message"] as Dictionary<string, object>;
+            string content = message == null || !message.ContainsKey("content")
+                ? ""
+                : Convert.ToString(message["content"]);
+            if (string.IsNullOrWhiteSpace(content)) throw new InvalidOperationException("AI 返回了空内容（思考型模型可能耗尽 token，请换模型或调小附加要求）");
+            AiProbeResult result = new AiProbeResult();
+            result.Content = content.Trim();
+            result.Model = root.ContainsKey("model") ? Convert.ToString(root["model"]) : "";
+            watch.Stop();
+            result.Seconds = watch.Elapsed.TotalSeconds;
+            return result;
+        }
+
+        /// <summary>
+        /// 发送一次 chat 请求并返回响应体文本（非流式）。
+        /// allowDowngrade=true 时，若网关因不认识 thinking 字段而拒绝，会去掉该字段
+        /// 重试一次——否则用户开启「关闭思考」后可能反而完全不可用。
+        /// </summary>
+        private static async Task<string> SendChatOnce(
+            JavaScriptSerializer serializer,
+            string endpoint,
+            string apiKey,
+            Dictionary<string, object> payload,
+            CancellationToken token,
+            bool allowDowngrade)
+        {
             using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, endpoint))
             {
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-                request.Content = new StringContent(serializer.Serialize(payload), Encoding.UTF8, "application/json");
+                request.Content = new StringContent(
+                    serializer.Serialize(payload), Encoding.UTF8, "application/json");
                 using (HttpResponseMessage response = await SharedClient.SendAsync(request, token))
                 {
                     string body = await response.Content.ReadAsStringAsync();
-                    if (!response.IsSuccessStatusCode)
-                        throw new InvalidOperationException("AI HTTP " + (int)response.StatusCode + ": " + body);
-                    Dictionary<string, object> root = serializer.Deserialize<Dictionary<string, object>>(body);
-                    IList choices = root.ContainsKey("choices") ? root["choices"] as IList : null;
-                    if (choices == null || choices.Count == 0) throw new InvalidOperationException("AI 返回中没有 choices");
-                    Dictionary<string, object> choice = choices[0] as Dictionary<string, object>;
-                    // 兼容中转站：reasoning 模型可能缺 message 或 content 字段
-                    Dictionary<string, object> message = choice == null || !choice.ContainsKey("message")
-                        ? null
-                        : choice["message"] as Dictionary<string, object>;
-                    string content = message == null || !message.ContainsKey("content")
-                        ? ""
-                        : Convert.ToString(message["content"]);
-                    if (string.IsNullOrWhiteSpace(content)) throw new InvalidOperationException("AI 返回了空内容（思考型模型可能耗尽 token，请换模型或调小附加要求）");
-                    AiProbeResult result = new AiProbeResult();
-                    result.Content = content.Trim();
-                    result.Model = root.ContainsKey("model") ? Convert.ToString(root["model"]) : "";
-                    watch.Stop();
-                    result.Seconds = watch.Elapsed.TotalSeconds;
-                    return result;
+                    if (response.IsSuccessStatusCode) return body;
+                    if (allowDowngrade && payload.ContainsKey("thinking")
+                        && IsThinkingUnsupported((int)response.StatusCode, body))
+                    {
+                        payload.Remove("thinking");
+                        return await SendChatOnce(serializer, endpoint, apiKey, payload, token, false);
+                    }
+                    throw new InvalidOperationException("AI HTTP " + (int)response.StatusCode + ": " + body);
                 }
             }
         }
@@ -1008,11 +1070,44 @@ namespace WasapiParaformerOverlay
             // 思考就能用满 50+ token）。这与截图解题链路保持同一取值。
             payload["max_tokens"] = 2048;
             payload["temperature"] = 0.3;
+            ApplyThinkingMode(payload, config);
 
             string endpoint = config.AiBaseUrl.TrimEnd('/') + "/chat/completions";
             if (!endpoint.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
                 && !endpoint.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("接口地址必须以 http:// 或 https:// 开头");
+            // 网关不认 thinking 字段时去掉它重试一次，避免开关导致完全不可用。
+            // 注意：C# 5 不允许在 catch 块里 await，故用标志位在 catch 外重试。
+            bool downgrade = false;
+            try
+            {
+                return await StreamOnce(serializer, endpoint, apiKey, payload, onPartial, token);
+            }
+            catch (ThinkingUnsupportedException)
+            {
+                downgrade = true;
+            }
+            if (downgrade)
+            {
+                payload.Remove("thinking");
+                return await StreamOnce(serializer, endpoint, apiKey, payload, onPartial, token);
+            }
+            throw new InvalidOperationException("AI 流式请求失败");
+        }
+
+        /// <summary>内部信号：网关拒绝 thinking 字段，调用方应去掉该字段重试。</summary>
+        private sealed class ThinkingUnsupportedException : Exception
+        {
+        }
+
+        private static async Task<string> StreamOnce(
+            JavaScriptSerializer serializer,
+            string endpoint,
+            string apiKey,
+            Dictionary<string, object> payload,
+            Action<string> onPartial,
+            CancellationToken token)
+        {
             using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, endpoint))
             {
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
@@ -1024,6 +1119,9 @@ namespace WasapiParaformerOverlay
                     if (!response.IsSuccessStatusCode)
                     {
                         string errorBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        if (payload.ContainsKey("thinking")
+                            && IsThinkingUnsupported((int)response.StatusCode, errorBody))
+                            throw new ThinkingUnsupportedException();
                         throw new InvalidOperationException(
                             "AI HTTP " + (int)response.StatusCode + ": " + errorBody);
                     }
@@ -1307,6 +1405,7 @@ namespace WasapiParaformerOverlay
         private readonly PasswordBox apiKeyBox;
         private readonly ComboBox aiModelBox;
         private readonly ComboBox aiModeBox;
+        private readonly ComboBox aiThinkingBox;
         private readonly TextBox aiBaseUrlBox;
         private readonly Slider aiDelaySlider;
         private readonly TextBox aiPromptBox;
@@ -1506,6 +1605,24 @@ namespace WasapiParaformerOverlay
             aiModeBox.Margin = new Thickness(8, 0, 0, 0);
             aiOptions.Children.Add(aiModeBox);
             aiRoot.Children.Add(aiOptions);
+
+            StackPanel aiThinkingRow = new StackPanel();
+            aiThinkingRow.Orientation = Orientation.Horizontal;
+            aiThinkingRow.Margin = new Thickness(0, 0, 0, 8);
+            aiThinkingRow.Children.Add(MakeText("思考", 13));
+            aiThinkingBox = new ComboBox();
+            aiThinkingBox.Items.Add("关闭思考（首字约 1 秒）");
+            aiThinkingBox.Items.Add("自动（模型自行决定）");
+            aiThinkingBox.Width = 200;
+            aiThinkingBox.Margin = new Thickness(8, 0, 0, 0);
+            aiThinkingRow.Children.Add(aiThinkingBox);
+            aiRoot.Children.Add(aiThinkingRow);
+            TextBlock aiThinkingHint = MakeText(
+                "思考型模型会先\"想\"再答，首字延迟可达 10 秒以上；关闭后回答反而更完整。若网关不支持该参数会自动退回自动模式。", 12);
+            aiThinkingHint.TextWrapping = TextWrapping.Wrap;
+            aiThinkingHint.Foreground = new SolidColorBrush(Color.FromRgb(100, 116, 139));
+            aiThinkingHint.Margin = new Thickness(0, 0, 0, 10);
+            aiRoot.Children.Add(aiThinkingHint);
 
             StackPanel aiBaseUrlRow = new StackPanel();
             aiBaseUrlRow.Orientation = Orientation.Horizontal;
@@ -1882,12 +1999,14 @@ namespace WasapiParaformerOverlay
                     ? Convert.ToString(aiModelBox.SelectedItem)
                     : aiModelBox.Text);
             string mode = aiModeBox.SelectedItem == null ? "auto" : ModeKey(Convert.ToString(aiModeBox.SelectedItem));
+            string thinking = aiThinkingBox.SelectedIndex == 0 ? "off" : "auto";
             SecretStore.SaveApiKey(apiKeyBox.Password);
             overlay.SetLiveTranslationEnabled(liveTranslateBox.IsChecked == true);
             overlay.ApplyAiSettings(
                 aiEnabledBox.IsChecked == true,
                 model,
                 mode,
+                thinking,
                 aiBaseUrlBox.Text,
                 aiDelaySlider.Value / 10.0,
                 aiPromptBox.Text,
@@ -1976,6 +2095,7 @@ namespace WasapiParaformerOverlay
             aiModelBox.SelectedItem = config.AiModel;
             if (aiModelBox.SelectedItem == null) aiModelBox.SelectedItem = "deepseek-v4-flash";
             aiModeBox.SelectedItem = ModeDisplay(config.AiMode);
+            aiThinkingBox.SelectedIndex = config.AiThinkingMode == "off" ? 0 : 1;
             aiBaseUrlBox.Text = config.AiBaseUrl;
             aiDelaySlider.Value = Math.Round(config.AiSilenceSeconds * 10);
             aiPromptBox.Text = config.AiSystemPrompt;
@@ -3554,13 +3674,15 @@ namespace WasapiParaformerOverlay
         }
 
         internal void ApplyAiSettings(
-            bool enabled, string model, string mode, string baseUrl, double silenceSeconds, string systemPrompt,
+            bool enabled, string model, string mode, string thinkingMode, string baseUrl,
+            double silenceSeconds, string systemPrompt,
             string overridePrompt, string resumeContext, string jdContext, string targetCompany, string extraContext,
             bool visionEnabled, string visionBaseUrl, string visionModel, string solvePrompt)
         {
             config.AiEnabled = enabled;
             config.AiModel = model;
             config.AiMode = mode;
+            config.AiThinkingMode = thinkingMode;
             config.AiBaseUrl = baseUrl ?? "";
             config.AiSilenceSeconds = silenceSeconds;
             config.AiSystemPrompt = systemPrompt ?? "";
@@ -4071,6 +4193,7 @@ namespace WasapiParaformerOverlay
             if (!Same(local.AsrLanguage, baseline.AsrLanguage)) merged.AsrLanguage = local.AsrLanguage;
             if (!Same(local.AiModel, baseline.AiModel)) merged.AiModel = local.AiModel;
             if (!Same(local.AiMode, baseline.AiMode)) merged.AiMode = local.AiMode;
+            if (!Same(local.AiThinkingMode, baseline.AiThinkingMode)) merged.AiThinkingMode = local.AiThinkingMode;
             if (!Same(local.AiSystemPrompt, baseline.AiSystemPrompt)) merged.AiSystemPrompt = local.AiSystemPrompt;
             if (!Same(local.AiBaseUrl, baseline.AiBaseUrl)) merged.AiBaseUrl = local.AiBaseUrl;
             if (!Same(local.AiOverridePrompt, baseline.AiOverridePrompt)) merged.AiOverridePrompt = local.AiOverridePrompt;
