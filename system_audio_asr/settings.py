@@ -589,30 +589,42 @@ def test_deepseek() -> dict[str, Any]:
     endpoint = settings["aiBaseUrl"].rstrip("/") + "/chat/completions"
     if not endpoint.startswith(("http://", "https://")):
         raise ValueError("接口地址必须以 http:// 或 https:// 开头")
-    body = json.dumps(
-        {
-            "model": settings["aiModel"],
-            "messages": [
-                {"role": "system", "content": "你是连接测试助手。"},
-                {"role": "user", "content": "请只回复：连接成功"},
-            ],
-            "stream": False,
-            # 思考型模型的 reasoning token 也计入上限；100 会让「连接测试」
-            # 在正常模型上误报失败（思考没结束就被截断，正文为空）。
-            "max_tokens": 512,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    status, payload = request_public_http(
-        endpoint,
-        body=body,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "VoxRibbon/0.1",
-            "Authorization": f"Bearer {api_key}",
-        },
-        timeout=35,
-    )
+
+    from .ai_stream import apply_thinking_mode, is_thinking_unsupported
+
+    request_body: dict[str, Any] = {
+        "model": settings["aiModel"],
+        "messages": [
+            {"role": "system", "content": "你是连接测试助手。"},
+            {"role": "user", "content": "请只回复：连接成功"},
+        ],
+        "stream": False,
+        # 思考型模型的 reasoning token 也计入上限；100 会让「连接测试」
+        # 在正常模型上误报失败（思考没结束就被截断，正文为空）。
+        "max_tokens": 512,
+    }
+    # 与其他 AI 链路一致地应用思考模式，让"测试结果"能反映面试时的真实表现。
+    # 连接测试也是探测网关兼容性的最安全时机（不会打断面试）。
+    apply_thinking_mode(request_body, settings.get("aiThinkingMode"))
+
+    def send(payload_dict: dict) -> tuple[int, bytes]:
+        return request_public_http(
+            endpoint,
+            body=json.dumps(payload_dict, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "VoxRibbon/0.1",
+                "Authorization": f"Bearer {api_key}",
+            },
+            timeout=35,
+        )
+
+    status, payload = send(request_body)
+    # 网关不认 thinking 字段时去掉它重试一次：连接测试正是发现该限制的地方，
+    # 直接失败会让人误以为 Key 或地址配错了。
+    if status >= 400 and "thinking" in request_body and is_thinking_unsupported(status, payload):
+        request_body.pop("thinking", None)
+        status, payload = send(request_body)
     if status >= 400:
         raise RuntimeError(f"AI HTTP {status}: {payload.decode('utf-8', errors='replace')[:300]}")
     result = json.loads(payload.decode("utf-8"))

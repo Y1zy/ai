@@ -162,6 +162,72 @@ def test_custom_builtin_prompt_replaces_all_modes(tmp_path, monkeypatch) -> None
         assert "[Resume]" in text and "五年 C++/Qt" in text, mode
 
 
+# ---------------------------------------------------------------- 连接测试
+# 三个调试入口（连接测试 / 回答测试 / 实际提示词）应与面试时的真实请求行为一致，
+# 否则「测试通过」不代表面试时可用。
+
+
+def _capture_connection_test_request(monkeypatch, mode: str) -> dict:
+    """拦截底层 HTTP，返回连接测试实际发出的请求体。"""
+    captured: list[dict] = []
+
+    def fake_request(url, *, body, headers, timeout, method="POST"):
+        captured.append(json.loads(body.decode("utf-8")))
+        return 200, json.dumps({"choices": [{"message": {"content": "连接成功"}}]}).encode()
+
+    monkeypatch.setattr(settings, "request_public_http", fake_request)
+    monkeypatch.setattr(settings, "load_api_key", lambda path=None: "test-key")
+    monkeypatch.setattr(
+        settings, "load_settings",
+        lambda path=None, strict=False: {
+            "aiThinkingMode": mode, "aiModel": "m", "aiBaseUrl": "https://api.example/v1",
+        },
+    )
+    result = settings.test_deepseek()
+    assert result["ok"] is True
+    assert captured, "未发出请求"
+    return captured[0]
+
+
+def test_connection_test_respects_thinking_off(monkeypatch) -> None:
+    """选「关闭思考」时，连接测试也应发送 thinking=disabled（与面试路径一致）。"""
+    sent = _capture_connection_test_request(monkeypatch, "off")
+    assert sent["thinking"] == {"type": "disabled"}
+
+
+def test_connection_test_omits_thinking_when_auto(monkeypatch) -> None:
+    """auto 档不发送任何思考字段，保持模型默认行为。"""
+    sent = _capture_connection_test_request(monkeypatch, "auto")
+    assert "thinking" not in sent
+    assert "reasoning_effort" not in sent
+
+
+def test_connection_test_downgrades_when_thinking_rejected(monkeypatch) -> None:
+    """网关不认 thinking 字段时自动重试一次，而不是误报 Key/地址错误。"""
+    bodies: list[dict] = []
+
+    def fake_request(url, *, body, headers, timeout, method="POST"):
+        payload = json.loads(body.decode("utf-8"))
+        bodies.append(payload)
+        if "thinking" in payload:
+            return 400, b'{"error":"unknown parameter thinking"}'
+        return 200, json.dumps({"choices": [{"message": {"content": "连接成功"}}]}).encode()
+
+    monkeypatch.setattr(settings, "request_public_http", fake_request)
+    monkeypatch.setattr(settings, "load_api_key", lambda path=None: "test-key")
+    monkeypatch.setattr(
+        settings, "load_settings",
+        lambda path=None, strict=False: {
+            "aiThinkingMode": "off", "aiModel": "m", "aiBaseUrl": "https://api.example/v1",
+        },
+    )
+    result = settings.test_deepseek()
+    assert result["ok"] is True, "降级后应成功"
+    assert len(bodies) == 2, "未触发降级重试"
+    assert bodies[0]["thinking"] == {"type": "disabled"}
+    assert "thinking" not in bodies[1]
+
+
 def _allow_local_file(tmp_path, monkeypatch, enabled: bool | None = None):
     """把 allow_local.json 指向 tmp 路径；enabled 非空时先写入。"""
     path = tmp_path / "allow_local.json"
