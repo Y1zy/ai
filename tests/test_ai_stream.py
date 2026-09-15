@@ -318,6 +318,7 @@ def test_stream_downgrades_when_gateway_rejects_thinking(monkeypatch) -> None:
     (1500, 1024),          # 吸附到最近档（居中偏小）
     (5000, 4096),          # 吸附到最近档（往大）
     (99999, 8192),         # 超出上限吸附到最大档
+    (1e15, 8192),          # 大浮点（与 C# Load 的 double 路径对拍用）
     (1, 256),              # 低于下限吸附到最小档
     (None, 2048),          # 缺键 / 垃圾值回退默认
     ("", 2048),

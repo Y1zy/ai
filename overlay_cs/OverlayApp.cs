@@ -427,12 +427,22 @@ namespace WasapiParaformerOverlay
                 if (data.ContainsKey("aiModel")) result.AiModel = Convert.ToString(data["aiModel"]);
                 if (data.ContainsKey("aiMode")) result.AiMode = Convert.ToString(data["aiMode"]);
                 if (data.ContainsKey("aiThinkingMode")) result.AiThinkingMode = Convert.ToString(data["aiThinkingMode"]);
-                // 单独 try/catch：超 Int32 的手改值（如 99999999999）会让 Convert.ToInt32
-                // 抛 OverflowException，被 Load 外层 catch 吞掉后，本行之后的所有字段
-                // （简历/JD/提示词等）都会退回默认值，下次保存即抹掉磁盘数据。
+                // 与 Python normalize_max_tokens 的 float() 同口径解析，避免两端对同一
+                // 配置文件吸附出不同档位：
+                //   null / NaN / 无穷 → 默认；超 Int32 的巨值夹到边界再吸附（Python int(float())
+                //   对大值不报错，会吸附到 8192，不能在这里回退 2048）。
+                // 必须单独 try/catch：Convert.ToString 之外的强转失败会被 Load 外层 catch 吞掉，
+                // 本行之后的所有字段（简历/JD/提示词等）都会退回默认值，下次保存即抹掉磁盘数据。
                 try
                 {
-                    if (data.ContainsKey("aiMaxTokens")) result.AiMaxTokens = Convert.ToInt32(data["aiMaxTokens"]);
+                    if (data.ContainsKey("aiMaxTokens") && data["aiMaxTokens"] != null)
+                    {
+                        double raw = Convert.ToDouble(data["aiMaxTokens"]);
+                        if (double.IsNaN(raw) || double.IsInfinity(raw)) result.AiMaxTokens = DefaultMaxTokens;
+                        else if (raw >= int.MaxValue) result.AiMaxTokens = int.MaxValue;
+                        else if (raw <= int.MinValue) result.AiMaxTokens = int.MinValue;
+                        else result.AiMaxTokens = (int)raw;
+                    }
                 }
                 catch { result.AiMaxTokens = DefaultMaxTokens; }
                 if (data.ContainsKey("aiSilenceSeconds")) result.AiSilenceSeconds = Convert.ToDouble(data["aiSilenceSeconds"]);
@@ -960,10 +970,16 @@ namespace WasapiParaformerOverlay
         internal static async Task<string> CompleteAsync(
             OverlayConfig config, string apiKey, string transcript, CancellationToken token)
         {
+            // 连接测试固定 512，不跟随「回答长度」档位（与 Python test_deepseek 一致）：
+            // 语义是"能否连通"，档位调到 256 时思考型模型的 reasoning token 可能
+            // 吃光额度导致正文为空，把可用的网关误报为"连接失败"（100→512 就是这么修的）。
             AiProbeResult result = await SendChatAsync(
-                config, apiKey, "转写文本：\n" + transcript, token);
+                config, apiKey, "转写文本：\n" + transcript, token, FixedProbeMaxTokens);
             return result.Content;
         }
+
+        /// <summary>连接测试等探测类请求的固定额度：足够覆盖 reasoning token 又不浪费。</summary>
+        internal const int FixedProbeMaxTokens = 512;
 
         /// <summary>
         /// 按配置给请求体加思考控制字段。面试实时场景下思考会让首字延迟从约 1 秒
@@ -987,8 +1003,11 @@ namespace WasapiParaformerOverlay
         }
 
         // 一次非流式对话：返回答案、响应里的实际模型名（中转站可能改路由）与耗时。
+        // maxTokensOverride 供连接测试固定额度用（见 CompleteAsync）；null 时跟随
+        // 「回答长度」档位。「回答测试」入口直接调用本方法、不传覆盖值，故跟随档位。
         internal static async Task<AiProbeResult> SendChatAsync(
-            OverlayConfig config, string apiKey, string userText, CancellationToken token)
+            OverlayConfig config, string apiKey, string userText, CancellationToken token,
+            int? maxTokensOverride = null)
         {
             System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
             ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
@@ -1006,7 +1025,9 @@ namespace WasapiParaformerOverlay
             payload["stream"] = false;
             // 与流式路径一致：思考型模型的 reasoning token 也计入上限，500 容易被思考吃光。
             // 档位来自「回答长度」设置（256–8192），默认 2048 即历史行为。
-            payload["max_tokens"] = config == null ? OverlayConfig.DefaultMaxTokens : OverlayConfig.SnapMaxTokens(config.AiMaxTokens);
+            payload["max_tokens"] = maxTokensOverride.HasValue
+                ? maxTokensOverride.Value
+                : (config == null ? OverlayConfig.DefaultMaxTokens : OverlayConfig.SnapMaxTokens(config.AiMaxTokens));
             payload["temperature"] = 0.3;
             ApplyThinkingMode(payload, config);
 
