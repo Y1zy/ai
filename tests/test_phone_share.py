@@ -551,6 +551,94 @@ class TestAutoCaptureLifecycle:
         assert len(sent) == 1 and sent[0]["done"] is True
 
 
+def test_phone_ask_forwards_max_tokens(monkeypatch):
+    """手机追问应把「回答长度」档位传给流式调用（与字幕 AI 同一档位）。"""
+    import asyncio
+
+    from system_audio_asr import ai_stream
+    from system_audio_asr import server
+    from system_audio_asr import settings as settings_module
+
+    relay = phone_share.PhoneRelay()
+    relay.schedule_json = lambda payload: None
+    captured: dict = {}
+
+    def fake_stream(**kwargs):
+        captured.update(kwargs)
+        return "回答"
+
+    monkeypatch.setattr(ai_stream, "stream_chat_completion", fake_stream)
+    monkeypatch.setattr(
+        settings_module, "load_settings",
+        lambda path=None, strict=False: {
+            **settings_module.DEFAULTS,
+            "aiMaxTokens": 512, "aiModel": "m", "aiBaseUrl": "https://api.example/v1",
+        },
+    )
+    monkeypatch.setattr(settings_module, "load_api_key", lambda path=None: "test-key")
+    monkeypatch.setattr(server, "effective_system_prompt", lambda: "系统提示词")
+
+    asyncio.run(relay._handle_ask("测一道题"))
+    assert captured.get("max_tokens") == 512, "手机追问未把档位传给请求"
+
+
+def test_phone_ask_defaults_max_tokens_when_key_missing(monkeypatch):
+    """旧配置没有 aiMaxTokens 键时，追问链路的实际请求应发出默认 2048。
+
+    这里走真实的 stream_chat_completion（只拦 httpx），验证 relay → ai_stream
+    的完整兜底链路，而不是只验证 relay 传了 None。
+    """
+    import asyncio
+
+    from system_audio_asr import server
+    from system_audio_asr import settings as settings_module
+
+    relay = phone_share.PhoneRelay()
+    relay.schedule_json = lambda payload: None
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def iter_lines(self):
+            return iter(['data: {"choices":[{"delta":{"content":"回答"}}]}', "data: [DONE]"])
+
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stream(self, method, url, json=None, headers=None):
+            captured["payload"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.Client", FakeClient)
+    monkeypatch.setattr("system_audio_asr.settings.validate_public_http_url", lambda url: url)
+
+    payload = {k: v for k, v in settings_module.DEFAULTS.items() if k != "aiMaxTokens"}
+    monkeypatch.setattr(settings_module, "load_settings", lambda path=None, strict=False: payload)
+    monkeypatch.setattr(settings_module, "load_api_key", lambda path=None: "test-key")
+    monkeypatch.setattr(server, "effective_system_prompt", lambda: "系统提示词")
+
+    asyncio.run(relay._handle_ask("测一道题"))
+    assert captured.get("payload"), "未发出请求"
+    assert captured["payload"]["max_tokens"] == 2048, "缺键时未回退默认档位"
+
+
 def test_phone_status_ok_when_config_broken(tmp_path: Path, monkeypatch):
     """phone_share.json 被写坏时 /api/phone/status 不应 500。"""
     fastapi_testclient = pytest.importorskip("fastapi.testclient")

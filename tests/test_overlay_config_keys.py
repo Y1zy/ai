@@ -57,3 +57,30 @@ def test_csharp_load_reads_all_saved_keys() -> None:
             break
     saved = _csharp_saved_keys()
     assert saved == loaded, f"Save/Load 键集合不一致: 仅 Save={sorted(saved - loaded)}, 仅 Load={sorted(loaded - saved)}"
+
+
+def _csharp_max_token_levels() -> tuple[list[int], int]:
+    """解析 OverlayApp.cs 的回答长度档位表与默认值。"""
+    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    match = re.search(r"MaxTokenLevels\s*=\s*\{([^}]*)\}", text)
+    assert match, "未找到 C# MaxTokenLevels 档位表"
+    levels = [int(token) for token in re.findall(r"\d+", match.group(1))]
+    default_match = re.search(r"DefaultMaxTokens\s*=\s*(\d+)", text)
+    assert default_match, "未找到 C# DefaultMaxTokens"
+    return levels, int(default_match.group(1))
+
+
+def test_max_token_levels_match_between_csharp_and_python() -> None:
+    """档位表跨语言各存一份，必须同步：只改一边会让同一配置在两端吸附出不同档位。
+
+    （Python 侧: ai_stream.MAX_TOKENS_LEVELS / DEFAULT_MAX_TOKENS）
+    """
+    from system_audio_asr.ai_stream import DEFAULT_MAX_TOKENS, MAX_TOKENS_LEVELS
+
+    csharp_levels, csharp_default = _csharp_max_token_levels()
+    assert csharp_levels == list(MAX_TOKENS_LEVELS), (
+        f"档位表不一致: C#={csharp_levels} Python={list(MAX_TOKENS_LEVELS)}"
+    )
+    assert csharp_default == DEFAULT_MAX_TOKENS, (
+        f"默认档不一致: C#={csharp_default} Python={DEFAULT_MAX_TOKENS}"
+    )
