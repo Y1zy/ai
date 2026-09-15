@@ -49,6 +49,9 @@ DEFAULTS: dict[str, Any] = {
     # 思考模式：off=关闭思考（首字约 1 秒，面试实时推荐） / auto=模型自行决定。
     # 必须纳入 DEFAULTS，否则网页保存时该键会被抹掉。
     "aiThinkingMode": "auto",
+    # 回答长度上限档位（token）：档位表见 ai_stream.MAX_TOKENS_LEVELS，
+    # 默认 2048 即历史行为。同样必须纳入 DEFAULTS 否则网页保存会抹掉。
+    "aiMaxTokens": 2048,
     "aiSilenceSeconds": 0.6,
     "aiSystemPrompt": "",
     "aiOverridePrompt": "",
@@ -222,6 +225,10 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
         result["aiMode"] = "auto"
     if result["aiThinkingMode"] not in {"off", "auto"}:
         result["aiThinkingMode"] = "auto"
+    # 长度档位吸附到最近一档（非法值回退默认），与 C# OverlayConfig.Normalize 同规则。
+    from .ai_stream import normalize_max_tokens
+
+    result["aiMaxTokens"] = normalize_max_tokens(result.get("aiMaxTokens"))
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(result["textColor"])):
         result["textColor"] = "#FFFFFF"
     if result["frameMode"] not in {"hover", "always"}:

@@ -55,6 +55,28 @@ def is_thinking_unsupported(status: int, body: bytes) -> bool:
     return "thinking" in text or "unknown" in text or "unsupported" in text or "invalid" in text
 
 
+# 回答长度上限档位（max_tokens）。额度同时决定"回答能写多长"：给太多，模型会把
+# 简单题展开成长文，更容易冒 Markdown 与代码示例；给太少，复杂题会被中途截断。
+# 档位表与 C# OverlayConfig.MaxTokenLevels 各存一份（跨语言无法共享），改档位需同步。
+MAX_TOKENS_LEVELS = (256, 512, 1024, 2048, 4096, 8192)
+DEFAULT_MAX_TOKENS = 2048
+
+
+def normalize_max_tokens(value: Any) -> int:
+    """把任意输入规范到受支持的档位；无法识别时回退默认。
+
+    区间内的值吸附到最近档（如 3000→2048、99999→8192）：两端 UI 都是固定档位
+    下拉，吸附保证手改 config 后仍能显示出当前值，不会出现空选项后被清零。
+    OverflowError 必须捕获：JSON 里的 1e400 会解析成 inf，int(inf) 抛的不是
+    ValueError——漏掉它会让 load_settings 整体失败（设置页表现为全部配置丢失）。
+    """
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_MAX_TOKENS
+    return min(MAX_TOKENS_LEVELS, key=lambda level: (abs(level - number), level))
+
+
 def build_messages(prompt: str, question: str, history: list[dict] | None = None) -> list[dict]:
     """系统提示词 + 最近多轮历史 + 本次问题（与 _ask_ai_blocking 保持同一结构）。"""
     messages: list[dict] = [{"role": "system", "content": prompt}]
@@ -74,7 +96,7 @@ def stream_chat_completion(
     model: str,
     messages: list[dict],
     on_snapshot: Callable[[str, bool], None],
-    max_tokens: int = 2048,
+    max_tokens: Any = DEFAULT_MAX_TOKENS,
     temperature: float = 0.3,
     timeout: float = 90.0,
     flush_seconds: float = STREAM_FLUSH_SECONDS,
@@ -97,7 +119,7 @@ def stream_chat_completion(
         "model": model,
         "messages": messages,
         "stream": True,
-        "max_tokens": max_tokens,
+        "max_tokens": normalize_max_tokens(max_tokens),
         "temperature": temperature,
     }
     apply_thinking_mode(payload, thinking_mode)

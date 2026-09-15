@@ -28,6 +28,14 @@ def test_deepseek_translation_mode_is_preserved() -> None:
     assert normalize_settings({"aiMode": "translate_zh"})["aiMode"] == "auto"
 
 
+def test_max_tokens_snaps_to_nearest_level() -> None:
+    """回答长度上限吸附到最近档位；非法值回退默认 2048（与 C# 同规则）。"""
+    assert normalize_settings({"aiMaxTokens": 512})["aiMaxTokens"] == 512
+    assert normalize_settings({"aiMaxTokens": 3000})["aiMaxTokens"] == 2048
+    assert normalize_settings({"aiMaxTokens": 99999})["aiMaxTokens"] == 8192
+    assert normalize_settings({"aiMaxTokens": "bad"})["aiMaxTokens"] == 2048
+
+
 def test_live_translation_flag_is_normalized() -> None:
     assert normalize_settings({"liveTranslateEnabled": True})["liveTranslateEnabled"] is True
     assert normalize_settings({"liveTranslateEnabled": False})["liveTranslateEnabled"] is False
@@ -226,6 +234,49 @@ def test_connection_test_downgrades_when_thinking_rejected(monkeypatch) -> None:
     assert len(bodies) == 2, "未触发降级重试"
     assert bodies[0]["thinking"] == {"type": "disabled"}
     assert "thinking" not in bodies[1]
+
+
+def test_connection_test_keeps_fixed_512_max_tokens(monkeypatch) -> None:
+    """连接测试语义是"能否连通"，不跟随回答长度档位（固定 512）。"""
+    sent = _capture_connection_test_request(monkeypatch, "off")
+    assert sent["max_tokens"] == 512
+
+
+# ---------------------------------------------------------------- 回答长度档位（回答测试链路）
+# 回答测试应走与面试时相同的 max_tokens 档位，否则"测试通过"不代表面试时可用。
+
+
+def _capture_ask_request(monkeypatch, settings_payload: dict) -> dict:
+    """拦截 _post_chat，返回「回答测试」实际发出的请求体。"""
+    from system_audio_asr import server
+
+    captured: list[dict] = []
+
+    def fake_post(endpoint, request_body, api_key):
+        captured.append(request_body)
+        return 200, json.dumps(
+            {"choices": [{"message": {"content": "回答"}}], "model": "m"}
+        ).encode()
+
+    monkeypatch.setattr(server, "_post_chat", fake_post)
+    result = server._ask_ai_blocking(
+        "系统提示词", "测一道题", {**settings.DEFAULTS, **settings_payload}, "test-key",
+    )
+    assert result["answer"] == "回答"
+    assert captured, "未发出请求"
+    return captured[0]
+
+
+def test_reply_test_uses_configured_max_tokens(monkeypatch) -> None:
+    sent = _capture_ask_request(monkeypatch, {"aiMaxTokens": 512})
+    assert sent["max_tokens"] == 512
+
+
+def test_reply_test_defaults_max_tokens_when_key_missing(monkeypatch) -> None:
+    """旧配置没有 aiMaxTokens 键时回退 2048，不能因 None 报错。"""
+    payload = {k: v for k, v in settings.DEFAULTS.items() if k != "aiMaxTokens"}
+    sent = _capture_ask_request(monkeypatch, payload)
+    assert sent["max_tokens"] == 2048
 
 
 def _allow_local_file(tmp_path, monkeypatch, enabled: bool | None = None):

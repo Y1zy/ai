@@ -98,15 +98,16 @@ def _ask_ai_blocking(
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": question})
-    from .ai_stream import apply_thinking_mode, is_thinking_unsupported
+    from .ai_stream import apply_thinking_mode, is_thinking_unsupported, normalize_max_tokens
 
     request_body: dict = {
         "model": settings["aiModel"],
         "messages": messages,
         "stream": False,
         # 与字幕 AI / 截图解题一致：思考型模型的 reasoning token 也计入上限，
-        # 500 常被思考过程吃光导致正文为空。
-        "max_tokens": 2048,
+        # 500 常被思考过程吃光导致正文为空。档位跟随「回答长度」设置，
+        # 让回答测试能反映面试时的真实表现。
+        "max_tokens": normalize_max_tokens(settings.get("aiMaxTokens")),
         "temperature": 0.3,
     }
     apply_thinking_mode(request_body, settings.get("aiThinkingMode"))

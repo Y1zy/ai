@@ -94,6 +94,7 @@
       <div class="row two"><label for="aiModel">模型</label><input id="aiModel" type="text" list="aiModelPresets" placeholder="deepseek-v4-flash"><datalist id="aiModelPresets"><option value="deepseek-v4-flash"></option><option value="deepseek-v4-pro"></option></datalist></div>
       <div class="row two"><label for="aiMode">处理模式</label><select id="aiMode"><option value="auto">自动判断：问题则回答，否则总结</option><option value="summary">一句话总结</option><option value="qa">回答问题</option><option value="explain">解释内容</option><option value="translate">中文翻译为英文</option></select></div>
       <div class="row two"><label for="aiThinkingMode">思考模式</label><div><select id="aiThinkingMode"><option value="off">关闭思考 — 首字约 1 秒（面试实时推荐）</option><option value="auto">自动 — 由模型判断，首字可能 10 秒以上</option></select><div style="font-size:12px;margin-top:4px;color:#91a1b8">思考型模型（如 deepseek-v4.x）默认先"想"再答，首字延迟可达 10 秒以上；关闭后回答反而更完整（token 不再被思考占用）。若你的网关不支持该参数，会自动退回自动模式。</div></div></div>
+      <div class="row two"><label for="aiMaxTokens">回答长度</label><div><select id="aiMaxTokens"><option value="256">极简 — 约 256（一两句话）</option><option value="512">简洁 — 约 512</option><option value="1024">适中 — 约 1024</option><option value="2048">完整 — 约 2048（默认）</option><option value="4096">长 — 约 4096</option><option value="8192">超长 — 约 8192</option></select><div style="font-size:12px;margin-top:4px;color:#91a1b8">回答长度上限（token）。档位越低回答越短，也不容易展开成带 Markdown / 代码示例的长文；档位太低复杂题会被中途截断，建议保持「完整」以上。对字幕 AI、手机追问与「回答测试」生效；截图解题固定 2048。</div></div></div>
       <div class="row"><label for="aiSilenceSeconds">final 后等待</label><input id="aiSilenceSeconds" type="range" min="0.5" max="8" step="0.1"><output id="aiSilenceOut"></output></div>
       <details class="adv" open>
         <summary>简历与面试背景（AI 回答时参考这些真实经历）<span id="resumeBadge" class="badge" style="margin-left:auto">未填写</span></summary>
@@ -193,7 +194,7 @@
   <div class="actions"><span id="status">正在加载设置…</span><button id="save" class="primary" type="button">保存并应用</button></div>
 </main>
 <script>
-const ids=['fontSize','opacity','fontFamily','textColor','frameMode','frameColor','frameOpacity','screenName','locked','asrLanguage','hotwordEnabled','liveTranslateEnabled','aiEnabled','aiBaseUrl','aiModel','aiMode','aiThinkingMode','aiSilenceSeconds','resumeContext','jdContext','targetCompany','extraContext'];
+const ids=['fontSize','opacity','fontFamily','textColor','frameMode','frameColor','frameOpacity','screenName','locked','asrLanguage','hotwordEnabled','liveTranslateEnabled','aiEnabled','aiBaseUrl','aiModel','aiMode','aiThinkingMode','aiMaxTokens','aiSilenceSeconds','resumeContext','jdContext','targetCompany','extraContext'];
 const $=id=>document.getElementById(id); let loaded=null, clearRequested=false;
 function stripMarkdown(t){
   if(!t) return t||"";
@@ -223,7 +224,7 @@ async function load(){
   }catch(e){showStatus('加载失败：'+e.message,true)}
 }
 function collect(){
-  const payload={fontSize:Number($('fontSize').value),opacity:Number($('opacity').value)/100,fontFamily:$('fontFamily').value,textColor:$('textColor').value,frameMode:$('frameMode').value,frameColor:$('frameColor').value,frameOpacity:Number($('frameOpacity').value)/100,screenName:$('screenName').value,locked:$('locked').checked,asrLanguage:$('asrLanguage').value,hotwordEnabled:$('hotwordEnabled').checked,liveTranslateEnabled:$('liveTranslateEnabled').checked,aiEnabled:$('aiEnabled').checked,aiBaseUrl:$('aiBaseUrl').value.trim(),aiModel:$('aiModel').value.trim(),aiMode:$('aiMode').value,aiThinkingMode:$('aiThinkingMode').value,aiSilenceSeconds:Number($('aiSilenceSeconds').value),resumeContext:$('resumeContext').value,jdContext:$('jdContext').value,targetCompany:$('targetCompany').value.trim(),extraContext:$('extraContext').value};
+  const payload={fontSize:Number($('fontSize').value),opacity:Number($('opacity').value)/100,fontFamily:$('fontFamily').value,textColor:$('textColor').value,frameMode:$('frameMode').value,frameColor:$('frameColor').value,frameOpacity:Number($('frameOpacity').value)/100,screenName:$('screenName').value,locked:$('locked').checked,asrLanguage:$('asrLanguage').value,hotwordEnabled:$('hotwordEnabled').checked,liveTranslateEnabled:$('liveTranslateEnabled').checked,aiEnabled:$('aiEnabled').checked,aiBaseUrl:$('aiBaseUrl').value.trim(),aiModel:$('aiModel').value.trim(),aiMode:$('aiMode').value,aiThinkingMode:$('aiThinkingMode').value,aiMaxTokens:Number($('aiMaxTokens').value),aiSilenceSeconds:Number($('aiSilenceSeconds').value),resumeContext:$('resumeContext').value,jdContext:$('jdContext').value,targetCompany:$('targetCompany').value.trim(),extraContext:$('extraContext').value};
   // 热词框展示的是派生词表（含简历提取/内置兜底），未编辑时不能回写，
   // 否则等同于把它们固化成手动热词。不提交该键，服务端会保留磁盘原值。
   if(hotwordEdited)payload.hotwordExtra=$('hotwordExtra').value.trim();

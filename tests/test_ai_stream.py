@@ -298,3 +298,64 @@ def test_stream_downgrades_when_gateway_rejects_thinking(monkeypatch) -> None:
     assert calls[0].get("thinking") == {"type": "disabled"}
     assert "thinking" not in calls[1], "重试请求仍带 thinking 字段"
     assert final == "重试成功"
+
+
+# ---------------------------------------------------------------- 回答长度档位
+# max_tokens 档位控制单次回答的篇幅；非法值回退、区间值吸附到最近档，
+# 保证两端固定档位下拉永远能显示出当前值。
+
+
+@pytest.mark.parametrize("value, expected", [
+    (256, 256),
+    (512, 512),
+    (1024, 1024),
+    (2048, 2048),
+    (4096, 4096),
+    (8192, 8192),
+    ("1024", 1024),        # 网页表单可能以字符串提交
+    (1024.0, 1024),
+    (3000, 2048),          # 吸附到最近档（往小）
+    (1500, 1024),          # 吸附到最近档（居中偏小）
+    (5000, 4096),          # 吸附到最近档（往大）
+    (99999, 8192),         # 超出上限吸附到最大档
+    (1, 256),              # 低于下限吸附到最小档
+    (None, 2048),          # 缺键 / 垃圾值回退默认
+    ("", 2048),
+    ("forced", 2048),
+    (float("inf"), 2048),  # json 的 1e400 会解析成 inf；int(inf) 抛 OverflowError
+    (float("-inf"), 2048),
+    (float("nan"), 2048),
+    ("1e400", 2048),
+])
+def test_normalize_max_tokens(value, expected) -> None:
+    assert ai_stream.normalize_max_tokens(value) == expected
+
+
+def test_max_tokens_is_sent_in_stream_payload(monkeypatch) -> None:
+    captured = _fake_stream(monkeypatch, [
+        'data: {"choices":[{"delta":{"content":"X"}}]}',
+        "data: [DONE]",
+    ])
+    ai_stream.stream_chat_completion(
+        url="https://api.example/v1/chat/completions",
+        api_key="k", model="m",
+        messages=[{"role": "user", "content": "q"}],
+        on_snapshot=lambda t, d: None,
+        max_tokens=512,
+    )
+    assert captured["payload"]["max_tokens"] == 512
+
+
+def test_max_tokens_defaults_to_2048_when_omitted(monkeypatch) -> None:
+    """不传 max_tokens 时保持历史默认 2048，避免调用方漏改导致额度变化。"""
+    captured = _fake_stream(monkeypatch, [
+        'data: {"choices":[{"delta":{"content":"X"}}]}',
+        "data: [DONE]",
+    ])
+    ai_stream.stream_chat_completion(
+        url="https://api.example/v1/chat/completions",
+        api_key="k", model="m",
+        messages=[{"role": "user", "content": "q"}],
+        on_snapshot=lambda t, d: None,
+    )
+    assert captured["payload"]["max_tokens"] == 2048

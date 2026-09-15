@@ -299,6 +299,13 @@ namespace WasapiParaformerOverlay
         internal string AiMode = "auto";
         // 思考模式：off=关闭思考（首字约 1 秒，面试实时推荐） / auto=模型自行决定。
         internal string AiThinkingMode = "auto";
+        // 回答长度上限档位（token）。额度同时决定"回答能写多长"：给太多，简单题也会
+        // 被展开成长文，更容易冒 Markdown 与代码示例；给太少复杂题会被中途截断。
+        internal int AiMaxTokens = DefaultMaxTokens;
+        // 档位表与 Python ai_stream.MAX_TOKENS_LEVELS 各存一份（跨语言无法共享），
+        // 改档位必须同步两处，否则网页保存后 C# 读到的值会被吸附到不同档。
+        internal static readonly int[] MaxTokenLevels = { 256, 512, 1024, 2048, 4096, 8192 };
+        internal const int DefaultMaxTokens = 2048;
         internal double AiSilenceSeconds = 0.6;
         internal string AiSystemPrompt = "";
         internal string AiBaseUrl = "https://api.deepseek.com";
@@ -361,8 +368,31 @@ namespace WasapiParaformerOverlay
             if (string.IsNullOrWhiteSpace(AiModel)) AiModel = "deepseek-v4-flash";
             if (string.IsNullOrWhiteSpace(AiMode)) AiMode = "auto";
             if (AiThinkingMode != "off") AiThinkingMode = "auto";
+            AiMaxTokens = SnapMaxTokens(AiMaxTokens);
             if (string.IsNullOrWhiteSpace(AiBaseUrl)) AiBaseUrl = "https://api.deepseek.com";
             if (AsrLanguage != "en") AsrLanguage = "zh";
+        }
+
+        /// <summary>
+        /// 把回答长度上限吸附到最近的受支持档位（与 Python ai_stream.normalize_max_tokens
+        /// 同规则）：手改 config 的任意值也能落到某个档，避免下拉框选不中当前值。
+        /// 距离用 long 计算：int.MinValue 时 int 版 Math.Abs(level - value) 会溢出回绕，
+        /// 得到与 Python 侧不同的吸附结果（int 溢出是静默的，不会报错）。
+        /// </summary>
+        internal static int SnapMaxTokens(int value)
+        {
+            int best = DefaultMaxTokens;
+            long bestDistance = long.MaxValue;
+            foreach (int level in MaxTokenLevels)
+            {
+                long distance = Math.Abs((long)level - value);
+                if (distance < bestDistance || (distance == bestDistance && level < best))
+                {
+                    best = level;
+                    bestDistance = distance;
+                }
+            }
+            return best;
         }
 
         internal static OverlayConfig Load()
@@ -397,6 +427,14 @@ namespace WasapiParaformerOverlay
                 if (data.ContainsKey("aiModel")) result.AiModel = Convert.ToString(data["aiModel"]);
                 if (data.ContainsKey("aiMode")) result.AiMode = Convert.ToString(data["aiMode"]);
                 if (data.ContainsKey("aiThinkingMode")) result.AiThinkingMode = Convert.ToString(data["aiThinkingMode"]);
+                // 单独 try/catch：超 Int32 的手改值（如 99999999999）会让 Convert.ToInt32
+                // 抛 OverflowException，被 Load 外层 catch 吞掉后，本行之后的所有字段
+                // （简历/JD/提示词等）都会退回默认值，下次保存即抹掉磁盘数据。
+                try
+                {
+                    if (data.ContainsKey("aiMaxTokens")) result.AiMaxTokens = Convert.ToInt32(data["aiMaxTokens"]);
+                }
+                catch { result.AiMaxTokens = DefaultMaxTokens; }
                 if (data.ContainsKey("aiSilenceSeconds")) result.AiSilenceSeconds = Convert.ToDouble(data["aiSilenceSeconds"]);
                 if (data.ContainsKey("aiSystemPrompt")) result.AiSystemPrompt = Convert.ToString(data["aiSystemPrompt"]);
                 if (data.ContainsKey("aiBaseUrl")) result.AiBaseUrl = Convert.ToString(data["aiBaseUrl"]);
@@ -445,6 +483,7 @@ namespace WasapiParaformerOverlay
             data["aiModel"] = AiModel;
             data["aiMode"] = AiMode;
             data["aiThinkingMode"] = AiThinkingMode;
+            data["aiMaxTokens"] = AiMaxTokens;
             data["aiSilenceSeconds"] = AiSilenceSeconds;
             data["aiSystemPrompt"] = AiSystemPrompt;
             data["aiBaseUrl"] = AiBaseUrl;
@@ -499,6 +538,7 @@ namespace WasapiParaformerOverlay
             AiModel = other.AiModel;
             AiMode = other.AiMode;
             AiThinkingMode = other.AiThinkingMode;
+            AiMaxTokens = other.AiMaxTokens;
             AiSilenceSeconds = other.AiSilenceSeconds;
             AiSystemPrompt = other.AiSystemPrompt;
             AiBaseUrl = other.AiBaseUrl;
@@ -965,7 +1005,8 @@ namespace WasapiParaformerOverlay
             payload["messages"] = new object[] { system, user };
             payload["stream"] = false;
             // 与流式路径一致：思考型模型的 reasoning token 也计入上限，500 容易被思考吃光。
-            payload["max_tokens"] = 2048;
+            // 档位来自「回答长度」设置（256–8192），默认 2048 即历史行为。
+            payload["max_tokens"] = config == null ? OverlayConfig.DefaultMaxTokens : OverlayConfig.SnapMaxTokens(config.AiMaxTokens);
             payload["temperature"] = 0.3;
             ApplyThinkingMode(payload, config);
 
@@ -1065,10 +1106,10 @@ namespace WasapiParaformerOverlay
             payload["model"] = config.AiModel;
             payload["messages"] = messages.ToArray();
             payload["stream"] = true;
-            // 2048 而非 500：思考型模型（如 deepseek-v4.x）的 reasoning token
-            // 也计入上限，500 常被思考过程吃光，正文为空（实测一句短问句的
-            // 思考就能用满 50+ token）。这与截图解题链路保持同一取值。
-            payload["max_tokens"] = 2048;
+            // 档位来自「回答长度」设置（256–8192），默认 2048 而非 500：思考型模型
+            // （如 deepseek-v4.x）的 reasoning token 也计入上限，500 常被思考过程吃光，
+            // 正文为空（实测一句短问句的思考就能用满 50+ token）。
+            payload["max_tokens"] = config == null ? OverlayConfig.DefaultMaxTokens : OverlayConfig.SnapMaxTokens(config.AiMaxTokens);
             payload["temperature"] = 0.3;
             ApplyThinkingMode(payload, config);
 
@@ -1406,6 +1447,7 @@ namespace WasapiParaformerOverlay
         private readonly ComboBox aiModelBox;
         private readonly ComboBox aiModeBox;
         private readonly ComboBox aiThinkingBox;
+        private readonly ComboBox aiMaxTokensBox;
         private readonly TextBox aiBaseUrlBox;
         private readonly Slider aiDelaySlider;
         private readonly TextBox aiPromptBox;
@@ -1623,6 +1665,28 @@ namespace WasapiParaformerOverlay
             aiThinkingHint.Foreground = new SolidColorBrush(Color.FromRgb(100, 116, 139));
             aiThinkingHint.Margin = new Thickness(0, 0, 0, 10);
             aiRoot.Children.Add(aiThinkingHint);
+
+            StackPanel aiMaxTokensRow = new StackPanel();
+            aiMaxTokensRow.Orientation = Orientation.Horizontal;
+            aiMaxTokensRow.Margin = new Thickness(0, 0, 0, 8);
+            aiMaxTokensRow.Children.Add(MakeText("长度", 13));
+            aiMaxTokensBox = new ComboBox();
+            aiMaxTokensBox.Items.Add("极简 — 约 256（一两句话）");
+            aiMaxTokensBox.Items.Add("简洁 — 约 512");
+            aiMaxTokensBox.Items.Add("适中 — 约 1024");
+            aiMaxTokensBox.Items.Add("完整 — 约 2048（默认）");
+            aiMaxTokensBox.Items.Add("长 — 约 4096");
+            aiMaxTokensBox.Items.Add("超长 — 约 8192");
+            aiMaxTokensBox.Width = 200;
+            aiMaxTokensBox.Margin = new Thickness(8, 0, 0, 0);
+            aiMaxTokensRow.Children.Add(aiMaxTokensBox);
+            aiRoot.Children.Add(aiMaxTokensRow);
+            TextBlock aiMaxTokensHint = MakeText(
+                "回答长度上限。档位越低回答越短（也更不容易展开成带代码示例的长文）；复杂题建议保持「完整」以上，太低会被中途截断。", 12);
+            aiMaxTokensHint.TextWrapping = TextWrapping.Wrap;
+            aiMaxTokensHint.Foreground = new SolidColorBrush(Color.FromRgb(100, 116, 139));
+            aiMaxTokensHint.Margin = new Thickness(0, 0, 0, 10);
+            aiRoot.Children.Add(aiMaxTokensHint);
 
             StackPanel aiBaseUrlRow = new StackPanel();
             aiBaseUrlRow.Orientation = Orientation.Horizontal;
@@ -2000,6 +2064,9 @@ namespace WasapiParaformerOverlay
                     : aiModelBox.Text);
             string mode = aiModeBox.SelectedItem == null ? "auto" : ModeKey(Convert.ToString(aiModeBox.SelectedItem));
             string thinking = aiThinkingBox.SelectedIndex == 0 ? "off" : "auto";
+            int maxTokens = aiMaxTokensBox.SelectedIndex >= 0 && aiMaxTokensBox.SelectedIndex < OverlayConfig.MaxTokenLevels.Length
+                ? OverlayConfig.MaxTokenLevels[aiMaxTokensBox.SelectedIndex]
+                : OverlayConfig.DefaultMaxTokens;
             SecretStore.SaveApiKey(apiKeyBox.Password);
             overlay.SetLiveTranslationEnabled(liveTranslateBox.IsChecked == true);
             overlay.ApplyAiSettings(
@@ -2007,6 +2074,7 @@ namespace WasapiParaformerOverlay
                 model,
                 mode,
                 thinking,
+                maxTokens,
                 aiBaseUrlBox.Text,
                 aiDelaySlider.Value / 10.0,
                 aiPromptBox.Text,
@@ -2096,6 +2164,11 @@ namespace WasapiParaformerOverlay
             if (aiModelBox.SelectedItem == null) aiModelBox.SelectedItem = "deepseek-v4-flash";
             aiModeBox.SelectedItem = ModeDisplay(config.AiMode);
             aiThinkingBox.SelectedIndex = config.AiThinkingMode == "off" ? 0 : 1;
+            // Normalize 已把值吸附到档位表，IndexOf 必命中；兜底再取一次防越界。
+            int maxTokensIndex = Array.IndexOf(OverlayConfig.MaxTokenLevels, config.AiMaxTokens);
+            aiMaxTokensBox.SelectedIndex = maxTokensIndex >= 0
+                ? maxTokensIndex
+                : Array.IndexOf(OverlayConfig.MaxTokenLevels, OverlayConfig.DefaultMaxTokens);
             aiBaseUrlBox.Text = config.AiBaseUrl;
             aiDelaySlider.Value = Math.Round(config.AiSilenceSeconds * 10);
             aiPromptBox.Text = config.AiSystemPrompt;
@@ -3674,7 +3747,7 @@ namespace WasapiParaformerOverlay
         }
 
         internal void ApplyAiSettings(
-            bool enabled, string model, string mode, string thinkingMode, string baseUrl,
+            bool enabled, string model, string mode, string thinkingMode, int maxTokens, string baseUrl,
             double silenceSeconds, string systemPrompt,
             string overridePrompt, string resumeContext, string jdContext, string targetCompany, string extraContext,
             bool visionEnabled, string visionBaseUrl, string visionModel, string solvePrompt)
@@ -3683,6 +3756,7 @@ namespace WasapiParaformerOverlay
             config.AiModel = model;
             config.AiMode = mode;
             config.AiThinkingMode = thinkingMode;
+            config.AiMaxTokens = OverlayConfig.SnapMaxTokens(maxTokens);
             config.AiBaseUrl = baseUrl ?? "";
             config.AiSilenceSeconds = silenceSeconds;
             config.AiSystemPrompt = systemPrompt ?? "";
@@ -4194,6 +4268,7 @@ namespace WasapiParaformerOverlay
             if (!Same(local.AiModel, baseline.AiModel)) merged.AiModel = local.AiModel;
             if (!Same(local.AiMode, baseline.AiMode)) merged.AiMode = local.AiMode;
             if (!Same(local.AiThinkingMode, baseline.AiThinkingMode)) merged.AiThinkingMode = local.AiThinkingMode;
+            if (local.AiMaxTokens != baseline.AiMaxTokens) merged.AiMaxTokens = local.AiMaxTokens;
             if (!Same(local.AiSystemPrompt, baseline.AiSystemPrompt)) merged.AiSystemPrompt = local.AiSystemPrompt;
             if (!Same(local.AiBaseUrl, baseline.AiBaseUrl)) merged.AiBaseUrl = local.AiBaseUrl;
             if (!Same(local.AiOverridePrompt, baseline.AiOverridePrompt)) merged.AiOverridePrompt = local.AiOverridePrompt;

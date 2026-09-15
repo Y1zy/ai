@@ -719,6 +719,9 @@ class PhoneRelay:
                 on_snapshot=lambda text, done: self.schedule_json(
                     {"type": "ai", "text": text, "done": done, "source": "ask"}
                 ),
+                # 回答长度上限跟随设置（与字幕 AI 同一档位）；缺键由
+                # normalize_max_tokens 回退默认，不会因 None 报错。
+                max_tokens=settings.get("aiMaxTokens"),
                 thinking_mode=settings.get("aiThinkingMode"),
             )
 
