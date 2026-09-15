@@ -79,7 +79,7 @@
       <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><h2>本地实时翻译</h2><span id="translationBadge" class="badge">未加载</span></div>
       <div class="row two"><label for="asrLanguage">识别语言</label><select id="asrLanguage"><option value="zh">中文 · Paraformer Streaming</option><option value="en">英文 · Faster-Whisper</option></select></div>
       <label class="switch"><input id="hotwordEnabled" type="checkbox" checked>启用热词纠正（从简历/JD 自动提取技术词，减少 Kafka→卡夫卡 等错误）</label>
-      <div class="row two" style="align-items:flex-start"><label for="hotwordExtra" style="padding-top:9px">热词表 <span id="hotwordCount" class="badge" style="display:none;margin-left:6px"></span><div style="font-weight:400;font-size:12px;color:#91a1b8;line-height:1.6;margin-top:4px">此处显示<b>当前全部生效热词</b>（手动补充 + 简历/JD 提取 + 内置兜底），可直接编辑。<br>每行一个词，或用逗号 / 顿号分隔。<br>编辑并保存后，框内内容将作为「手动热词」固定生效（优先级最高）。</div></label><div><textarea id="hotwordExtra" style="min-height:150px" placeholder="Kubernetes, CI/CD, 微服务&#10;高并发、分布式锁、幂等"></textarea><div id="hotwordSources" style="display:none;margin-top:6px;padding:8px 10px;border:1px solid rgba(251,191,36,.2);background:rgba(251,191,36,.1);border-radius:8px;font-size:12px;line-height:1.7"></div><div style="font-size:12px;margin-top:4px;color:#91a1b8" id="hotwordExtraState">加载中…</div></div></div>
+      <div class="row two" style="align-items:flex-start"><label for="hotwordExtra" style="padding-top:9px">热词表 <span id="hotwordCount" class="badge" style="display:none;margin-left:6px"></span><div style="font-weight:400;font-size:12px;color:#91a1b8;line-height:1.6;margin-top:4px">此处显示<b>当前全部生效热词</b>（手动补充 + 简历/JD 提取 + 内置兜底），可直接编辑。<br>每行一个词，或用逗号 / 顿号分隔。<br>编辑并保存后，框内内容将作为「手动热词」固定生效（优先级最高）。</div></label><div><textarea id="hotwordExtra" style="min-height:150px" placeholder="Kubernetes, CI/CD, 微服务&#10;高并发、分布式锁、幂等"></textarea><div id="hotwordSources" style="display:none;margin-top:6px;padding:8px 10px;border:1px solid rgba(251,191,36,.2);background:rgba(251,191,36,.1);border-radius:8px;font-size:12px;line-height:1.7"></div><div style="font-size:12px;margin-top:4px;color:#91a1b8" id="hotwordExtraState">加载中…</div><div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap"><button id="hotwordClean" type="button">清理句子碎片</button><span id="hotwordCleanHint" style="font-size:12px;color:#91a1b8;align-self:center">删掉误存进来的整句残留（如「保证各步骤仅在安全联锁条」），只保留短术语</span></div></div></div>
       <label class="switch"><input id="liveTranslateEnabled" type="checkbox">启用英文 → 中文实时翻译（本地模型，不使用 DeepSeek）</label>
       <p class="hint">英文模式使用约 78 MB 的 Faster-Whisper 英文模型；每次 partial 再由本机 OPUS-MT 翻译，final 到达后稳定定稿。模型下载后可离线使用。原英文直接显示，中文结果标为“译文”。</p>
       <div style="display:flex;justify-content:flex-end"><button id="warmTranslation" type="button">下载并预热翻译模型</button></div>
@@ -286,6 +286,7 @@ function customPromptPayload(){
   return (text&&text!==def)?text:'';
 }
 $('aiCustomPrompt').addEventListener('input',()=>{customPromptDirty=true});
+$('hotwordClean').onclick=cleanHotwordFragments;
 $('aiCustomReset').onclick=()=>{
   $('aiCustomPrompt').value=defaultTemplateText();
   customPromptSaved='';customPromptDirty=false;
@@ -542,6 +543,26 @@ async function loadEffectiveHotwords(){
     }
     refreshHotwordState();
   }catch(e){}
+}
+// 清理误存成「手动热词」的句子碎片：中文只留 2-6 字的短术语，
+// 英文/数字术语原样保留。历史版本曾把展示用的词表整体回写，
+// 使简历长句被截断后的碎片固化成手动词，占满中文配额（40）。
+function cleanHotwordFragments(){
+  const zh=function(s){return /[\u4e00-\u9fa5]/.test(s)};
+  const parts=$('hotwordExtra').value.split(/[\r\n,，、]+/).map(function(s){return s.trim()}).filter(Boolean);
+  const kept=[],removed=[];
+  parts.forEach(function(w){
+    if(!zh(w)){kept.push(w);return}
+    // 与后端 _ZH_TERM_MAX_CHARS 一致：真术语都在 6 字内
+    (w.length>=2&&w.length<=6)?kept.push(w):removed.push(w);
+  });
+  const seen={},final=[];
+  kept.forEach(function(w){if(!seen[w]){seen[w]=1;final.push(w)}});
+  if(!removed.length){ showStatus('没有发现句子碎片，热词表无需清理'); return; }
+  $('hotwordExtra').value=final.join('\n');
+  hotwordEdited=true;
+  refreshHotwordState();
+  showStatus('已移除 '+removed.length+' 个句子碎片（如「'+removed[0].slice(0,10)+'」），点「保存并应用」生效');
 }
 $('hotwordExtra').addEventListener('input',function(){hotwordEdited=true;refreshHotwordState();});
 

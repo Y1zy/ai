@@ -889,6 +889,91 @@ namespace WasapiParaformerOverlay
         internal double Seconds;
     }
 
+    /// <summary>
+    /// 读取 knowledge.json（网页设置页维护的知识库）并拼成提示词片段。
+    ///
+    /// 背景：知识库此前只在 Python 侧拼接，而字幕 AI 的系统提示词由 C# 拼装，
+    /// 导致「存了话术但字幕 AI 从不引用」。这里按 C# 只读、Python 只写的方式接入：
+    /// C# 绝不改写该文件，避免与网页端互相覆盖。
+    /// </summary>
+    internal static class KnowledgeFeed
+    {
+        internal const int MaxEntryChars = 6000;
+
+        private static readonly object Sync = new object();
+        private static string cachedPath = "";
+        private static DateTime cachedWrite = DateTime.MinValue;
+        private static string cachedBlock = "";
+
+        internal static string KnowledgePath
+        {
+            get
+            {
+                string root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                return Path.Combine(root, "WasapiParaformerOverlay", "knowledge.json");
+            }
+        }
+
+        /// <summary>拼装启用的知识库条目；文件缺失/损坏/为空时返回空串（不影响 AI 请求）。</summary>
+        internal static string BuildContextBlock()
+        {
+            try
+            {
+                string path = KnowledgePath;
+                DateTime stamp;
+                try { stamp = File.GetLastWriteTimeUtc(path); }
+                catch { return ""; }
+                lock (Sync)
+                {
+                    if (path == cachedPath && stamp == cachedWrite) return cachedBlock;
+                    cachedPath = path;
+                    cachedWrite = stamp;
+                    cachedBlock = BuildFromDisk(path);
+                    return cachedBlock;
+                }
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static string BuildFromDisk(string path)
+        {
+            if (!File.Exists(path)) return "";
+            Dictionary<string, object> root;
+            try
+            {
+                root = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(
+                    File.ReadAllText(path, Encoding.UTF8));
+            }
+            catch { return ""; }
+            if (root == null) return "";
+            object rawEntries = root.ContainsKey("entries") ? root["entries"] : null;
+            IEnumerable items = rawEntries as IEnumerable;
+            if (items == null) return "";
+
+            List<string> sections = new List<string>();
+            foreach (object item in items)
+            {
+                Dictionary<string, object> entry = item as Dictionary<string, object>;
+                if (entry == null) continue;
+                // enabled 缺省视为启用（与 Python _normalize_entry 一致）
+                if (entry.ContainsKey("enabled") && !Convert.ToBoolean(entry["enabled"])) continue;
+                string content = entry.ContainsKey("content") ? Convert.ToString(entry["content"]) : "";
+                content = (content ?? "").Trim();
+                if (content.Length == 0) continue;
+                if (content.Length > MaxEntryChars) content = content.Substring(0, MaxEntryChars).TrimEnd() + "…";
+                string title = entry.ContainsKey("title") ? Convert.ToString(entry["title"]) : "";
+                title = (title ?? "").Trim();
+                if (title.Length == 0) title = "知识库";
+                sections.Add("[" + title + "]\n" + content);
+            }
+            if (sections.Count == 0) return "";
+            return string.Join("\n\n", sections);
+        }
+    }
+
     internal static class DeepSeekClient
     {
         private static readonly HttpClient SharedClient = CreateHttpClient();
@@ -917,9 +1002,15 @@ namespace WasapiParaformerOverlay
             if (!string.IsNullOrWhiteSpace(config.ExtraContext))
                 contextSections.Add("[Extra Context]\n" + config.ExtraContext.Trim());
 
-            string contextBlock = contextSections.Count > 0
-                ? string.Join("\n\n", contextSections) + "\n\n"
-                : "";
+            // 知识库（knowledge.json，由网页端维护）：启用的条目追加在四项之后。
+            // 此前只在 Python 侧拼接（设置页「回答测试」/手机追问生效），字幕 AI 是
+            // C# 拼的提示词，完全读不到知识库——用户存的话术/FAQ 永远不生效。
+            string knowledgeBlock = KnowledgeFeed.BuildContextBlock();
+            if (knowledgeBlock.Length > 0) contextSections.Add(knowledgeBlock.TrimEnd());
+
+            // 总长度上限与 Python settings.overlay_context_block 的 32000 对齐：
+            // 逐块累加，放不下的整块丢弃（不切碎单块，避免残留半句污染提示词）。
+            string contextBlock = JoinContextSections(contextSections, ContextTotalLimit);
 
             string persona;
             if (contextBlock.Length > 0)
@@ -965,6 +1056,33 @@ namespace WasapiParaformerOverlay
             if (!string.IsNullOrWhiteSpace(config.AiSystemPrompt))
                 prompt += "\n附加要求：" + config.AiSystemPrompt.Trim();
             return prompt;
+        }
+
+        /// <summary>
+        /// 面试上下文总长度上限，与 Python settings._CONTEXT_TOTAL_LIMIT 保持一致。
+        /// 此前只有 Python 侧截断（设置页「回答测试」/手机追问），字幕 AI 走 C# 拼接，
+        /// 往简历/JD 灌大量资料时请求会超模型上下文直接失败。
+        /// </summary>
+        internal const int ContextTotalLimit = 32000;
+
+        /// <summary>
+        /// 按顺序拼接上下文块，累计超过 limit 时丢弃放不下的整块（不切碎单块，
+        /// 避免留下半句话污染提示词）。与 Python overlay_context_block 的截断语义一致。
+        /// </summary>
+        internal static string JoinContextSections(List<string> sections, int limit)
+        {
+            if (sections == null || sections.Count == 0) return "";
+            List<string> kept = new List<string>();
+            int used = 0;
+            foreach (string section in sections)
+            {
+                if (string.IsNullOrEmpty(section)) continue;
+                if (used + section.Length > limit) break;
+                kept.Add(section);
+                used += section.Length;
+            }
+            if (kept.Count == 0) return "";
+            return string.Join("\n\n", kept) + "\n\n";
         }
 
         internal static async Task<string> CompleteAsync(

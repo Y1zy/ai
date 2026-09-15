@@ -66,14 +66,40 @@ _ZH_STOPWORDS: frozenset[str] = frozenset({
     "项目", "需求", "业务", "系统", "平台", "功能", "模块", "接口", "数据", "服务",
     "以及", "并且", "能够", "可以", "需要", "要求", "以下", "以上", "负责相关工作",
     "任职", "职责", "加分", "优先", "者优先", "年以上", "及其", "等等", "其他",
+    # 简历叙述性文字里的常用词：实测会被抽成热词，它们不是术语却占中文配额。
+    "描述", "面向", "通过", "机制", "主要", "读取", "覆盖", "包括", "采用", "进行",
+    "标准文件", "库解析", "值转换", "高效", "界面样式", "按钮使能", "多页面",
 })
+
+# 中文术语的长度上限：正常技术术语（高并发、分布式锁、多平面重建、连通域分析）
+# 都不超过 6 字；更长且不含英文/数字的整段汉字几乎都是被标点截断的句子残留
+# （如「保证各步骤仅在安全联锁条」）。用长度这一结构性判据，不靠枚举具体短语。
+_ZH_TERM_MAX_CHARS = 6
+
+# 悬空虚词结尾：整段汉字被标点/词边界截断时，末尾常残留这些连词/助词，
+# 说明它只是半句话而非术语（如「像素数据解码与」「体素坐标与」）。直接丢弃。
+_ZH_TRAILING_PARTICLES: tuple[str, ...] = (
+    "与", "及", "和", "等", "的", "地", "得", "为", "以", "对", "把", "被",
+    "在", "从", "或", "并", "而", "则", "使", "令", "于", "各", "通过",
+)
+
+# 悬空虚词开头：与结尾同理（如「与影像后处理」）。剥离后若过短会被长度检查丢弃。
+_ZH_LEADING_PARTICLES: tuple[str, ...] = (
+    "与", "及", "和", "等", "的", "为", "以", "对", "把", "被", "在", "从", "或", "并",
+)
 
 
 def _is_meaningful_zh(word: str) -> bool:
-    """过滤无意义中文词：停用词、纯数字、以及短于 2 字的片段。"""
+    """过滤无意义中文词：停用词、纯数字、以及短于 2 字的片段。
+
+    另外丢弃以连词/助词结尾的片段（「像素数据解码与」「体素坐标与」）：
+    这类词是整句被标点截断的残留，作为热词只会占配额。
+    """
     if len(word) < 2 or word in _ZH_STOPWORDS:
         return False
     if word.isdigit():
+        return False
+    if word.endswith(_ZH_TRAILING_PARTICLES):
         return False
     return True
 
@@ -107,17 +133,35 @@ def _strip_zh_affixes(word: str) -> str:
     return current
 
 
+def _strip_zh_particles(word: str) -> str:
+    """剥离首尾悬空虚词（「与」「及」「等」「的」…）。
+
+    这类残留说明整段汉字只是被标点截断的半句话——「像素数据解码与」去掉尾巴后
+    才是可能完整的词；若剥完不足 2 字，_is_meaningful_zh 会丢弃它。
+    """
+    current = word
+    while len(current) >= 2 and current.endswith(_ZH_TRAILING_PARTICLES):
+        current = current[:-1]
+    while len(current) >= 2 and current.startswith(_ZH_LEADING_PARTICLES):
+        current = current[1:]
+    return current
+
+
 def _extract_zh_hotwords(text: str) -> list[str]:
-    """从中文文本中提取候选术语：取整段连续汉字，剥离动词前后缀后再判长。
+    """从中文文本中提取候选术语：取整段连续汉字，剥离动词前后缀与悬空虚词。
 
     先剥离前后缀再判长度，而不是先按固定窗口切断：完整串才能正确剥离
     （「负责高并发系统优化」→「高并发」），切断后反而既丢语义又产生碎片。
-    剥离后仍超过 _MAX_ZH_HOTWORD_CHARS 的视为整句，直接丢弃（不切碎）。
+
+    长度上限 _ZH_TERM_MAX_CHARS（6 字）：真实中文技术术语（高并发、分布式锁、
+    多平面重建、连通域分析）都在此范围内；更长的整段汉字几乎都是模板句被标点
+    截断的残留（「保证各步骤仅在安全联锁条」），一律丢弃——宁可漏收，
+    也不把半句话塞进热词表占配额、污染识别。
     """
     results: list[str] = []
     for run in _ZH_HOTWORD_RE.findall(text):
-        stripped = _strip_zh_affixes(run)
-        if len(stripped) > _MAX_ZH_HOTWORD_CHARS:
+        stripped = _strip_zh_particles(_strip_zh_affixes(run))
+        if len(stripped) > _ZH_TERM_MAX_CHARS:
             continue
         if _is_meaningful_zh(stripped):
             results.append(stripped)

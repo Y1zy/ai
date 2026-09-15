@@ -84,3 +84,65 @@ def test_max_token_levels_match_between_csharp_and_python() -> None:
     assert csharp_default == DEFAULT_MAX_TOKENS, (
         f"默认档不一致: C#={csharp_default} Python={DEFAULT_MAX_TOKENS}"
     )
+
+
+# ---------------------------------------------------------------- 知识库接入
+# 知识库此前只在 Python 侧拼装（设置页「回答测试」/手机追问生效），而字幕 AI 的
+# 提示词由 C# 的 PromptForMode 拼装 —— 用户存的话术/FAQ 在字幕 AI 里永远不生效。
+# 以下用例锁定「C# 必须读 knowledge.json」这一契约。
+
+
+def test_csharp_prompt_includes_knowledge_feed() -> None:
+    """PromptForMode 必须把知识库拼进上下文，否则该功能对字幕 AI 无效。"""
+    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    assert "KnowledgeFeed.BuildContextBlock()" in text, (
+        "PromptForMode 未接入知识库：知识库内容到不了字幕 AI"
+    )
+
+
+def test_csharp_knowledge_feed_is_readonly() -> None:
+    """C# 只能读 knowledge.json，绝不能写 —— 否则与网页端互相覆盖。"""
+    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    start = text.index("internal static class KnowledgeFeed")
+    block = text[start:start + 4000]
+    for writer in ("File.WriteAllText", "File.Replace", "File.Move", "File.Delete"):
+        assert writer not in block, f"KnowledgeFeed 不应包含写操作: {writer}"
+
+
+def test_csharp_knowledge_feed_matches_python_rules() -> None:
+    """两端对知识库条目的读取规则必须一致（正文上限、启用开关）。"""
+    from system_audio_asr.knowledge import MAX_CONTEXT_ENTRY_CHARS
+
+    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    start = text.index("internal static class KnowledgeFeed")
+    block = text[start:start + 4000]
+
+    entry_limit = re.search(r"MaxEntryChars\s*=\s*(\d+)", block)
+    assert entry_limit, "未找到 C# 知识库条目长度上限"
+    assert int(entry_limit.group(1)) == MAX_CONTEXT_ENTRY_CHARS, (
+        f"条目长度上限不一致: C#={entry_limit.group(1)} Python={MAX_CONTEXT_ENTRY_CHARS}"
+    )
+    # 启用开关：必须检查 enabled 字段，否则停用的条目也会被送入模型
+    assert '"enabled"' in block, "C# 未检查 enabled 字段，停用的条目也会被送入模型"
+
+
+def test_context_total_limit_matches_python() -> None:
+    """上下文总长上限两端一致，避免 C# 侧无截断导致超长请求失败。"""
+    from system_audio_asr.settings import _CONTEXT_TOTAL_LIMIT
+
+    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    match = re.search(r"ContextTotalLimit\s*=\s*(\d+)", text)
+    assert match, "C# 未定义 ContextTotalLimit"
+    assert int(match.group(1)) == _CONTEXT_TOTAL_LIMIT, (
+        f"总长上限不一致: C#={match.group(1)} Python={_CONTEXT_TOTAL_LIMIT}"
+    )
+
+
+def test_csharp_truncates_oversized_context() -> None:
+    """上下文拼接必须走截断函数，而不是无条件全量拼接。"""
+    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    start = text.index("internal static string PromptForMode")
+    block = text[start:start + 3000]
+    assert "JoinContextSections" in block, (
+        "PromptForMode 未使用 JoinContextSections：长简历会撑爆模型上下文"
+    )

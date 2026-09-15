@@ -223,22 +223,67 @@ def test_every_candidate_is_either_kept_or_reported_dropped() -> None:
     assert len(dropped) == len(candidates) - _MAX_HOTWORDS
 
 
+# ---------------------------------------------------------------- 碎片过滤
+# 历史版本曾把设置页展示用的「全部生效热词」整体回写，使简历长句被标点截断后的
+# 碎片固化成手动词（「保证各步骤仅在安全联锁条」「像素数据解码与」），
+# 它们占满中文配额（40）把真术语挤出去。以下用例锁定过滤规则。
+
+
+def test_zh_fragment_with_dangling_particle_is_rejected() -> None:
+    """以连词/助词结尾的片段是整句被标点截断的残留，不能当热词。"""
+    from system_audio_asr.recognizer import _is_meaningful_zh
+
+    for fragment in ("像素数据解码与", "体素坐标与", "实时读取的", "切片导航及"):
+        assert not _is_meaningful_zh(fragment), f"碎片未被过滤: {fragment}"
+
+
+def test_zh_long_sentence_residue_is_dropped() -> None:
+    """超过 6 字的整段汉字视为句子残留，直接丢弃（不切碎）。"""
+    from system_audio_asr.recognizer import _extract_zh_hotwords
+
+    result = _extract_zh_hotwords("保证各步骤仅在安全联锁条模式下按序执行完毕")
+    for term in result:
+        assert len(term) <= 6, f"超长碎片未被拦截: {term!r}"
+
+
+def test_zh_real_terms_survive_fragment_filter() -> None:
+    """过滤规则不能误伤真术语（这是配额能否落到实处的关键）。"""
+    from system_audio_asr.recognizer import _extract_zh_hotwords
+
+    for term in ("多平面重建", "连通域分析", "窗宽窗位", "橡皮擦", "智能指针", "观察者模式"):
+        assert _extract_zh_hotwords(term) == [term], f"真术语被误杀: {term}"
+
+
+def test_narrative_common_words_are_stopwords() -> None:
+    """简历叙述性常用词（描述/面向/通过…）不应进热词表。"""
+    from system_audio_asr.recognizer import _is_meaningful_zh
+
+    for word in ("描述", "面向", "通过", "机制", "主要", "读取"):
+        assert not _is_meaningful_zh(word), f"叙述词未被过滤: {word}"
+
+
 # ---------------------------------------------------------------- 长串与标点
 
 
 def test_long_chinese_run_is_not_sliced() -> None:
-    """整段连续汉字应先剥离前后缀再判长，不能按固定窗口切碎。
+    """整段连续汉字不能被切成碎片混进热词表。
 
     早期用 {2,12} 定长窗口，会把「熟练掌握高并发分布式系统设计与优化能力」
-    从中间切断，产生碎片混进热词表。
+    从中间切断，产生「高并发分布式系统设计」这类 7-12 字碎片：它们不是术语，
+    却占满中文配额（40），把真术语挤出去。
+
+    现策略（_ZH_TERM_MAX_CHARS=6）：剥离前后缀与悬空虚词后仍超过 6 字的整段
+    直接丢弃——宁可漏收也不塞碎片。中文真术语（高并发 / 分布式锁 / 多平面重建 /
+    连通域分析）都在 6 字内。
     """
     from system_audio_asr.recognizer import _extract_zh_hotwords
 
     result = _extract_zh_hotwords("熟练掌握高并发分布式系统设计与优化能力")
-    assert result, "整段串不应被丢弃"
     for term in result:
+        assert len(term) <= 6, f"出现超长碎片: {term!r}"
         assert not term.startswith("描述"), f"出现切片碎片: {term!r}"
-        assert len(term) <= 12, f"超长碎片: {term!r}"
+    # 剥离逻辑本身不能被削弱：能落回术语长度的照常收
+    assert _extract_zh_hotwords("负责高并发系统优化") == ["高并发"]
 
 
 def test_overlong_chinese_run_is_dropped_not_sliced() -> None:
