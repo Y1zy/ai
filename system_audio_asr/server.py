@@ -217,6 +217,29 @@ def create_app(config: AppConfig) -> FastAPI:
     hub.listeners.append(session_recorder.on_event)
     records_root = APP_DIR / "records"
 
+    def phone_debug_snapshot() -> dict:
+        """手机诊断面板的数据源（白名单，见 PhoneRelay._debug_payload 的边界说明）。
+
+        只暴露排障需要的事实：识别引擎状态/语言、服务端最近错误、AI 与视觉模型
+        是否就绪、WS 队列积压。刻意不含任何凭据、baseUrl 或用户资料。
+        """
+        status = hub.latest_status or {}
+        error = hub.latest_error or {}
+        return {
+            "asrState": str(status.get("state") or "unknown"),
+            "asrLanguage": engine.config.language,
+            "lastError": str(error.get("message") or "")[:200],
+            "lastErrorAt": str(error.get("timestamp") or ""),
+            "wsQueue": int(hub.queue.qsize()) if hub.queue is not None else -1,
+            "wsClients": len(hub.clients),
+            "aiKeySet": bool(load_api_key()),
+            "visionKeySet": bool(phone_share.load_vision_key()),
+            "recordFinals": session_recorder.stats().get("finals", 0),
+            "recordSolves": session_recorder.stats().get("solves", 0),
+        }
+
+    phone_relay.debug_snapshot_provider = phone_debug_snapshot
+
     async def restart_engine(language: str) -> None:
         nonlocal engine, runtime_config
         async with engine_restart_lock:
@@ -246,11 +269,20 @@ def create_app(config: AppConfig) -> FastAPI:
         clipboard_watcher.start()
         dispatcher = asyncio.create_task(hub.dispatch())
         engine.start()
+
+        async def debug_ticker() -> None:
+            """手机诊断面板订阅期间，每 2 秒下发一次快照（未订阅时是空操作）。"""
+            while True:
+                await asyncio.sleep(2)
+                await asyncio.to_thread(phone_relay._push_debug_if_subscribed)
+
+        debug_task = asyncio.create_task(debug_ticker())
         try:
             yield
         finally:
             engine.stop()
             clipboard_watcher.stop()
+            debug_task.cancel()
             dispatcher.cancel()
             try:
                 await dispatcher

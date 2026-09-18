@@ -12,10 +12,29 @@ from datetime import datetime
 from pathlib import Path
 
 MAX_ENTRIES = 3000
-MAX_IMAGES = 50
+# 题图环形缓冲的默认张数（实际值由配置 recordImageCap 决定，见 image_cap()）。
+# 单张实测约 137 KB（1600px / 质量 75，见 phone_share.MAX_IMAGE_WIDTH/JPEG_QUALITY），
+# 200 张约 27 MB，对面试机的内存占用可接受；早期硬编码 50 张在一场长面试里
+# （尤其算法题连续截图）会明显不够。
+MAX_IMAGES = 200
 # 未封口的流式条目（ai_open / solve_open）超过这个时长就视为已失效，
 # 不再接收新快照：否则被取消的请求会把后续无关内容吸附进同一条。
 OPEN_ENTRY_TTL_SECONDS = 300
+
+
+def image_cap() -> int:
+    """当前生效的题图保留张数上限。
+
+    读配置而不是用模块常量：用户可以在设置页调（100/200/300/500）。
+    读配置失败时回退默认值——记录功能绝不能因为配置坏掉而不可用。
+    """
+    try:
+        from .settings import load_settings
+
+        value = int(load_settings().get("recordImageCap") or MAX_IMAGES)
+    except Exception:
+        return MAX_IMAGES
+    return max(1, value)
 
 
 class SessionRecorder:
@@ -23,7 +42,9 @@ class SessionRecorder:
         self._lock = threading.Lock()
         # 条目 kind：final（字幕定稿）/ ai_open→ai（流式期间为 open）/ solve_open→solve
         self._entries: list[dict] = []
-        self._images: list[dict] = []  # {ts, name, data}
+        self._images: list[dict] = []  # {ts, name, data, batch}
+        # 题图批次号：一次解题（可能多张）共用一个，落盘时据此归组。
+        self._image_batch = 0
 
     # ------------------------------------------------------------------ 捕获
     def on_event(self, event: dict) -> None:
@@ -55,17 +76,33 @@ class SessionRecorder:
             self._trim_locked()
 
     def add_solve_image(self, jpeg: bytes) -> None:
-        """截图解题触发时存题图（内存，环形上限）。"""
-        if not jpeg:
+        """单张题图（桌面热键路径）：自成一批。"""
+        self.add_solve_images([jpeg])
+
+    def add_solve_images(self, images: list[bytes]) -> None:
+        """一次解题提交的多张题图：共用同一个批次号。
+
+        批次号是落盘时把「多张图归到同一条解题记录」的依据。不能只靠时间窗：
+        两次解题挨得近时（用户连点两题），后一题的图也落在前一题的时间窗内，
+        会被错配到前一题。
+        """
+        payload = [image for image in images if image]
+        if not payload:
             return
+        cap = image_cap()
         with self._lock:
-            stamp = datetime.now().strftime("%H%M%S")
-            name, n = f"{stamp}.jpg", 1
-            while any(img["name"] == name for img in self._images):
-                name = f"{stamp}_{n}.jpg"
-                n += 1
-            self._images.append({"ts": time.time(), "name": name, "data": jpeg})
-            while len(self._images) > MAX_IMAGES:
+            self._image_batch += 1
+            batch = self._image_batch
+            for jpeg in payload:
+                stamp = datetime.now().strftime("%H%M%S")
+                name, n = f"{stamp}.jpg", 1
+                while any(img["name"] == name for img in self._images):
+                    name = f"{stamp}_{n}.jpg"
+                    n += 1
+                self._images.append(
+                    {"ts": time.time(), "name": name, "data": jpeg, "batch": batch}
+                )
+            while len(self._images) > cap:
                 self._images.pop(0)
 
     # ------------------------------------------------------------------ 状态
@@ -118,48 +155,82 @@ class SessionRecorder:
             block["kind"] = _base_kind(block["kind"])
 
         used_images: set[str] = set()
-        lines = [
+        solve_total = sum(1 for b in blocks if b["kind"] == "solve")
+        solve_with_image = 0
+        body: list[str] = []
+        for block in blocks:
+            clock = datetime.fromtimestamp(block["ts"]).strftime("%H:%M:%S")
+            if block["kind"] == "final":
+                body.append(f"**{clock}**")
+                body.append("")
+                body.append(block["text"])
+            elif block["kind"] == "ai":
+                body.append(f"**{clock} · AI 回答**")
+                body.append("")
+                body.append(block["text"])
+            else:
+                body.append(f"**{clock} · 截图解题**")
+                body.append("")
+                matched = self._match_images(block["ts"], images, used_images)
+                if matched:
+                    solve_with_image += 1
+                    for name in matched:
+                        body.append(f"![题目](images/{name})")
+                    body.append("")
+                body.append(block["text"])
+            body.append("")
+
+        header = [
             f"# VoxRibbon 面试记录 · {datetime.now().strftime('%Y-%m-%d')}",
             "",
             f"> 保存时间 {datetime.now().strftime('%H:%M:%S')} · "
             f"字幕 {sum(1 for b in blocks if b['kind'] == 'final')} 段 · "
             f"AI 回答 {sum(1 for b in blocks if b['kind'] == 'ai')} 条 · "
-            f"截图解题 {sum(1 for b in blocks if b['kind'] == 'solve')} 次",
-            "",
-            "## 时间线",
+            f"截图解题 {solve_total} 次",
             "",
         ]
-        for block in blocks:
-            clock = datetime.fromtimestamp(block["ts"]).strftime("%H:%M:%S")
-            if block["kind"] == "final":
-                lines.append(f"**{clock}**")
-                lines.append("")
-                lines.append(block["text"])
-            elif block["kind"] == "ai":
-                lines.append(f"**{clock} · AI 回答**")
-                lines.append("")
-                lines.append(block["text"])
-            else:
-                lines.append(f"**{clock} · 截图解题**")
-                lines.append("")
-                image = self._match_image(block["ts"], images, used_images)
-                if image is not None:
-                    lines.append(f"![题目](images/{image})")
-                    lines.append("")
-                lines.append(block["text"])
-            lines.append("")
+        # 题图配不上时（超出环形缓冲上限、或时间窗内没有对应截图）明写出来：
+        # 否则用户保存后只看到某条解题没图，不知道是被上限挤掉的。
+        missing = solve_total - solve_with_image
+        if missing > 0:
+            header.append(
+                f"> ⚠ 本次有 {missing} 次解题未附带题图"
+                f"（题图仅保留最近 {image_cap()} 张，更早的已滚出缓冲；"
+                "可在设置页调大「题图保留张数」）"
+            )
+            header.append("")
+        lines = header + ["## 时间线", ""] + body
         return "\n".join(lines).rstrip() + "\n"
 
     @staticmethod
-    def _match_image(ts: float, images: list[dict], used: set[str]) -> str | None:
+    def _match_images(ts: float, images: list[dict], used: set[str]) -> list[str]:
+        """取出一条解题记录对应的题图（可能多张，按批次归组）。
+
+        先找时间窗内最早那张未用过的图，再把它所属批次的图整批取走——
+        多图一题时几张图属于同一次解题，必须一起落地，不能只放一张。
+        批次缺失（旧数据/单张路径）时退化为只取这一张。
+        """
+        head: dict | None = None
         for image in images:
             if image["name"] in used:
                 continue
             if image["ts"] <= ts + 10:
-                used.add(image["name"])
-                return image["name"]
+                head = image
             break
-        return None
+        if head is None:
+            return []
+
+        batch = head.get("batch")
+        if batch is None:
+            used.add(head["name"])
+            return [head["name"]]
+        matched: list[str] = []
+        for image in images:
+            if image.get("batch") != batch or image["name"] in used:
+                continue
+            used.add(image["name"])
+            matched.append(image["name"])
+        return matched
 
     # ------------------------------------------------------------------ 内部
     def _add(self, kind: str, text: str) -> None:

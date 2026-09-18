@@ -193,7 +193,7 @@ def test_apply_thinking_mode_auto_sends_nothing() -> None:
     payload: dict = {"model": "m"}
     ai_stream.apply_thinking_mode(payload, "auto")
     assert "thinking" not in payload
-    assert "reasoning_effort" not in payload, "不得使用 reasoning_effort：实测会让正文返回空"
+    assert "reasoning_effort" not in payload, "auto 档不得主动要求推理"
 
 
 @pytest.mark.parametrize("value", ["forced", "", None, "AUTO", "unknown"])
@@ -204,6 +204,64 @@ def test_normalize_thinking_mode_falls_back_to_auto(value) -> None:
 def test_normalize_thinking_mode_accepts_off() -> None:
     assert ai_stream.normalize_thinking_mode("off") == "off"
     assert ai_stream.normalize_thinking_mode("OFF") == "off"
+
+
+# ---------------------------------------------------------------- 推理档（medium/high）
+# 2026-09-17 实测（本地网关，deepseek-v4.1-flash，明细见 .runtime/thinking_probe*.json）：
+#   reasoning_effort 的 graded 值确实生效（返回 reasoning_content），
+#   但推理 token 计入 max_tokens —— 额度不足时正文会是 0 字。
+#   实测 high 在 2048/4096 下正文均为空，8192 才有正文。
+# 因此 apply_thinking_mode 必须同时抬高额度，否则用户一切档就得到空回答。
+
+
+def test_reasoning_modes_send_effort() -> None:
+    payload: dict = {"model": "m", "max_tokens": 2048}
+    ai_stream.apply_thinking_mode(payload, "medium")
+    assert payload["reasoning_effort"] == "medium"
+    payload = {"model": "m", "max_tokens": 2048}
+    ai_stream.apply_thinking_mode(payload, "high")
+    assert payload["reasoning_effort"] == "high"
+
+
+def test_reasoning_modes_raise_token_budget() -> None:
+    """推理会吃光额度导致正文为空，故必须抬到 THINKING_MIN_TOKENS 以上。"""
+    for mode in ("medium", "high"):
+        payload: dict = {"model": "m", "max_tokens": 2048}
+        ai_stream.apply_thinking_mode(payload, mode)
+        assert payload["max_tokens"] >= ai_stream.THINKING_MIN_TOKENS, (
+            f"{mode} 档未抬高 token 额度：推理会吃光额度、正文返回空"
+        )
+        # 已经够大时不往下调（用户主动设了更大额度）
+        payload = {"model": "m", "max_tokens": 99999}
+        ai_stream.apply_thinking_mode(payload, mode)
+        assert payload["max_tokens"] == 99999
+        # 缺失/非法 max_tokens 也要兜住
+        payload = {"model": "m", "max_tokens": None}
+        ai_stream.apply_thinking_mode(payload, mode)
+        assert payload["max_tokens"] >= ai_stream.THINKING_MIN_TOKENS
+
+
+def test_off_and_auto_do_not_touch_token_budget() -> None:
+    """只有推理档才抬额度：off/auto 不该改动用户设置的回答长度。"""
+    for mode in ("off", "auto"):
+        payload: dict = {"model": "m", "max_tokens": 2048}
+        ai_stream.apply_thinking_mode(payload, mode)
+        assert payload["max_tokens"] == 2048
+
+
+def test_is_reasoning_mode() -> None:
+    assert ai_stream.is_reasoning_mode("medium") is True
+    assert ai_stream.is_reasoning_mode("high") is True
+    assert ai_stream.is_reasoning_mode("auto") is False
+    assert ai_stream.is_reasoning_mode("off") is False
+    assert ai_stream.is_reasoning_mode("") is False
+
+
+def test_realtime_modes_exclude_reasoning_tiers() -> None:
+    """字幕 AI 不提供推理档：实测 20-35 秒，实时字幕场景不可用。"""
+    assert ai_stream.THINKING_MODES_REALTIME == ("off", "auto")
+    for slow in ("medium", "high"):
+        assert slow not in ai_stream.THINKING_MODES_REALTIME
 
 
 def test_thinking_mode_is_sent_in_stream_payload(monkeypatch) -> None:

@@ -246,6 +246,42 @@ def test_zh_long_sentence_residue_is_dropped() -> None:
         assert len(term) <= 6, f"超长碎片未被拦截: {term!r}"
 
 
+def test_multi_char_particle_strips_whole_not_partial() -> None:
+    """多字粒子要整体剥离，不能只砍末字留碎渣。
+
+    粒子表含 2 字项「通过」，早期实现固定 `current[:-1]` 只删 1 字符，
+    把「服务间通过」变成「服务间通」——那是个既不完整也不是术语的碎渣。
+    """
+    from system_audio_asr.recognizer import _strip_zh_particles
+
+    assert _strip_zh_particles("服务间通过") == "服务间"
+    assert _strip_zh_particles("登录时通过") == "登录时"
+    assert _strip_zh_particles("逻辑层通过") == "逻辑层"
+
+
+def test_real_terms_ending_in_common_verbs_are_kept() -> None:
+    """以实义动词结尾的真术语不能被当残渣砍掉。
+
+    「提供/实现/处理/支持/使用」在术语里是合法结尾（服务提供、功能实现、
+    图像处理、技术支持），与句子残渣（「对外提供」）字面无法区分。
+    粒子表只该收虚词/连词，收实义动词会把真术语砍短。
+    """
+    from system_audio_asr.recognizer import _strip_zh_particles
+
+    for term in ("服务提供", "功能实现", "图像处理", "批处理", "技术支持", "内存使用"):
+        assert _strip_zh_particles(term) == term, f"真术语被误砍: {term}"
+
+
+def test_leading_particle_does_not_eat_term_first_char() -> None:
+    """前缀粒子只收纯连词：「对」是术语首字（对外接口），不能当前缀剥掉。
+
+    早期把「对」列入前缀粒子，导致「对外提供」→「外提供」（残渣）。
+    """
+    from system_audio_asr.recognizer import _strip_zh_particles
+
+    assert _strip_zh_particles("对外提供").startswith("对外"), "术语首字被剥掉"
+
+
 def test_zh_real_terms_survive_fragment_filter() -> None:
     """过滤规则不能误伤真术语（这是配额能否落到实处的关键）。"""
     from system_audio_asr.recognizer import _extract_zh_hotwords

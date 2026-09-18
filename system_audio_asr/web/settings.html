@@ -69,6 +69,8 @@
       <p class="hint">老板键：<strong>Ctrl+Alt+H</strong>。若被其他软件占用，自动回退为 <strong>Ctrl+Shift+H</strong>；按一次隐藏，再按一次恢复。</p>
     </section>
 
+    <section class="card wide" id="missingKeysWarn" style="display:none;border-color:rgba(251,191,36,.45);background:rgba(251,191,36,.08);color:#fcd34d;font-size:13px;line-height:1.7"></section>
+
     <section class="card">
       <h2>效果预览</h2>
       <div class="preview"><div id="previewText">桌面实时字幕预览<br>最后一句会一直保留</div></div>
@@ -135,6 +137,10 @@
       OpenAI：<code>https://api.openai.com/v1</code>（模型如 <code>gpt-4o-mini</code>）</p>
       <div class="row two"><label for="visionBaseUrl">BaseURL（含 /v1）</label><input id="visionBaseUrl" type="text" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"></div>
       <div class="row two"><label for="visionModel">模型名</label><input id="visionModel" type="text" placeholder="qwen-vl-plus"></div>
+      <div class="row two"><label for="visionThinkingMode">解题思考</label><div><select id="visionThinkingMode"><option value="">跟随字幕 AI</option><option value="off">关闭思考 — 首字快</option><option value="auto">自动 — 不干预，由模型决定</option><option value="medium">中度思考 — 显式推理（实测约 23 秒）</option><option value="high">深度思考 — 最强推理（实测约 33 秒）</option></select><div style="font-size:12px;margin-top:4px;color:#91a1b8">截图解题是独立链路（算法题/笔试题用），思考模式可单独设置，不影响字幕 AI。算法题若被算错可试「中度/深度」——它们会让模型先完整推理（实测深度档推理上万 token、约 33 秒才有正文），只建议难题或笔试离线场景用；两者会自动把解题 token 额度抬到 8192，否则推理会吃光额度导致正文为空。</div></div></div>
+      <div class="row two"><label for="visionAnswerMode">作答模式</label><div><select id="visionAnswerMode"><option value="core_code">核心代码 — 只给关键实现（默认）</option><option value="acm">ACM — 完整可编译程序（含 main/输入输出）</option></select><div style="font-size:12px;margin-top:4px;color:#91a1b8">只影响内置提示词：<b>核心代码</b>给关键实现与复杂度；<b>ACM</b> 给可直接提交的完整程序（默认 C++，题目指定其他语言则遵循题目）。自己填了「解题提示词」时以你的为准，此项不生效。</div></div></div>
+      <div class="row two"><label for="visionMaxTokens">解题长度</label><div><select id="visionMaxTokens"><option value="256">极简 — 约 256</option><option value="512">简洁 — 约 512</option><option value="1024">适中 — 约 1024</option><option value="2048">完整 — 约 2048（默认）</option><option value="4096">长 — 约 4096</option><option value="8192">超长 — 约 8192</option></select><div style="font-size:12px;margin-top:4px;color:#91a1b8">解题回答的长度上限，独立于字幕 AI 的「回答长度」。算法题核心代码较长时调大，避免代码被截断抄不全。</div></div></div>
+      <div class="row two"><label for="visionMaxImages">单题截图张数</label><div><select id="visionMaxImages"><option value="1">1 张 — 单屏题目</option><option value="2">2 张</option><option value="3">3 张 — 默认</option><option value="4">4 张</option><option value="5">5 张 — 最多</option></select><div style="font-size:12px;margin-top:4px;color:#91a1b8">一次解题最多挂几张截图。题干、约束、样例分散在多屏时，手机端点「➕ 加一图」把各部分截进来，再点「截题+回答」一次提交（同一道题按顺序合并理解）。每张约 183 KB 且全部计入模型输入，张数越多首字越慢，够用即可。</div></div></div>
       <div class="row two"><label for="visionApiKey">API Key</label><div><div style="display:flex;gap:8px"><input id="visionApiKey" type="password" autocomplete="off" placeholder="留空表示不修改已保存的 Key"><button id="clearVisionKey" class="danger" type="button">清除</button></div><div id="visionKeyState" style="font-size:12px;margin-top:4px;color:#91a1b8">检查中…</div></div></div>
       <div class="row two"><label for="solvePrompt">解题提示词</label><div><textarea id="solvePrompt" placeholder="留空使用内置默认：识别图中题目并给出简洁答案与关键步骤。可自定义，例如：只输出选择题答案字母；用英文回答。"></textarea><div style="font-size:12px;margin-top:4px;color:#91a1b8" id="solvePromptState">当前为空 = 使用系统内置默认解题提示词</div></div></div>
       <label class="switch"><input id="allowLocalEndpoints" type="checkbox">允许本机/内网接口地址（自建模型：Ollama、LM Studio、vLLM 等）</label>
@@ -160,6 +166,7 @@
     <section class="card wide">
       <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><h2>🗂 面试记录</h2><span id="recordsBadge" class="badge">—</span></div>
       <p class="hint">字幕、AI 回答、截图解题（含题图）只暂存在内存，不影响识别性能；点「保存到本地」才写入 <code>%LOCALAPPDATA%\WasapiParaformerOverlay\records\</code>，每场一个文件夹（transcript.md 时间线 + images 题图）。服务重启后内存记录清空，面试完记得保存。</p>
+      <div class="row two"><label for="recordImageCap">题图保留张数</label><div><select id="recordImageCap"><option value="100">100 张 — 约 14 MB</option><option value="200">200 张 — 约 27 MB（默认）</option><option value="300">300 张 — 约 41 MB</option><option value="500">500 张 — 约 68 MB</option></select><div style="font-size:12px;margin-top:4px;color:#91a1b8">内存里最多保留多少张题图（单张约 137 KB）。一场长面试连续截算法题时调大，避免早期的题图被挤掉、保存的记录里对应解题没有图（记录顶部会注明有几次未附带题图）。</div></div></div>
       <p class="hint" id="sessionWarn" style="display:none;color:#fbbf24"></p>
       <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">
         <button id="sessionNew" type="button" class="primary">🆕 开始新一场</button>
@@ -194,7 +201,7 @@
   <div class="actions"><span id="status">正在加载设置…</span><button id="save" class="primary" type="button">保存并应用</button></div>
 </main>
 <script>
-const ids=['fontSize','opacity','fontFamily','textColor','frameMode','frameColor','frameOpacity','screenName','locked','asrLanguage','hotwordEnabled','liveTranslateEnabled','aiEnabled','aiBaseUrl','aiModel','aiMode','aiThinkingMode','aiMaxTokens','aiSilenceSeconds','resumeContext','jdContext','targetCompany','extraContext'];
+const ids=['fontSize','opacity','fontFamily','textColor','frameMode','frameColor','frameOpacity','screenName','locked','asrLanguage','hotwordEnabled','liveTranslateEnabled','aiEnabled','aiBaseUrl','aiModel','aiMode','aiThinkingMode','aiMaxTokens','aiSilenceSeconds','resumeContext','jdContext','targetCompany','extraContext','recordImageCap'];
 const $=id=>document.getElementById(id); let loaded=null, clearRequested=false;
 function stripMarkdown(t){
   if(!t) return t||"";
@@ -212,7 +219,11 @@ function updatePreview(){
 }
 async function load(){
   try{const data=await fetch('/api/settings').then(r=>{if(!r.ok)throw Error(r.status);return r.json()}); loaded=data.settings;
-    for(const id of ids){const el=$(id),v=loaded[id]; if(el.type==='checkbox')el.checked=Boolean(v); else if(id==='opacity'||id==='frameOpacity')el.value=Math.round(Number(v)*100); else if(v!==undefined)el.value=v}
+    // 服务端没返回的键之前是「静默留空」：输入框空白、页面无任何提示，用户会以为
+    // 资料丢了（简历就这么被误判过）。现在先收集缺键，加载完统一给出可见告警。
+    const missing=[];
+    for(const id of ids){const el=$(id); if(!el)continue; const v=loaded[id]; if(el.type==='checkbox')el.checked=Boolean(v); else if(id==='opacity'||id==='frameOpacity')el.value=Math.round(Number(v)*100); else if(v!==undefined)el.value=v; else {el.value=''; missing.push(id);}}
+    renderMissingKeys(missing);
     $('screenName').innerHTML=''; const monitors=data.monitors.length?data.monitors:[loaded.screenName||'默认显示器']; for(const name of monitors){const o=document.createElement('option');o.value=name;o.textContent=name;$('screenName').append(o)} $('screenName').value=loaded.screenName||monitors[0];
     $('keyBadge').textContent=data.apiKeySet?'API Key 已加密保存':'尚未设置 API Key'; $('keyBadge').className='badge '+(data.apiKeySet?'ok':''); $('keyState').dataset.saved=data.apiKeySet?'1':'0'; refreshMainKeyState(); refreshHotwordState(); refreshResumeBadge();
     legacyOverride=String(loaded.aiOverridePrompt||'').trim();
@@ -223,8 +234,21 @@ async function load(){
     $('allowLocalEndpoints').checked=Boolean(data.allowLocalEndpoints);
   }catch(e){showStatus('加载失败：'+e.message,true)}
 }
+// 配置键缺失（服务端未返回）时的可见告警：静默空白会让用户以为资料被清空。
+// 这些键不属于长期资料，缺失不影响使用，所以只在真正缺关键资料字段时提示。
+const LONG_TERM_KEYS=['resumeContext','jdContext','targetCompany','extraContext','aiSystemPrompt','aiOverridePrompt','aiBuiltInPrompt','hotwordExtra'];
+function renderMissingKeys(missing){
+  const box=$('missingKeysWarn');
+  if(!box)return;
+  const important=(missing||[]).filter(function(k){return LONG_TERM_KEYS.indexOf(k)>=0});
+  if(!missing||!missing.length){box.style.display='none';box.textContent='';return}
+  box.style.display='block';
+  box.textContent=important.length
+    ? '⚠ 配置里缺少这些字段：'+missing.join('、')+'。其中长期资料（'+important.join('、')+'）已显示为空，请先到 %LOCALAPPDATA%\\WasapiParaformerOverlay\\ 查看 config.json 是否还有内容，确认后重新填写，避免被这次的空值覆盖。'
+    : '⚠ 配置里缺少这些字段：'+missing.join('、')+'（已按默认值显示）。';
+}
 function collect(){
-  const payload={fontSize:Number($('fontSize').value),opacity:Number($('opacity').value)/100,fontFamily:$('fontFamily').value,textColor:$('textColor').value,frameMode:$('frameMode').value,frameColor:$('frameColor').value,frameOpacity:Number($('frameOpacity').value)/100,screenName:$('screenName').value,locked:$('locked').checked,asrLanguage:$('asrLanguage').value,hotwordEnabled:$('hotwordEnabled').checked,liveTranslateEnabled:$('liveTranslateEnabled').checked,aiEnabled:$('aiEnabled').checked,aiBaseUrl:$('aiBaseUrl').value.trim(),aiModel:$('aiModel').value.trim(),aiMode:$('aiMode').value,aiThinkingMode:$('aiThinkingMode').value,aiMaxTokens:Number($('aiMaxTokens').value),aiSilenceSeconds:Number($('aiSilenceSeconds').value),resumeContext:$('resumeContext').value,jdContext:$('jdContext').value,targetCompany:$('targetCompany').value.trim(),extraContext:$('extraContext').value};
+  const payload={fontSize:Number($('fontSize').value),opacity:Number($('opacity').value)/100,fontFamily:$('fontFamily').value,textColor:$('textColor').value,frameMode:$('frameMode').value,frameColor:$('frameColor').value,frameOpacity:Number($('frameOpacity').value)/100,screenName:$('screenName').value,locked:$('locked').checked,asrLanguage:$('asrLanguage').value,hotwordEnabled:$('hotwordEnabled').checked,liveTranslateEnabled:$('liveTranslateEnabled').checked,aiEnabled:$('aiEnabled').checked,aiBaseUrl:$('aiBaseUrl').value.trim(),aiModel:$('aiModel').value.trim(),aiMode:$('aiMode').value,aiThinkingMode:$('aiThinkingMode').value,aiMaxTokens:Number($('aiMaxTokens').value),aiSilenceSeconds:Number($('aiSilenceSeconds').value),resumeContext:$('resumeContext').value,jdContext:$('jdContext').value,targetCompany:$('targetCompany').value.trim(),extraContext:$('extraContext').value,recordImageCap:Number($('recordImageCap').value)};
   // 热词框展示的是派生词表（含简历提取/内置兜底），未编辑时不能回写，
   // 否则等同于把它们固化成手动热词。不提交该键，服务端会保留磁盘原值。
   if(hotwordEdited)payload.hotwordExtra=$('hotwordExtra').value.trim();
@@ -455,6 +479,10 @@ async function refreshVisionStatus(){try{const s=await fetch('/api/vision/status
 }catch{$('visionBadge').textContent='状态未知'}}
 async function loadVisionConfig(){try{const data=await fetch('/api/settings').then(r=>{if(!r.ok)throw Error(r.status);return r.json()});
   $('visionBaseUrl').value=data.settings.visionBaseUrl||'';$('visionModel').value=data.settings.visionModel||'';
+  $('visionThinkingMode').value=data.settings.visionThinkingMode||'';
+  $('visionAnswerMode').value=data.settings.visionAnswerMode||'core_code';
+  $('visionMaxTokens').value=String(data.settings.visionMaxTokens||2048);
+  $('visionMaxImages').value=String(data.settings.visionMaxImages||3);
   $('solvePrompt').value=data.settings.solvePrompt||'';
   refreshSolvePromptState();
 }catch{}}
@@ -568,7 +596,7 @@ $('hotwordExtra').addEventListener('input',function(){hotwordEdited=true;refresh
 
 $('solvePrompt').addEventListener('input',refreshSolvePromptState);
 $('saveVision').onclick=async()=>{$('saveVision').disabled=true;showStatus('正在保存视觉模型配置…');
-  try{const payload={settings:{visionEnabled:$('visionEnabled').checked,visionBaseUrl:$('visionBaseUrl').value.trim(),visionModel:$('visionModel').value.trim(),solvePrompt:$('solvePrompt').value.trim()},allowLocalEndpoints:$('allowLocalEndpoints').checked};
+  try{const payload={settings:{visionEnabled:$('visionEnabled').checked,visionBaseUrl:$('visionBaseUrl').value.trim(),visionModel:$('visionModel').value.trim(),visionThinkingMode:$('visionThinkingMode').value,visionAnswerMode:$('visionAnswerMode').value,visionMaxTokens:Number($('visionMaxTokens').value),visionMaxImages:Number($('visionMaxImages').value),solvePrompt:$('solvePrompt').value.trim()},allowLocalEndpoints:$('allowLocalEndpoints').checked};
     if($('visionApiKey').value.trim())payload.visionApiKey=$('visionApiKey').value.trim();
     if(clearVisionRequested)payload.clearVisionApiKey=true;
     const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});

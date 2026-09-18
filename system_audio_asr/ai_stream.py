@@ -16,15 +16,42 @@ STREAM_MIN_CHUNK_CHARS = 8
 
 # 思考模式（thinking mode）。思考型模型默认先输出一段 reasoning_content 再给正文，
 # 实测同一道题「关闭」能让首字延迟从约 11 秒降到 1 秒内，且正文反而更长
-# （token 预算不再被思考占用）。三档取值：
-#   "off"  —— 关闭思考（send thinking={type:disabled}），面试实时场景推荐
-#   "auto" —— 不干预，由模型自行决定是否思考
-# 注意：不要用 reasoning_effort 参数控制。实测该项在本机网关上适得其反：
-# reasoning_effort="none" 会让模型把全部 token 用于思考、正文返回 0 字。
+# （token 预算不再被思考占用）。取值：
+#   "off"    —— 关闭思考（send thinking={type:disabled}），面试实时场景推荐
+#   "auto"   —— 不干预，由模型自行决定是否思考
+#   "medium" —— 中度思考（reasoning_effort=medium），算法题/难题用
+#   "high"   —— 深度思考（reasoning_effort=high），最难的情况用
+#
+# 关于 reasoning_effort（2026-09-17 三次实测，仅本地网关 127.0.0.1:7863，
+# deepseek-v4.1-flash；明细见 .runtime/thinking_probe*.json）：
+#   这里原先写着「不要用 reasoning_effort」，那是基于 reasoning_effort="none"
+#   得出的结论（"none" 反而让推理暴涨、正文 0 字）。实测澄清：出问题的是
+#   "none" 这个值，不是参数本身 —— graded 值（low/medium/high）正常生效。
+#   同一道区间调度推理题，max_tokens=8192，各跑 3 次：
+#     基线 auto    推理 0      正文 1196 字   4.7s   全对
+#     low          推理 6882   正文 1028 字   25.6s  3 次里 1 次答错
+#     medium       推理 6251   正文  706 字   22.8s  全对
+#     high         推理 9692   正文  907 字   33.1s  全对
+#   两个必须注意的坑：
+#   1) 推理 token 计入 max_tokens。额度不够时正文会是 0 字（finish_reason=length）：
+#      high 在 2048/4096 下实测正文均为 0，8192 才有正文。所以 apply_thinking_mode
+#      会给推理档兜底抬高额度（THINKING_MIN_TOKENS），否则用户一切档就得到空回答。
+#   2) 推理量大不等于更准：low 的推理量高于 medium 却出现过答错。故只暴露 medium/high。
 THINKING_OFF = "off"
 THINKING_AUTO = "auto"
-THINKING_MODES = (THINKING_OFF, THINKING_AUTO)
+THINKING_MEDIUM = "medium"
+THINKING_HIGH = "high"
+THINKING_MODES = (THINKING_OFF, THINKING_AUTO, THINKING_MEDIUM, THINKING_HIGH)
+# 字幕 AI 可用档位（不含推理档）：推理档实测 20-35 秒，实时字幕场景不可用，
+# 只留给截图解题这类「可以等」的场景。
+THINKING_MODES_REALTIME = (THINKING_OFF, THINKING_AUTO)
 DEFAULT_THINKING_MODE = THINKING_AUTO
+
+# 推理档的最小 token 额度：低于此值时推理会吃光额度、正文返回空（实测 4096 即空）。
+THINKING_MIN_TOKENS = 8192
+
+# 对外的两个推理档 → reasoning_effort 取值
+_REASONING_EFFORT = {THINKING_MEDIUM: "medium", THINKING_HIGH: "high"}
 
 
 def normalize_thinking_mode(value: Any) -> str:
@@ -33,13 +60,30 @@ def normalize_thinking_mode(value: Any) -> str:
     return mode if mode in THINKING_MODES else DEFAULT_THINKING_MODE
 
 
+def is_reasoning_mode(mode: Any) -> bool:
+    """是否「显式要求推理」的档位（需要抬高 token 额度兜底）。"""
+    return normalize_thinking_mode(mode) in _REASONING_EFFORT
+
+
 def apply_thinking_mode(payload: dict[str, Any], mode: Any) -> dict[str, Any]:
     """按模式给请求体加上（或省略）思考控制字段。
 
-    off 时显式发送 disabled；auto 时不发送任何相关字段，保持模型默认行为。
+    off 时显式发送 disabled；auto 时不发送任何相关字段，保持模型默认行为；
+    medium/high 发送 reasoning_effort，并把 max_tokens 至少抬到 THINKING_MIN_TOKENS
+    ——推理 token 计入该额度，额度不足会让正文变成 0 字（实测 4096 就是空回答）。
     """
-    if normalize_thinking_mode(mode) == THINKING_OFF:
+    normalized = normalize_thinking_mode(mode)
+    if normalized == THINKING_OFF:
         payload["thinking"] = {"type": "disabled"}
+    elif normalized in _REASONING_EFFORT:
+        payload["reasoning_effort"] = _REASONING_EFFORT[normalized]
+        current = payload.get("max_tokens")
+        try:
+            current_value = int(current)
+        except (TypeError, ValueError):
+            current_value = 0
+        if current_value < THINKING_MIN_TOKENS:
+            payload["max_tokens"] = THINKING_MIN_TOKENS
     return payload
 
 

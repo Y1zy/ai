@@ -14,23 +14,40 @@ from system_audio_asr.settings import DEFAULTS
 
 _OVERLAY_CS = Path(__file__).resolve().parents[1] / "overlay_cs" / "OverlayApp.cs"
 
+# 扫描 C# 方法体时的行数上限：仅作防御（防止哨兵行被误删后无限扫下去），
+# 真实边界由哨兵行决定。切勿收窄——Save()/Load() 每加一个配置键就会变长，
+# 上限卡太紧会在加键时报出「键集合不一致」的假故障（曾用 80 行，Load() 长到
+# 83 行后误报 hotwordExtra 缺失）。
+_SCAN_LIMIT = 400
 
-def _csharp_saved_keys() -> set[str]:
-    """解析 OverlayConfig.Save() 里 data["..."] = ... 写入的键集合。"""
+
+def _scan_keys(method_marker: str, stop_marker: str, pattern: str) -> set[str]:
+    """从 C# 源码扫出某个方法体里匹配 pattern 的键名（到 stop_marker 行为止）。"""
     text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
     lines = text.splitlines()
     start = None
     for index, line in enumerate(lines):
-        if "internal void Save()" in line:
+        if method_marker in line:
             start = index
             break
-    assert start is not None, "未找到 OverlayConfig.Save()"
+    assert start is not None, f"未找到 {method_marker}"
     keys: set[str] = set()
-    for line in lines[start:start + 80]:
-        keys.update(re.findall(r'data\["(\w+)"\]', line))
-        if "File.WriteAllText" in line:
+    scanned = 0
+    for line in lines[start:_SCAN_LIMIT + start]:
+        keys.update(re.findall(pattern, line))
+        scanned += 1
+        if stop_marker in line:
             break
+    assert scanned < _SCAN_LIMIT, (
+        f"{method_marker} 的结束标记 {stop_marker!r} 超出扫描上限，"
+        "请检查方法是否被误改，或调大 _SCAN_LIMIT"
+    )
     return keys
+
+
+def _csharp_saved_keys() -> set[str]:
+    """解析 OverlayConfig.Save() 里 data["..."] = ... 写入的键集合。"""
+    return _scan_keys("internal void Save()", "File.WriteAllText", r'data\["(\w+)"\]')
 
 
 def test_csharp_save_covers_all_default_keys() -> None:
@@ -42,21 +59,48 @@ def test_csharp_save_covers_all_default_keys() -> None:
 
 def test_csharp_load_reads_all_saved_keys() -> None:
     """Load() 能读回的键必须与 Save() 写出的键一致，否则重写会丢数据。"""
-    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
-    lines = text.splitlines()
-    start = None
-    for index, line in enumerate(lines):
-        if "internal static OverlayConfig Load()" in line:
-            start = index
-            break
-    assert start is not None, "未找到 OverlayConfig.Load()"
-    loaded: set[str] = set()
-    for line in lines[start:start + 80]:
-        loaded.update(re.findall(r'ContainsKey\("(\w+)"\)', line))
-        if "result.Normalize()" in line:
-            break
+    loaded = _scan_keys(
+        "internal static OverlayConfig Load()", "result.Normalize()", r'ContainsKey\("(\w+)"\)'
+    )
     saved = _csharp_saved_keys()
     assert saved == loaded, f"Save/Load 键集合不一致: 仅 Save={sorted(saved - loaded)}, 仅 Load={sorted(loaded - saved)}"
+
+
+def test_vision_thinking_levels_match_python() -> None:
+    """C# 的解题思考档位表必须与 Python 一致（含「跟随」这一档）。
+
+    两端各存一份档位表（跨语言无法共享）。C# 的下拉下标 ↔ 取值映射、以及
+    Normalize 的白名单都依赖它：不一致会让某个档位在桌面端被重置成「跟随」，
+    而界面上看不出异常。
+    """
+    from system_audio_asr.ai_stream import THINKING_MODES
+
+    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    match = re.search(r"VisionThinkingLevels\s*=\s*\{([^}]*)\}", text)
+    assert match, "未找到 C# VisionThinkingLevels 档位表"
+    levels = re.findall(r'"([^"]*)"', match.group(1))
+    # C# 表含「跟随」（空串），Python 的 THINKING_MODES 不含
+    assert levels == [""] + list(THINKING_MODES), (
+        f"档位表不一致: C#={levels} Python(含跟随)={[''] + list(THINKING_MODES)}"
+    )
+    # 下拉项数量必须与档位表一一对应，否则下标会错位
+    items = re.findall(r"visionThinkingBox\.Items\.Add\(\"", text)
+    assert len(items) == len(levels), (
+        f"下拉项数({len(items)})与档位表({len(levels)})不匹配：下标会错位、选错档"
+    )
+
+
+def test_vision_thinking_save_uses_shared_levels() -> None:
+    """加载与保存两个方向都必须走同一张档位表。
+
+    各自写一份映射会漂移，后果是「选了深度思考却存成跟随」，而界面看起来正常。
+    """
+    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    usages = re.findall(r"OverlayConfig\.VisionThinkingLevels", text)
+    assert len(usages) >= 3, (
+        f"VisionThinkingLevels 只被用了 {len(usages)} 处，"
+        "加载/保存/Normalize 三处都应使用它"
+    )
 
 
 def _csharp_max_token_levels() -> tuple[list[int], int]:

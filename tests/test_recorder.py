@@ -169,3 +169,62 @@ def test_stats_count_unclosed_stream_entries() -> None:
     stats = recorder.stats()
     assert stats["answers"] == 1
     assert stats["solves"] == 1
+
+
+# ---------------------------------------------------------------- 题图环形缓冲
+# 题图只保留最近 MAX_IMAGES 张（超出丢最老的）。上限从 50 提到 200 后，
+# 一场长面试（连续算法题截图）不会再出现"后半场没图"。
+
+
+def test_image_ring_keeps_newest_and_drops_oldest() -> None:
+    """超出上限时丢弃最老的，保留最新的一批。"""
+    import system_audio_asr.recorder as rec
+
+    recorder = SessionRecorder()
+    total = rec.MAX_IMAGES + 5
+    for index in range(total):
+        recorder.add_solve_image(f"img-{index}".encode())
+
+    assert recorder.stats()["images"] == rec.MAX_IMAGES
+    names = [img["data"] for img in recorder._images]
+    assert names[0] == b"img-5", "最老的几张未被丢弃"
+    assert names[-1] == f"img-{total - 1}".encode(), "最新一张被误丢"
+
+
+def test_image_ring_cap_is_200() -> None:
+    """上限就是 200：早期 50 张在一场长面试里不够用。"""
+    import system_audio_asr.recorder as rec
+
+    assert rec.MAX_IMAGES == 200
+
+
+def test_markdown_reports_images_dropped_by_ring(tmp_path) -> None:
+    """题图被环形缓冲挤掉时要明写，不能只让用户看到"这条没图"。
+
+    真实场景：解题发生在很久以前，它的题图已滚出缓冲；此时缓冲区里只剩
+    更晚的图，_match_image 的 10 秒前瞻窗匹配不上 → 该条解题没有图。
+    """
+    import time
+
+    recorder = SessionRecorder()
+    recorder.on_event({"type": "solve_answer", "text": "解题一", "done": True})
+    # 把这条解题的时间拨到很久以前（早于所有留存的图）
+    for entry in recorder._entries:
+        entry["ts"] = time.time() - 3600
+    recorder.add_solve_image(b"\xff\xd8\xff\xe0recent-shot")
+
+    recorder.save_to(tmp_path)
+    saved = next(tmp_path.glob("*/transcript.md")).read_text(encoding="utf-8")
+    assert "未附带题图" in saved, "题图被挤掉时未给出可见提示"
+
+
+def test_markdown_has_no_notice_when_all_images_match(tmp_path) -> None:
+    """图都配得上时不该出现"未附带题图"的噪声提示。"""
+    recorder = SessionRecorder()
+    recorder.add_solve_image(b"\xff\xd8\xff\xe0shot")
+    recorder.on_event({"type": "solve_answer", "text": "解题一", "done": True})
+
+    recorder.save_to(tmp_path)
+    saved = next(tmp_path.glob("*/transcript.md")).read_text(encoding="utf-8")
+    assert "未附带题图" not in saved
+    assert "![题目](images/" in saved, "正常配图路径被破坏"

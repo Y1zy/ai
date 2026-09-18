@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -322,6 +322,18 @@ namespace WasapiParaformerOverlay
         internal string VisionBaseUrl = "";
         internal string VisionModel = "";
         internal string SolvePrompt = "";
+        // 截图解题是独立链路（算法题/笔试题用，不带简历等面试上下文），
+        // 故思考模式与回答长度各留独立开关，与字幕 AI 解耦。
+        // 思考模式三态："" = 跟随 AiThinkingMode（默认，行为零变化）/ "off" / "auto"。
+        internal string VisionThinkingMode = "";
+        internal int VisionMaxTokens = DefaultMaxTokens;
+        // 作答模式：core_code = 只给核心实现（默认，行为零变化）/ acm = 完整可编译程序。
+        // 仅在用户未自定义 solvePrompt 时生效（自定义优先级最高）。
+        internal string VisionAnswerMode = "core_code";
+        // 一次解题最多挂几张截图（题干跨屏时用）：1..5，默认 3。
+        internal int VisionMaxImages = 3;
+        // 记录里保留的题图张数上限：吸附到 {100,200,300,500}，默认 200。
+        internal int RecordImageCap = 200;
         // 热词纠正：由网页设置页写入，C# 不参与逻辑，但必须原样保留，
         // 否则 Overlay 保存 config.json 时会把这两个键抹掉。
         internal bool HotwordEnabled = true;
@@ -369,8 +381,48 @@ namespace WasapiParaformerOverlay
             if (string.IsNullOrWhiteSpace(AiMode)) AiMode = "auto";
             if (AiThinkingMode != "off") AiThinkingMode = "auto";
             AiMaxTokens = SnapMaxTokens(AiMaxTokens);
+            // 解题思考模式三态：空串 = 跟随字幕 AI；off/auto = 独立生效。
+            // 解题思考模式白名单："" = 跟随字幕 AI，其余为 ai_stream.THINKING_MODES 的取值。
+            // 用档位表判断而不是写死 off/auto —— 写死会让新增的 medium/high 被静默重置成「跟随」。
+            if (Array.IndexOf(VisionThinkingLevels, VisionThinkingMode ?? "") < 0)
+                VisionThinkingMode = "";
+            VisionMaxTokens = SnapMaxTokens(VisionMaxTokens);
+            // 大小写不敏感（与 Python normalize_answer_mode 一致）：手改 config 写 "ACM" 也生效。
+            VisionAnswerMode = (VisionAnswerMode ?? "").Trim().ToLowerInvariant() == "acm" ? "acm" : "core_code";
+            // 多图解题张数 1..5；题图保留上限吸附到档位表（两端规则一致）。
+            VisionMaxImages = Math.Max(1, Math.Min(5, VisionMaxImages));
+            RecordImageCap = SnapRecordImageCap(RecordImageCap);
             if (string.IsNullOrWhiteSpace(AiBaseUrl)) AiBaseUrl = "https://api.deepseek.com";
             if (AsrLanguage != "en") AsrLanguage = "zh";
+        }
+
+        /// <summary>
+        /// 解题思考模式的下拉档位表（下标 ↔ 取值）。
+        /// 顺序必须与 visionThinkingBox.Items 一一对应；加载与保存都用它，
+        /// 两边写各自的映射会漂移（选了深度却存成跟随，界面看不出异常）。
+        /// 与 Python ai_stream.THINKING_MODES 保持一致（后者不含 ""，此处含「跟随」）。
+        /// </summary>
+        internal static readonly string[] VisionThinkingLevels =
+            { "", "off", "auto", "medium", "high" };
+
+        /// <summary>记录题图保留张数档位表（与 Python settings.RECORD_IMAGE_CAP_LEVELS 一致）。</summary>
+        internal static readonly int[] RecordImageCapLevels = { 100, 200, 300, 500 };
+
+        /// <summary>把题图保留上限吸附到最近档位；非法值回退默认档。</summary>
+        internal static int SnapRecordImageCap(int value)
+        {
+            int best = 200;
+            long bestDistance = long.MaxValue;
+            foreach (int level in RecordImageCapLevels)
+            {
+                long distance = Math.Abs((long)level - value);
+                if (distance < bestDistance || (distance == bestDistance && level < best))
+                {
+                    best = level;
+                    bestDistance = distance;
+                }
+            }
+            return best;
         }
 
         /// <summary>
@@ -395,6 +447,56 @@ namespace WasapiParaformerOverlay
             return best;
         }
 
+        // ---------------------------------------------------------------- 安全读取
+        // Load() 里每个字段都必须独立容错：JSON 里任意一个字段类型不合法（手改配置、
+        // 别的版本写入不同格式），此前会让整段 Load 抛错并被外层 catch 吞掉，导致
+        // 该字段之后的所有字段一起退回默认值——简历/JD/提示词就这么丢的，而且下次
+        // Save() 会把空值写回磁盘，永久损坏用户资料。
+        // 下列 Safe* 与 Python normalize_settings 的逐字段兜底同语义：读不出来就用
+        // 「保持默认值」，绝不抛给调用方。
+        private static double SafeDouble(object value, double fallback)
+        {
+            if (value == null) return fallback;
+            try { return Convert.ToDouble(value); }
+            catch { return fallback; }
+        }
+
+        private static int SafeInt(object value, int fallback)
+        {
+            if (value == null) return fallback;
+            try { return Convert.ToInt32(value); }
+            catch { return fallback; }
+        }
+
+        private static bool SafeBool(object value, bool fallback)
+        {
+            if (value == null) return fallback;
+            try { return Convert.ToBoolean(value); }
+            catch { return fallback; }
+        }
+
+        private static string SafeString(object value, string fallback)
+        {
+            if (value == null) return fallback;
+            try { return Convert.ToString(value) ?? fallback; }
+            catch { return fallback; }
+        }
+
+        /// <summary>长度档位：NaN/无穷/越界/无法解析一律回退默认档（与 Python 同口径）。</summary>
+        private static int SafeTokens(object value, int fallback)
+        {
+            if (value == null) return fallback;
+            try
+            {
+                double raw = Convert.ToDouble(value);
+                if (double.IsNaN(raw) || double.IsInfinity(raw)) return fallback;
+                if (raw >= int.MaxValue) return int.MaxValue;
+                if (raw <= int.MinValue) return int.MinValue;
+                return (int)raw;
+            }
+            catch { return fallback; }
+        }
+
         internal static OverlayConfig Load()
         {
             OverlayConfig result = new OverlayConfig();
@@ -404,62 +506,58 @@ namespace WasapiParaformerOverlay
                 JavaScriptSerializer serializer = new JavaScriptSerializer();
                 Dictionary<string, object> data = serializer.Deserialize<Dictionary<string, object>>(
                     File.ReadAllText(ConfigPath, Encoding.UTF8));
-                if (data.ContainsKey("left")) result.Left = Convert.ToDouble(data["left"]);
-                if (data.ContainsKey("top")) result.Top = Convert.ToDouble(data["top"]);
-                if (data.ContainsKey("width")) result.Width = Convert.ToDouble(data["width"]);
-                if (data.ContainsKey("height")) result.Height = Convert.ToDouble(data["height"]);
-                if (data.ContainsKey("fontSize")) result.FontSize = Convert.ToDouble(data["fontSize"]);
-                if (data.ContainsKey("maxLines")) result.MaxLines = Convert.ToInt32(data["maxLines"]);
-                if (data.ContainsKey("opacity")) result.Opacity = Convert.ToDouble(data["opacity"]);
-                if (data.ContainsKey("fadeDelayMs")) result.FadeDelayMs = Convert.ToInt32(data["fadeDelayMs"]);
-                if (data.ContainsKey("fontFamily")) result.FontFamilyName = Convert.ToString(data["fontFamily"]);
-                if (data.ContainsKey("textColor")) result.TextColor = Convert.ToString(data["textColor"]);
-                if (data.ContainsKey("frameMode")) result.FrameMode = Convert.ToString(data["frameMode"]);
-                if (data.ContainsKey("frameColor")) result.FrameColor = Convert.ToString(data["frameColor"]);
-                if (data.ContainsKey("frameOpacity")) result.FrameOpacity = Convert.ToDouble(data["frameOpacity"]);
-                if (data.ContainsKey("locked")) result.Locked = Convert.ToBoolean(data["locked"]);
-                if (data.ContainsKey("captureInvisible")) result.CaptureInvisible = Convert.ToBoolean(data["captureInvisible"]);
-                if (data.ContainsKey("screenName")) result.ScreenName = Convert.ToString(data["screenName"]);
-                if (data.ContainsKey("webSocketUrl")) result.WebSocketUrl = Convert.ToString(data["webSocketUrl"]);
-                if (data.ContainsKey("asrLanguage")) result.AsrLanguage = Convert.ToString(data["asrLanguage"]);
-                if (data.ContainsKey("liveTranslateEnabled")) result.LiveTranslateEnabled = Convert.ToBoolean(data["liveTranslateEnabled"]);
-                if (data.ContainsKey("aiEnabled")) result.AiEnabled = Convert.ToBoolean(data["aiEnabled"]);
-                if (data.ContainsKey("aiModel")) result.AiModel = Convert.ToString(data["aiModel"]);
-                if (data.ContainsKey("aiMode")) result.AiMode = Convert.ToString(data["aiMode"]);
-                if (data.ContainsKey("aiThinkingMode")) result.AiThinkingMode = Convert.ToString(data["aiThinkingMode"]);
+                // 逐字段独立容错（与 Python normalize_settings 同语义）：任一字段类型不合法
+                // 只让该字段回退默认值，绝不能整段中止。
+                // 此前用裸 Convert.*，任一处转换失败都会被外层 catch 吞掉，导致本行之后的
+                // 所有字段（简历/JD/提示词…）一起退回空值，下次保存即抹掉磁盘上的真实资料。
+                if (data.ContainsKey("left")) result.Left = SafeDouble(data["left"], result.Left);
+                if (data.ContainsKey("top")) result.Top = SafeDouble(data["top"], result.Top);
+                if (data.ContainsKey("width")) result.Width = SafeDouble(data["width"], result.Width);
+                if (data.ContainsKey("height")) result.Height = SafeDouble(data["height"], result.Height);
+                if (data.ContainsKey("fontSize")) result.FontSize = SafeDouble(data["fontSize"], result.FontSize);
+                if (data.ContainsKey("maxLines")) result.MaxLines = SafeInt(data["maxLines"], result.MaxLines);
+                if (data.ContainsKey("opacity")) result.Opacity = SafeDouble(data["opacity"], result.Opacity);
+                if (data.ContainsKey("fadeDelayMs")) result.FadeDelayMs = SafeInt(data["fadeDelayMs"], result.FadeDelayMs);
+                if (data.ContainsKey("fontFamily")) result.FontFamilyName = SafeString(data["fontFamily"], result.FontFamilyName);
+                if (data.ContainsKey("textColor")) result.TextColor = SafeString(data["textColor"], result.TextColor);
+                if (data.ContainsKey("frameMode")) result.FrameMode = SafeString(data["frameMode"], result.FrameMode);
+                if (data.ContainsKey("frameColor")) result.FrameColor = SafeString(data["frameColor"], result.FrameColor);
+                if (data.ContainsKey("frameOpacity")) result.FrameOpacity = SafeDouble(data["frameOpacity"], result.FrameOpacity);
+                if (data.ContainsKey("locked")) result.Locked = SafeBool(data["locked"], result.Locked);
+                if (data.ContainsKey("captureInvisible")) result.CaptureInvisible = SafeBool(data["captureInvisible"], result.CaptureInvisible);
+                if (data.ContainsKey("screenName")) result.ScreenName = SafeString(data["screenName"], result.ScreenName);
+                if (data.ContainsKey("webSocketUrl")) result.WebSocketUrl = SafeString(data["webSocketUrl"], result.WebSocketUrl);
+                if (data.ContainsKey("asrLanguage")) result.AsrLanguage = SafeString(data["asrLanguage"], result.AsrLanguage);
+                if (data.ContainsKey("liveTranslateEnabled")) result.LiveTranslateEnabled = SafeBool(data["liveTranslateEnabled"], result.LiveTranslateEnabled);
+                if (data.ContainsKey("aiEnabled")) result.AiEnabled = SafeBool(data["aiEnabled"], result.AiEnabled);
+                if (data.ContainsKey("aiModel")) result.AiModel = SafeString(data["aiModel"], result.AiModel);
+                if (data.ContainsKey("aiMode")) result.AiMode = SafeString(data["aiMode"], result.AiMode);
+                if (data.ContainsKey("aiThinkingMode")) result.AiThinkingMode = SafeString(data["aiThinkingMode"], result.AiThinkingMode);
                 // 与 Python normalize_max_tokens 的 float() 同口径解析，避免两端对同一
                 // 配置文件吸附出不同档位：
                 //   null / NaN / 无穷 → 默认；超 Int32 的巨值夹到边界再吸附（Python int(float())
                 //   对大值不报错，会吸附到 8192，不能在这里回退 2048）。
-                // 必须单独 try/catch：Convert.ToString 之外的强转失败会被 Load 外层 catch 吞掉，
-                // 本行之后的所有字段（简历/JD/提示词等）都会退回默认值，下次保存即抹掉磁盘数据。
-                try
-                {
-                    if (data.ContainsKey("aiMaxTokens") && data["aiMaxTokens"] != null)
-                    {
-                        double raw = Convert.ToDouble(data["aiMaxTokens"]);
-                        if (double.IsNaN(raw) || double.IsInfinity(raw)) result.AiMaxTokens = DefaultMaxTokens;
-                        else if (raw >= int.MaxValue) result.AiMaxTokens = int.MaxValue;
-                        else if (raw <= int.MinValue) result.AiMaxTokens = int.MinValue;
-                        else result.AiMaxTokens = (int)raw;
-                    }
-                }
-                catch { result.AiMaxTokens = DefaultMaxTokens; }
-                if (data.ContainsKey("aiSilenceSeconds")) result.AiSilenceSeconds = Convert.ToDouble(data["aiSilenceSeconds"]);
-                if (data.ContainsKey("aiSystemPrompt")) result.AiSystemPrompt = Convert.ToString(data["aiSystemPrompt"]);
-                if (data.ContainsKey("aiBaseUrl")) result.AiBaseUrl = Convert.ToString(data["aiBaseUrl"]);
-                if (data.ContainsKey("aiOverridePrompt")) result.AiOverridePrompt = Convert.ToString(data["aiOverridePrompt"]);
-                if (data.ContainsKey("aiBuiltInPrompt")) result.AiBuiltInPrompt = Convert.ToString(data["aiBuiltInPrompt"]);
-                if (data.ContainsKey("resumeContext")) result.ResumeContext = Convert.ToString(data["resumeContext"]);
-                if (data.ContainsKey("jdContext")) result.JdContext = Convert.ToString(data["jdContext"]);
-                if (data.ContainsKey("targetCompany")) result.TargetCompany = Convert.ToString(data["targetCompany"]);
-                if (data.ContainsKey("extraContext")) result.ExtraContext = Convert.ToString(data["extraContext"]);
-                if (data.ContainsKey("visionEnabled")) result.VisionEnabled = Convert.ToBoolean(data["visionEnabled"]);
-                if (data.ContainsKey("visionBaseUrl")) result.VisionBaseUrl = Convert.ToString(data["visionBaseUrl"]);
-                if (data.ContainsKey("visionModel")) result.VisionModel = Convert.ToString(data["visionModel"]);
-                if (data.ContainsKey("solvePrompt")) result.SolvePrompt = Convert.ToString(data["solvePrompt"]);
-                if (data.ContainsKey("hotwordEnabled")) result.HotwordEnabled = Convert.ToBoolean(data["hotwordEnabled"]);
-                if (data.ContainsKey("hotwordExtra")) result.HotwordExtra = Convert.ToString(data["hotwordExtra"]);
+                if (data.ContainsKey("aiMaxTokens")) result.AiMaxTokens = SafeTokens(data["aiMaxTokens"], result.AiMaxTokens);
+                if (data.ContainsKey("aiSilenceSeconds")) result.AiSilenceSeconds = SafeDouble(data["aiSilenceSeconds"], result.AiSilenceSeconds);
+                if (data.ContainsKey("aiSystemPrompt")) result.AiSystemPrompt = SafeString(data["aiSystemPrompt"], result.AiSystemPrompt);
+                if (data.ContainsKey("aiBaseUrl")) result.AiBaseUrl = SafeString(data["aiBaseUrl"], result.AiBaseUrl);
+                if (data.ContainsKey("aiOverridePrompt")) result.AiOverridePrompt = SafeString(data["aiOverridePrompt"], result.AiOverridePrompt);
+                if (data.ContainsKey("aiBuiltInPrompt")) result.AiBuiltInPrompt = SafeString(data["aiBuiltInPrompt"], result.AiBuiltInPrompt);
+                if (data.ContainsKey("resumeContext")) result.ResumeContext = SafeString(data["resumeContext"], result.ResumeContext);
+                if (data.ContainsKey("jdContext")) result.JdContext = SafeString(data["jdContext"], result.JdContext);
+                if (data.ContainsKey("targetCompany")) result.TargetCompany = SafeString(data["targetCompany"], result.TargetCompany);
+                if (data.ContainsKey("extraContext")) result.ExtraContext = SafeString(data["extraContext"], result.ExtraContext);
+                if (data.ContainsKey("visionEnabled")) result.VisionEnabled = SafeBool(data["visionEnabled"], result.VisionEnabled);
+                if (data.ContainsKey("visionBaseUrl")) result.VisionBaseUrl = SafeString(data["visionBaseUrl"], result.VisionBaseUrl);
+                if (data.ContainsKey("visionModel")) result.VisionModel = SafeString(data["visionModel"], result.VisionModel);
+                if (data.ContainsKey("solvePrompt")) result.SolvePrompt = SafeString(data["solvePrompt"], result.SolvePrompt);
+                if (data.ContainsKey("visionThinkingMode")) result.VisionThinkingMode = SafeString(data["visionThinkingMode"], result.VisionThinkingMode);
+                if (data.ContainsKey("visionAnswerMode")) result.VisionAnswerMode = SafeString(data["visionAnswerMode"], result.VisionAnswerMode);
+                if (data.ContainsKey("visionMaxTokens")) result.VisionMaxTokens = SafeTokens(data["visionMaxTokens"], result.VisionMaxTokens);
+                if (data.ContainsKey("visionMaxImages")) result.VisionMaxImages = SafeInt(data["visionMaxImages"], result.VisionMaxImages);
+                if (data.ContainsKey("recordImageCap")) result.RecordImageCap = SafeInt(data["recordImageCap"], result.RecordImageCap);
+                if (data.ContainsKey("hotwordEnabled")) result.HotwordEnabled = SafeBool(data["hotwordEnabled"], result.HotwordEnabled);
+                if (data.ContainsKey("hotwordExtra")) result.HotwordExtra = SafeString(data["hotwordExtra"], result.HotwordExtra);
             }
             catch { }
             result.Normalize();
@@ -507,8 +605,17 @@ namespace WasapiParaformerOverlay
             data["visionBaseUrl"] = VisionBaseUrl;
             data["visionModel"] = VisionModel;
             data["solvePrompt"] = SolvePrompt;
+            data["visionThinkingMode"] = VisionThinkingMode;
+            data["visionMaxTokens"] = VisionMaxTokens;
+            data["visionAnswerMode"] = VisionAnswerMode;
+            data["visionMaxImages"] = VisionMaxImages;
+            data["recordImageCap"] = RecordImageCap;
             data["hotwordEnabled"] = HotwordEnabled;
             data["hotwordExtra"] = HotwordExtra;
+            // 保留本版本不认识的键：C# 用固定键表整体重写文件，跨版本或网页端新增的键
+            // （例如只有 Python 侧使用的字段）若原样丢弃，一次保存就会把用户配置抹掉。
+            // 已知键以内存值为准（上面的赋值已覆盖），未知键按磁盘原值带回。
+            MergeUnknownKeys(data);
             string directory = Path.GetDirectoryName(ConfigPath);
             Directory.CreateDirectory(directory);
             string temporary = ConfigPath + ".tmp";
@@ -516,6 +623,23 @@ namespace WasapiParaformerOverlay
             File.WriteAllText(temporary, serializer.Serialize(data), Encoding.UTF8);
             if (File.Exists(ConfigPath)) File.Replace(temporary, ConfigPath, null);
             else File.Move(temporary, ConfigPath);
+        }
+
+        /// <summary>把磁盘上已存在、但本次不写的键原样并入待写数据（未知键不丢）。</summary>
+        private void MergeUnknownKeys(Dictionary<string, object> data)
+        {
+            try
+            {
+                if (!File.Exists(ConfigPath)) return;
+                Dictionary<string, object> disk = new JavaScriptSerializer()
+                    .Deserialize<Dictionary<string, object>>(File.ReadAllText(ConfigPath, Encoding.UTF8));
+                if (disk == null) return;
+                foreach (KeyValuePair<string, object> item in disk)
+                {
+                    if (!data.ContainsKey(item.Key)) data[item.Key] = item.Value;
+                }
+            }
+            catch { }
         }
 
         internal OverlayConfig Clone()
@@ -562,6 +686,11 @@ namespace WasapiParaformerOverlay
             VisionBaseUrl = other.VisionBaseUrl;
             VisionModel = other.VisionModel;
             SolvePrompt = other.SolvePrompt;
+            VisionThinkingMode = other.VisionThinkingMode;
+            VisionMaxTokens = other.VisionMaxTokens;
+            VisionAnswerMode = other.VisionAnswerMode;
+            VisionMaxImages = other.VisionMaxImages;
+            RecordImageCap = other.RecordImageCap;
             HotwordEnabled = other.HotwordEnabled;
             HotwordExtra = other.HotwordExtra;
             Normalize();
@@ -1602,6 +1731,11 @@ namespace WasapiParaformerOverlay
         private readonly CheckBox visionEnabledBox;
         private readonly TextBox visionBaseUrlBox;
         private readonly TextBox visionModelBox;
+        private readonly ComboBox visionThinkingBox;
+        private readonly ComboBox visionMaxTokensBox;
+        private readonly ComboBox visionAnswerModeBox;
+        private readonly ComboBox visionMaxImagesBox;
+        private readonly ComboBox recordImageCapBox;
         private readonly TextBox solvePromptBox;
         private readonly PasswordBox visionApiKeyBox;
         private readonly TextBlock visionStatus;
@@ -1972,6 +2106,83 @@ namespace WasapiParaformerOverlay
             visionModelBox.Margin = new Thickness(8, 18, 0, 0);
             visionModelRow.Children.Add(visionModelBox);
             aiRoot.Children.Add(visionModelRow);
+
+            // 解题独立开关：思考模式 + 回答长度（与字幕 AI 解耦，算法题常用）
+            StackPanel visionThinkingRow = new StackPanel();
+            visionThinkingRow.Orientation = Orientation.Horizontal;
+            visionThinkingRow.Margin = new Thickness(0, 8, 0, 6);
+            visionThinkingRow.Children.Add(MakeText("解题思考", 13));
+            visionThinkingBox = new ComboBox();
+            visionThinkingBox.Items.Add("跟随字幕 AI");
+            visionThinkingBox.Items.Add("关闭思考（首字快）");
+            visionThinkingBox.Items.Add("自动（模型决定）");
+            visionThinkingBox.Items.Add("中度思考（显式推理，约 23 秒）");
+            visionThinkingBox.Items.Add("深度思考（最强推理，约 33 秒）");
+            visionThinkingBox.Width = 200;
+            visionThinkingBox.Margin = new Thickness(8, 0, 0, 0);
+            visionThinkingRow.Children.Add(visionThinkingBox);
+            aiRoot.Children.Add(visionThinkingRow);
+            StackPanel visionTokensRow = new StackPanel();
+            visionTokensRow.Orientation = Orientation.Horizontal;
+            visionTokensRow.Margin = new Thickness(0, 0, 0, 6);
+            visionTokensRow.Children.Add(MakeText("解题长度", 13));
+            visionMaxTokensBox = new ComboBox();
+            visionMaxTokensBox.Items.Add("极简 — 约 256");
+            visionMaxTokensBox.Items.Add("简洁 — 约 512");
+            visionMaxTokensBox.Items.Add("适中 — 约 1024");
+            visionMaxTokensBox.Items.Add("完整 — 约 2048（默认）");
+            visionMaxTokensBox.Items.Add("长 — 约 4096");
+            visionMaxTokensBox.Items.Add("超长 — 约 8192");
+            visionMaxTokensBox.Width = 200;
+            visionMaxTokensBox.Margin = new Thickness(8, 0, 0, 0);
+            visionTokensRow.Children.Add(visionMaxTokensBox);
+            aiRoot.Children.Add(visionTokensRow);
+            StackPanel visionAnswerRow = new StackPanel();
+            visionAnswerRow.Orientation = Orientation.Horizontal;
+            visionAnswerRow.Margin = new Thickness(0, 0, 0, 6);
+            visionAnswerRow.Children.Add(MakeText("作答模式", 13));
+            visionAnswerModeBox = new ComboBox();
+            visionAnswerModeBox.Items.Add("核心代码（只给关键实现）");
+            visionAnswerModeBox.Items.Add("ACM（完整可编译程序）");
+            visionAnswerModeBox.Width = 200;
+            visionAnswerModeBox.Margin = new Thickness(8, 0, 0, 0);
+            visionAnswerRow.Children.Add(visionAnswerModeBox);
+            aiRoot.Children.Add(visionAnswerRow);
+            // 单题截图张数：题干/约束/样例跨屏时，手机端「➕ 加一图」攒够再一起提交。
+            StackPanel visionImagesRow = new StackPanel();
+            visionImagesRow.Orientation = Orientation.Horizontal;
+            visionImagesRow.Margin = new Thickness(0, 0, 0, 6);
+            visionImagesRow.Children.Add(MakeText("单题截图", 13));
+            visionMaxImagesBox = new ComboBox();
+            visionMaxImagesBox.Items.Add("1 张 — 单屏题目");
+            visionMaxImagesBox.Items.Add("2 张");
+            visionMaxImagesBox.Items.Add("3 张 — 默认");
+            visionMaxImagesBox.Items.Add("4 张");
+            visionMaxImagesBox.Items.Add("5 张 — 最多");
+            visionMaxImagesBox.Width = 200;
+            visionMaxImagesBox.Margin = new Thickness(8, 0, 0, 0);
+            visionImagesRow.Children.Add(visionMaxImagesBox);
+            aiRoot.Children.Add(visionImagesRow);
+            // 题图保留张数：内存记录的环形上限，影响保存时能带出多少张题图。
+            StackPanel recordCapRow = new StackPanel();
+            recordCapRow.Orientation = Orientation.Horizontal;
+            recordCapRow.Margin = new Thickness(0, 0, 0, 6);
+            recordCapRow.Children.Add(MakeText("题图保留", 13));
+            recordImageCapBox = new ComboBox();
+            recordImageCapBox.Items.Add("100 张 — 约 14 MB");
+            recordImageCapBox.Items.Add("200 张 — 约 27 MB（默认）");
+            recordImageCapBox.Items.Add("300 张 — 约 41 MB");
+            recordImageCapBox.Items.Add("500 张 — 约 68 MB");
+            recordImageCapBox.Width = 200;
+            recordImageCapBox.Margin = new Thickness(8, 0, 0, 0);
+            recordCapRow.Children.Add(recordImageCapBox);
+            aiRoot.Children.Add(recordCapRow);
+            TextBlock visionHint = MakeText(
+                "截图解题是独立链路（算法题/笔试题）：不带简历与知识库。思考、长度、单题截图张数可单独设置，不影响字幕 AI。题图保留张数决定记录里能带出多少张题图（超上限时最老的被丢弃，记录顶部会注明）。", 12);
+            visionHint.TextWrapping = TextWrapping.Wrap;
+            visionHint.Foreground = new SolidColorBrush(Color.FromRgb(100, 116, 139));
+            visionHint.Margin = new Thickness(0, 0, 0, 8);
+            aiRoot.Children.Add(visionHint);
             StackPanel visionKeyRow = new StackPanel();
             visionKeyRow.Orientation = Orientation.Horizontal;
             visionKeyRow.Margin = new Thickness(0, 0, 0, 4);
@@ -2206,6 +2417,25 @@ namespace WasapiParaformerOverlay
             int maxTokens = aiMaxTokensBox.SelectedIndex >= 0 && aiMaxTokensBox.SelectedIndex < OverlayConfig.MaxTokenLevels.Length
                 ? OverlayConfig.MaxTokenLevels[aiMaxTokensBox.SelectedIndex]
                 : OverlayConfig.DefaultMaxTokens;
+            // 解题思考模式：下拉序号 → 取值。用共享数组而不是写死的三元表达式，
+            // 避免「加载」与「保存」两个方向的映射各写一份而漂移
+            // （漂移的后果是选了深度思考却存成跟随，界面上看不出异常）。
+            string visionThinking = visionThinkingBox.SelectedIndex >= 0
+                && visionThinkingBox.SelectedIndex < OverlayConfig.VisionThinkingLevels.Length
+                ? OverlayConfig.VisionThinkingLevels[visionThinkingBox.SelectedIndex]
+                : "";
+            int visionMaxTokens = visionMaxTokensBox.SelectedIndex >= 0 && visionMaxTokensBox.SelectedIndex < OverlayConfig.MaxTokenLevels.Length
+                ? OverlayConfig.MaxTokenLevels[visionMaxTokensBox.SelectedIndex]
+                : OverlayConfig.DefaultMaxTokens;
+            string visionAnswerMode = visionAnswerModeBox.SelectedIndex == 1 ? "acm" : "core_code";
+            // 单题截图张数：下拉序号即张数-1（1..5）。
+            int visionMaxImages = visionMaxImagesBox.SelectedIndex >= 0
+                ? visionMaxImagesBox.SelectedIndex + 1
+                : 3;
+            int recordImageCap = recordImageCapBox.SelectedIndex >= 0
+                && recordImageCapBox.SelectedIndex < OverlayConfig.RecordImageCapLevels.Length
+                ? OverlayConfig.RecordImageCapLevels[recordImageCapBox.SelectedIndex]
+                : 200;
             SecretStore.SaveApiKey(apiKeyBox.Password);
             overlay.SetLiveTranslationEnabled(liveTranslateBox.IsChecked == true);
             overlay.ApplyAiSettings(
@@ -2225,6 +2455,11 @@ namespace WasapiParaformerOverlay
                 visionEnabledBox.IsChecked == true,
                 visionBaseUrlBox.Text,
                 visionModelBox.Text,
+                visionThinking,
+                visionMaxTokens,
+                visionAnswerMode,
+                visionMaxImages,
+                recordImageCap,
                 solvePromptBox.Text);
             aiPromptPreviewBox.Text = DeepSeekClient.PromptForMode(overlay.CurrentConfig);
         }
@@ -2283,47 +2518,77 @@ namespace WasapiParaformerOverlay
         internal void Sync(OverlayConfig config)
         {
             syncing = true;
-            fontSizeBox.Text = Math.Round(config.FontSize).ToString();
-            opacitySlider.Value = config.Opacity * 100;
-            fontBox.SelectedItem = config.FontFamilyName;
-            if (fontBox.SelectedItem == null) fontBox.SelectedItem = "Microsoft YaHei UI";
-            colorBox.SelectedItem = ColorName(config.TextColor);
-            lockedBox.IsChecked = config.Locked;
-            captureBox.IsChecked = config.CaptureInvisible;
-            liveTranslateBox.IsChecked = config.LiveTranslateEnabled;
-            screenBox.Items.Clear();
-            foreach (Forms.Screen screen in Forms.Screen.AllScreens)
-                screenBox.Items.Add(screen.DeviceName);
-            screenBox.SelectedItem = config.ScreenName;
-            if (screenBox.SelectedItem == null && screenBox.Items.Count > 0)
-                screenBox.SelectedIndex = 0;
-            aiEnabledBox.IsChecked = config.AiEnabled;
-            apiKeyBox.Password = SecretStore.LoadApiKey();
-            aiModelBox.SelectedItem = config.AiModel;
-            if (aiModelBox.SelectedItem == null) aiModelBox.SelectedItem = "deepseek-v4-flash";
-            aiModeBox.SelectedItem = ModeDisplay(config.AiMode);
-            aiThinkingBox.SelectedIndex = config.AiThinkingMode == "off" ? 0 : 1;
-            // Normalize 已把值吸附到档位表，IndexOf 必命中；兜底再取一次防越界。
-            int maxTokensIndex = Array.IndexOf(OverlayConfig.MaxTokenLevels, config.AiMaxTokens);
-            aiMaxTokensBox.SelectedIndex = maxTokensIndex >= 0
-                ? maxTokensIndex
-                : Array.IndexOf(OverlayConfig.MaxTokenLevels, OverlayConfig.DefaultMaxTokens);
-            aiBaseUrlBox.Text = config.AiBaseUrl;
-            aiDelaySlider.Value = Math.Round(config.AiSilenceSeconds * 10);
-            aiPromptBox.Text = config.AiSystemPrompt;
-            aiOverrideBox.Text = config.AiOverridePrompt;
-            aiPromptPreviewBox.Text = DeepSeekClient.PromptForMode(config);
-            visionEnabledBox.IsChecked = config.VisionEnabled;
-            visionBaseUrlBox.Text = config.VisionBaseUrl;
-            visionModelBox.Text = config.VisionModel;
-            solvePromptBox.Text = config.SolvePrompt;
-            visionStatus.Text = VisionSecretStore.HasApiKey ? "Key 已加密保存" : "尚未设置 Key";
-            resumeBox.Text = config.ResumeContext;
-            jdBox.Text = config.JdContext;
-            companyBox.Text = config.TargetCompany;
-            extraBox.Text = config.ExtraContext;
-            aiStatus.Text = SecretStore.HasApiKey ? "API Key 已加密保存" : "尚未设置 API Key";
-            syncing = false;
+            try
+            {
+                // 先填用户手输的长期资料（简历/JD/公司/附加背景/提示词），再填其余控件。
+                // 这些字段一旦漏填，关闭设置窗时 ApplyAllSettings 会把空值写回配置、
+                // 永久抹掉用户资料；放在最前面可保证后面的控件即使出问题也不殃及它们。
+                resumeBox.Text = config.ResumeContext;
+                jdBox.Text = config.JdContext;
+                companyBox.Text = config.TargetCompany;
+                extraBox.Text = config.ExtraContext;
+                aiPromptBox.Text = config.AiSystemPrompt;
+                aiOverrideBox.Text = config.AiOverridePrompt;
+                solvePromptBox.Text = config.SolvePrompt;
+                fontSizeBox.Text = Math.Round(config.FontSize).ToString();
+                opacitySlider.Value = config.Opacity * 100;
+                fontBox.SelectedItem = config.FontFamilyName;
+                if (fontBox.SelectedItem == null) fontBox.SelectedItem = "Microsoft YaHei UI";
+                colorBox.SelectedItem = ColorName(config.TextColor);
+                lockedBox.IsChecked = config.Locked;
+                captureBox.IsChecked = config.CaptureInvisible;
+                liveTranslateBox.IsChecked = config.LiveTranslateEnabled;
+                screenBox.Items.Clear();
+                foreach (Forms.Screen screen in Forms.Screen.AllScreens)
+                    screenBox.Items.Add(screen.DeviceName);
+                screenBox.SelectedItem = config.ScreenName;
+                if (screenBox.SelectedItem == null && screenBox.Items.Count > 0)
+                    screenBox.SelectedIndex = 0;
+                aiEnabledBox.IsChecked = config.AiEnabled;
+                apiKeyBox.Password = SecretStore.LoadApiKey();
+                aiModelBox.SelectedItem = config.AiModel;
+                if (aiModelBox.SelectedItem == null) aiModelBox.SelectedItem = "deepseek-v4-flash";
+                aiModeBox.SelectedItem = ModeDisplay(config.AiMode);
+                aiThinkingBox.SelectedIndex = config.AiThinkingMode == "off" ? 0 : 1;
+                // Normalize 已把值吸附到档位表，IndexOf 必命中；兜底再取一次防越界。
+                int maxTokensIndex = Array.IndexOf(OverlayConfig.MaxTokenLevels, config.AiMaxTokens);
+                aiMaxTokensBox.SelectedIndex = maxTokensIndex >= 0
+                    ? maxTokensIndex
+                    : Array.IndexOf(OverlayConfig.MaxTokenLevels, OverlayConfig.DefaultMaxTokens);
+                aiBaseUrlBox.Text = config.AiBaseUrl;
+                aiDelaySlider.Value = Math.Round(config.AiSilenceSeconds * 10);
+                aiPromptPreviewBox.Text = DeepSeekClient.PromptForMode(config);
+                visionEnabledBox.IsChecked = config.VisionEnabled;
+                visionBaseUrlBox.Text = config.VisionBaseUrl;
+                visionModelBox.Text = config.VisionModel;
+                // 取值 → 下拉序号（与保存方向共用 VisionThinkingLevels，防漂移）
+                int visionThinkingIndex = Array.IndexOf(
+                    OverlayConfig.VisionThinkingLevels, config.VisionThinkingMode);
+                visionThinkingBox.SelectedIndex = visionThinkingIndex >= 0 ? visionThinkingIndex : 0;
+                int visionMaxTokensIndex = Array.IndexOf(OverlayConfig.MaxTokenLevels, config.VisionMaxTokens);
+                visionMaxTokensBox.SelectedIndex = visionMaxTokensIndex >= 0
+                    ? visionMaxTokensIndex
+                    : Array.IndexOf(OverlayConfig.MaxTokenLevels, OverlayConfig.DefaultMaxTokens);
+                visionAnswerModeBox.SelectedIndex = config.VisionAnswerMode == "acm" ? 1 : 0;
+                // 单题截图张数：1..5 对应下拉序号 0..4。
+                visionMaxImagesBox.SelectedIndex = Math.Max(0, Math.Min(4, config.VisionMaxImages - 1));
+                int recordCapIndex = Array.IndexOf(OverlayConfig.RecordImageCapLevels, config.RecordImageCap);
+                recordImageCapBox.SelectedIndex = recordCapIndex >= 0
+                    ? recordCapIndex
+                    : Array.IndexOf(OverlayConfig.RecordImageCapLevels, 200);
+                visionStatus.Text = VisionSecretStore.HasApiKey ? "Key 已加密保存" : "尚未设置 Key";
+                aiStatus.Text = SecretStore.HasApiKey ? "API Key 已加密保存" : "尚未设置 API Key";
+            }
+            catch (Exception error)
+            {
+                // 同步失败不能让 syncing 卡在 true（那会永久屏蔽后续控件更新），
+                // 也不能让异常冒泡打断调用方（如配置重载、几何变化）。
+                AppLog.Write("settings sync error=" + error.Message);
+            }
+            finally
+            {
+                syncing = false;
+            }
         }
 
         internal void SelectAiTab() { tabs.SelectedIndex = 1; }
@@ -3348,6 +3613,71 @@ namespace WasapiParaformerOverlay
             return cleaned.ToString();
         }
 
+        /// <summary>
+        /// 按 ``` 围栏把文本切成「正文 / 代码」交替段，供字幕窗渲染。
+        /// 返回项 IsCode 为 true 表示围栏内的代码。
+        ///
+        /// 字幕窗是窄条且鼠标穿透，无法像手机那样给代码加深色背景块
+        /// （WPF Run 不支持背景），因此代码段用等宽字体 + 独立配色区分，
+        /// 保留缩进；至少不会再像 CleanAiText 那样把代码和正文混在一起。
+        /// </summary>
+        internal static List<KeyValuePair<bool, string>> SplitCodeFences(string input)
+        {
+            List<KeyValuePair<bool, string>> parts = new List<KeyValuePair<bool, string>>();
+            if (string.IsNullOrEmpty(input)) return parts;
+            string[] lines = input.Replace("\r\n", "\n").Split('\n');
+            bool inCode = false;
+            StringBuilder buffer = new StringBuilder();
+            foreach (string line in lines)
+            {
+                bool isFence = line.TrimStart().StartsWith("```");
+                if (isFence)
+                {
+                    // 围栏行本身不显示，只切换状态
+                    if (buffer.Length > 0)
+                    {
+                        parts.Add(new KeyValuePair<bool, string>(inCode, buffer.ToString().TrimEnd('\n')));
+                        buffer.Length = 0;
+                    }
+                    inCode = !inCode;
+                    continue;
+                }
+                buffer.Append(line).Append('\n');
+            }
+            if (buffer.Length > 0)
+                parts.Add(new KeyValuePair<bool, string>(inCode, buffer.ToString().TrimEnd('\n')));
+            return parts;
+        }
+
+        /// <summary>把 AI 文本按代码围栏分段追加到字幕窗（代码用等宽字体）。</summary>
+        private void AppendAiText(TextBlock target, string text, Brush normalBrush)
+        {
+            foreach (KeyValuePair<bool, string> part in SplitCodeFences(text))
+            {
+                if (part.Value.Length == 0) continue;
+                Run run = new Run(part.Value);
+                run.FontWeight = FontWeights.Normal;
+                if (part.Key)
+                {
+                    run.FontFamily = CodeFontFamily;
+                    run.Foreground = CodeBrush;
+                }
+                else
+                {
+                    run.Foreground = normalBrush;
+                }
+                target.Inlines.Add(run);
+            }
+        }
+
+        /// <summary>字幕窗代码段的等宽字体：与手机端代码块保持同一族观感。</summary>
+        private static readonly FontFamily CodeFontFamily =
+            new FontFamily("Consolas, Cascadia Mono, Courier New");
+
+        /// <summary>字幕窗代码段配色：比正文的青色更亮，一眼区分「这是代码」。</summary>
+        private static readonly Brush CodeBrush =
+            new SolidColorBrush(Color.FromRgb(147, 197, 253));
+
         private void RefreshText()
         {
             double previousOffset = scroll.VerticalOffset;
@@ -3387,12 +3717,22 @@ namespace WasapiParaformerOverlay
                         label.FontWeight = FontWeights.SemiBold;
                         text.Inlines.Add(label);
                     }
-                    Run content = new Run((user ? entry.Text : CleanAiText(entry.Text)) + (entry.Streaming ? " ▍" : ""));
-                    content.Foreground = user
-                        ? BrushFromHex(config.TextColor, 245)
-                        : new SolidColorBrush(Color.FromRgb(116, 232, 255));
+                    Run content = new Run(user ? entry.Text : "");
                     content.FontWeight = FontWeights.Normal;
-                    text.Inlines.Add(content);
+                    if (user)
+                    {
+                        content.Foreground = BrushFromHex(config.TextColor, 245);
+                        content.Text = entry.Text + (entry.Streaming ? " ▍" : "");
+                        text.Inlines.Add(content);
+                    }
+                    else
+                    {
+                        // AI 文本按代码围栏分段渲染：代码用等宽字体，其余保持正文样式。
+                        // 走 AppendAiText 而不是 CleanAiText —— 后者会把围栏与反引号
+                        // 全部删掉，代码与正文混在一起、缩进丢失。
+                        AppendAiText(text, entry.Text, new SolidColorBrush(Color.FromRgb(116, 232, 255)));
+                        if (entry.Streaming) text.Inlines.Add(new Run(" ▍") { Foreground = new SolidColorBrush(Color.FromRgb(116, 232, 255)) });
+                    }
                     if (index < chatEntries.Count - 1 || subtitle.Partial.Length > 0)
                         text.Inlines.Add(new LineBreak());
                 }
@@ -3889,7 +4229,9 @@ namespace WasapiParaformerOverlay
             bool enabled, string model, string mode, string thinkingMode, int maxTokens, string baseUrl,
             double silenceSeconds, string systemPrompt,
             string overridePrompt, string resumeContext, string jdContext, string targetCompany, string extraContext,
-            bool visionEnabled, string visionBaseUrl, string visionModel, string solvePrompt)
+            bool visionEnabled, string visionBaseUrl, string visionModel,
+            string visionThinkingMode, int visionMaxTokens, string visionAnswerMode,
+            int visionMaxImages, int recordImageCap, string solvePrompt)
         {
             config.AiEnabled = enabled;
             config.AiModel = model;
@@ -3907,6 +4249,11 @@ namespace WasapiParaformerOverlay
             config.VisionEnabled = visionEnabled;
             config.VisionBaseUrl = visionBaseUrl ?? "";
             config.VisionModel = visionModel ?? "";
+            config.VisionThinkingMode = visionThinkingMode ?? "";
+            config.VisionMaxTokens = OverlayConfig.SnapMaxTokens(visionMaxTokens);
+            config.VisionAnswerMode = (visionAnswerMode ?? "").Trim().ToLowerInvariant() == "acm" ? "acm" : "core_code";
+            config.VisionMaxImages = Math.Max(1, Math.Min(5, visionMaxImages));
+            config.RecordImageCap = OverlayConfig.SnapRecordImageCap(recordImageCap);
             config.SolvePrompt = solvePrompt ?? "";
             config.Normalize();
             aiTimer.Interval = TimeSpan.FromSeconds(config.AiSilenceSeconds);
@@ -4419,6 +4766,11 @@ namespace WasapiParaformerOverlay
             if (!Same(local.VisionBaseUrl, baseline.VisionBaseUrl)) merged.VisionBaseUrl = local.VisionBaseUrl;
             if (!Same(local.VisionModel, baseline.VisionModel)) merged.VisionModel = local.VisionModel;
             if (!Same(local.SolvePrompt, baseline.SolvePrompt)) merged.SolvePrompt = local.SolvePrompt;
+            if (!Same(local.VisionThinkingMode, baseline.VisionThinkingMode)) merged.VisionThinkingMode = local.VisionThinkingMode;
+            if (local.VisionMaxTokens != baseline.VisionMaxTokens) merged.VisionMaxTokens = local.VisionMaxTokens;
+            if (!Same(local.VisionAnswerMode, baseline.VisionAnswerMode)) merged.VisionAnswerMode = local.VisionAnswerMode;
+            if (local.VisionMaxImages != baseline.VisionMaxImages) merged.VisionMaxImages = local.VisionMaxImages;
+            if (local.RecordImageCap != baseline.RecordImageCap) merged.RecordImageCap = local.RecordImageCap;
             if (local.HotwordEnabled != baseline.HotwordEnabled) merged.HotwordEnabled = local.HotwordEnabled;
             if (!Same(local.HotwordExtra, baseline.HotwordExtra)) merged.HotwordExtra = local.HotwordExtra;
             config.ApplyFrom(merged);

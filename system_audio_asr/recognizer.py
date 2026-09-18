@@ -76,16 +76,24 @@ _ZH_STOPWORDS: frozenset[str] = frozenset({
 # （如「保证各步骤仅在安全联锁条」）。用长度这一结构性判据，不靠枚举具体短语。
 _ZH_TERM_MAX_CHARS = 6
 
-# 悬空虚词结尾：整段汉字被标点/词边界截断时，末尾常残留这些连词/助词，
+# 悬空虚词结尾：整段汉字被标点/词边界截断时，末尾常残留这些虚词/助词，
 # 说明它只是半句话而非术语（如「像素数据解码与」「体素坐标与」）。直接丢弃。
+#
+# 只收「虚词与纯连词」，不收「提供/实现/处理」这类实义动词：后者在术语里
+# 同样是合法结尾（服务提供、功能实现、图像处理），按字面无法区分是术语还是
+# 句子残渣，剥离只会把真术语砍短（「服务提供」→「服务」）——宁可保留残渣，
+# 也不能丢术语。允许多字项（「通过」），剥离按实际匹配长度删除。
 _ZH_TRAILING_PARTICLES: tuple[str, ...] = (
     "与", "及", "和", "等", "的", "地", "得", "为", "以", "对", "把", "被",
-    "在", "从", "或", "并", "而", "则", "使", "令", "于", "各", "通过",
+    "在", "从", "或", "并", "而", "则", "使", "令", "于", "各",
+    "通过",
 )
 
-# 悬空虚词开头：与结尾同理（如「与影像后处理」）。剥离后若过短会被长度检查丢弃。
+# 悬空虚词开头：只收纯连词/助词。像「对」「为」「以」这类字常是术语首字
+# （对外接口、为知笔记、以太网），做前缀剥离会把真术语砍成残渣
+# （「对外提供」→「外提供」），故不列入。
 _ZH_LEADING_PARTICLES: tuple[str, ...] = (
-    "与", "及", "和", "等", "的", "为", "以", "对", "把", "被", "在", "从", "或", "并",
+    "与", "及", "和", "等", "的", "被", "在", "从",
 )
 
 
@@ -134,16 +142,25 @@ def _strip_zh_affixes(word: str) -> str:
 
 
 def _strip_zh_particles(word: str) -> str:
-    """剥离首尾悬空虚词（「与」「及」「等」「的」…）。
+    """剥离首尾悬空虚词（「与」「及」「等」「的」「通过」…）。
 
     这类残留说明整段汉字只是被标点截断的半句话——「像素数据解码与」去掉尾巴后
     才是可能完整的词；若剥完不足 2 字，_is_meaningful_zh 会丢弃它。
+
+    必须按**实际匹配到的粒子长度**删除：粒子表含多字项（「通过」），
+    固定删 1 字符会只砍掉末字而留下碎渣（「服务间通过」→「服务间通」）。
     """
     current = word
-    while len(current) >= 2 and current.endswith(_ZH_TRAILING_PARTICLES):
-        current = current[:-1]
-    while len(current) >= 2 and current.startswith(_ZH_LEADING_PARTICLES):
-        current = current[1:]
+    while len(current) >= 2:
+        matched = next((p for p in _ZH_TRAILING_PARTICLES if current.endswith(p)), "")
+        if not matched or len(current) <= len(matched):
+            break
+        current = current[: -len(matched)]
+    while len(current) >= 2:
+        matched = next((p for p in _ZH_LEADING_PARTICLES if current.startswith(p)), "")
+        if not matched or len(current) <= len(matched):
+            break
+        current = current[len(matched):]
     return current
 
 

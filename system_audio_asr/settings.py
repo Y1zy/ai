@@ -63,6 +63,24 @@ DEFAULTS: dict[str, Any] = {
     "visionEnabled": False,
     "visionBaseUrl": "",
     "visionModel": "",
+    # 截图解题是独立链路（主要面向算法题/笔试题：题干在截图里已完整，
+    # 不需要简历/JD 上下文），故思考模式与回答长度各留一个独立开关。
+    # 思考模式三态："" = 跟随字幕 AI 的 aiThinkingMode（默认，行为零变化）/
+    #               "off" / "auto" = 解题独立生效。
+    "visionThinkingMode": "",
+    # 回答长度上限：算法题代码较长，与字幕 AI 的档位解耦，可单独调大。
+    "visionMaxTokens": 2048,
+    # 解题作答模式：core_code = 只给核心实现（默认，行为零变化）/
+    #               acm = 完整可编译程序（含头文件/main/输入输出，面向笔试与 ACM）。
+    # 仅在用户未自定义 solvePrompt 时生效（自定义优先级最高）。
+    "visionAnswerMode": "core_code",
+    # 一次解题最多挂几张截图：题干/约束/样例跨屏时用得上。每张 base64 后约
+    # 183 KB 且全部进模型输入，故默认 3、上限 5（见 phone_share.MAX_SOLVE_IMAGES_LIMIT）。
+    "visionMaxImages": 3,
+    # 记录里保留的题图张数上限：一场长面试连续截算法题时，50 张明显不够，
+    # 超限后最老的题图会被丢弃，保存的记录里对应解题就没有图（记录顶部会注明）。
+    # 单张约 137 KB，500 张约占 68 MB 内存。
+    "recordImageCap": 200,
     # C# Overlay 写入的面试上下文与采集开关：必须纳入 DEFAULTS，
     # 否则网页设置保存时会把这些键从 config.json 整体抹掉。
     "resumeContext": "",
@@ -71,6 +89,19 @@ DEFAULTS: dict[str, Any] = {
     "extraContext": "",
     "captureInvisible": True,
 }
+
+# 记录题图保留张数的可选档位（设置页下拉与此保持一致）。
+RECORD_IMAGE_CAP_LEVELS = (100, 200, 300, 500)
+
+
+def normalize_record_image_cap(value: Any) -> int:
+    """把题图保留上限吸附到受支持档位；非法值回退默认档。"""
+    default = int(DEFAULTS["recordImageCap"])
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(RECORD_IMAGE_CAP_LEVELS, key=lambda level: (abs(level - number), level))
 
 
 class DataBlob(ctypes.Structure):
@@ -225,10 +256,32 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
         result["aiMode"] = "auto"
     if result["aiThinkingMode"] not in {"off", "auto"}:
         result["aiThinkingMode"] = "auto"
+    # 解题思考模式：空串 = 跟随字幕 AI；off/auto/medium/high = 独立生效。
+    # 白名单取 ai_stream.THINKING_MODES，不写字面量集合——写死会在新增档位时
+    # 把它静默重置成「跟随」，用户切了档却看不出任何异常。
+    from .ai_stream import THINKING_MODES
+
+    if result["visionThinkingMode"] not in ("",) + tuple(THINKING_MODES):
+        result["visionThinkingMode"] = ""
     # 长度档位吸附到最近一档（非法值回退默认），与 C# OverlayConfig.Normalize 同规则。
     from .ai_stream import normalize_max_tokens
 
     result["aiMaxTokens"] = normalize_max_tokens(result.get("aiMaxTokens"))
+    result["visionMaxTokens"] = normalize_max_tokens(result.get("visionMaxTokens"))
+    # 解题作答模式：大小写不敏感（与 visionThinkingMode 的容错风格一致），
+    # 白名单外回退默认（core_code）。用字面量而非 import phone_share：避免给
+    # config 层引入 ctypes/PIL 依赖链；两端同步由测试保证。
+    answer_mode = str(result["visionAnswerMode"] or "").strip().lower()
+    result["visionAnswerMode"] = answer_mode if answer_mode in {"core_code", "acm"} else "core_code"
+    # 多图解题张数：1..5（上限与 phone_share.MAX_SOLVE_IMAGES_LIMIT 一致）。
+    # 同样用字面量，避免 config 层 import phone_share 带进 ctypes/PIL。
+    try:
+        max_images = int(result["visionMaxImages"])
+    except (TypeError, ValueError):
+        max_images = int(DEFAULTS["visionMaxImages"])
+    result["visionMaxImages"] = max(1, min(5, max_images))
+    # 题图保留上限：吸附到档位表（非法值回退默认）。
+    result["recordImageCap"] = normalize_record_image_cap(result.get("recordImageCap"))
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(result["textColor"])):
         result["textColor"] = "#FFFFFF"
     if result["frameMode"] not in {"hover", "always"}:
@@ -314,6 +367,8 @@ def overlay_context_block() -> str:
 
     组成顺序：config.json 的四个字段在前（保持既有行为），知识库追加在后。
     总长度统一截断，避免用户填充大量资料后请求因超长而失败。
+    供面试链路使用（字幕 AI 的系统提示词、设置页「回答测试」、手机追问）；
+    截图解题是独立链路，不带这些上下文。
     """
     try:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
@@ -332,6 +387,12 @@ def overlay_context_block() -> str:
             continue
         block = label + "\n" + value
         if used + len(block) > _CONTEXT_TOTAL_LIMIT:
+            # 放不下整块时不静默丢弃：单块就超限（如超长简历）时按剩余额度截断，
+            # 否则用户在截图题/回答测试里会看到"资料像没生效"而无任何提示。
+            remaining = _CONTEXT_TOTAL_LIMIT - used
+            if remaining > len(label) + 1:
+                sections.append(block[:remaining].rstrip() + "…")
+                used = _CONTEXT_TOTAL_LIMIT
             break
         sections.append(block)
         used += len(block)
@@ -385,14 +446,16 @@ def builtin_prompts() -> dict[str, Any]:
         if extra:
             override_prompt += "\n附加要求：" + extra
 
-    from .phone_share import SOLVE_PROMPT
+    # 内置默认随作答模式变化：设置页展示的「默认值」必须与解题实际发送的一致，
+    # 否则用户切到 acm 后看到的默认提示词仍是 core_code 的。
+    from .phone_share import build_solve_prompt
 
     return {
         "contextBlock": context_block,
         "modes": modes,
         "templates": templates,
         "overridePrompt": override_prompt or None,
-        "solveDefault": SOLVE_PROMPT,
+        "solveDefault": build_solve_prompt(settings.get("visionAnswerMode")),
         "solveCustom": str(settings.get("solvePrompt") or "").strip() or None,
         "aiBuiltInPrompt": str(settings.get("aiBuiltInPrompt") or ""),
     }

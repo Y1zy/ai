@@ -20,6 +20,17 @@ header{position:sticky;top:0;z-index:10;padding:12px 16px;background:rgba(10,10,
 main{padding:12px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .img-wrap{border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02)}
 .img-wrap img{width:100%;display:block}
+.img-actions{display:flex;gap:8px;margin-top:8px}
+.img-actions .btn{flex:0 0 auto}
+/* 截图解题设置行：作答模式 + 思考模式。两个按钮等宽平分，窄屏下也放得下。 */
+.shot-settings{display:flex;flex-direction:column;gap:8px;margin:4px 0}
+/* 自动提交那一行：文字可伸长、间隔下拉固定宽度，窄屏下不挤 */
+.auto-row{display:flex;align-items:center;gap:8px}
+.auto-interval{flex:none;width:104px;padding:6px 8px;font-size:calc(var(--fs) - 4px);
+  color:#f1f5f9;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.12);border-radius:8px}
+.solve-opts{display:flex;gap:8px}
+.solve-opts .btn{flex:1 1 0;min-width:0;padding:9px 6px;font-size:calc(var(--fs) - 4px);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .actions{display:flex;gap:8px}
 .btn{flex:1;padding:11px 12px;font-size:calc(var(--fs) - 2px);font-weight:600;border:none;border-radius:10px;cursor:pointer}
 .btn-primary{background:linear-gradient(135deg,#60a5fa,#a78bfa);color:#fff}
@@ -43,17 +54,44 @@ main{padding:12px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .clip-card[open] > summary::before{content:"▾"}
 .clip-brief{margin-left:auto;font-size:calc(var(--fs) - 5px);color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
 .clip-body{padding:0 12px 12px}
+/* 诊断面板：键值对逐行展示，值靠右等宽，便于快速扫读数字 */
+.debug-body{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;font-size:calc(var(--fs) - 4px);line-height:1.7}
+.debug-body .k{color:#94a3b8}
+.debug-body .v{color:#e2e8f0;font-variant-numeric:tabular-nums;word-break:break-word}
+.debug-body .v.warn{color:#fbbf24}
 /* 聊天流限定高度并在内部滚动：回答长短不一时页面高度保持稳定。
    高度按视口给足（一条 500 字回答在默认字号下约需 800px），
    上限用 dvh 保证小屏也不会撑出屏幕。 */
 #chat-flow{max-height:min(62dvh,900px);overflow-y:auto;overscroll-behavior:contain}
-/* 展开模式：仅保留聊天卡片，其余区块收起，聊天区吃满剩余视口高度。
+/* 代码块：解答里的代码用独立深色圆角块展示（等宽字体 + 横向滚动），
+   与正文明显区分，抄代码时缩进不会丢、也不会被气泡宽度挤到折行错乱。
+   长代码横向滚动而不是折行，避免视觉上多出换行造成抄错。 */
+.code-block{display:block;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);
+  border-radius:8px;padding:10px 12px;margin:8px 0;overflow-x:auto;white-space:pre;
+  word-break:normal;overflow-wrap:normal;
+  font-family:'SF Mono','Menlo','Consolas','Cascadia Mono',monospace;
+  font-size:calc(var(--fs) - 4px);line-height:1.5;color:#e2e8f0;-webkit-overflow-scrolling:touch}
+/* 行内代码：与正文同底色区分，不换行。 */
+.inline-code{background:rgba(255,255,255,.09);border-radius:4px;padding:1px 5px;
+  font-family:'SF Mono','Menlo','Consolas','Cascadia Mono',monospace;
+  font-size:calc(var(--fs) - 3px);word-break:break-all}
+/* 吸底操作栏：高频按钮固定在屏幕底部，滚动聊天记录时始终可单手点到。
+   z-index 低于页头，避免盖住状态栏。窄屏（手机竖屏常见 360-430px）下按钮
+   允许多行排布、文字可折行，而不是把某个按钮挤到点不准或看不见。 */
+.actionbar{position:fixed;left:0;right:0;bottom:0;z-index:9;display:flex;flex-wrap:wrap;gap:6px;
+  padding:10px 12px calc(10px + env(safe-area-inset-bottom));
+  background:rgba(10,10,26,.96);backdrop-filter:blur(12px);
+  border-top:1px solid rgba(255,255,255,.08)}
+.actionbar .btn{flex:1 1 30%;min-width:0;padding:9px 6px;font-size:13px;line-height:1.25;
+  white-space:normal;word-break:break-word}
+/* 展开模式：仅保留聊天卡片与吸底栏，其余区块收起，聊天区吃满剩余视口高度。
    同时收紧页头与内边距，把省下的空间全部让给回答（仍受屏幕物理高度限制，
    比整屏还长的回答需在框内滚动）。 */
-body.chat-expanded main > .actions,
 body.chat-expanded main > .switchline,
 body.chat-expanded main > .tip,
+body.chat-expanded #shot-settings,
 body.chat-expanded #img-wrap,
+body.chat-expanded #img-actions,
 body.chat-expanded #save-tip,
 body.chat-expanded #partial,
 body.chat-expanded #clipboard-card,
@@ -63,8 +101,11 @@ body.chat-expanded main{padding:8px 10px 8px}
 body.chat-expanded #chat-card{padding:10px}
 /* 空的状态区不占高度（#err 为空时仍有 line-height 高度） */
 body.chat-expanded #err:empty{display:none}
-/* 高度 = 视口 - 页头 - main 上下内边距 - 卡片内边距 - 卡片标题行 - 输入行 - 间隙 */
-body.chat-expanded #chat-flow{max-height:calc(100dvh - 210px)}
+/* 高度 = 视口 - 页头 - main 上下内边距 - 卡片内边距 - 卡片标题行 - 输入行 - 间隙 - 吸底栏 */
+body.chat-expanded #chat-flow{max-height:calc(100dvh - 280px)}
+/* 非展开模式也要给吸底栏留出空间，否则页面末尾内容被永久遮住 */
+/* 底部留白要盖住吸底栏的高度（按钮可折行，窄屏下会占两行）。 */
+main{padding-bottom:132px}
 .chat-expand-btn{flex:none;padding:4px 10px;font-size:calc(var(--fs) - 6px)}
 .card.old{opacity:.55}
 .partial{font-size:calc(var(--fs) - 2px);color:#64748b;padding:6px 10px;border-left:2px solid rgba(255,255,255,.1);margin:2px 0}
@@ -85,17 +126,16 @@ body.chat-expanded #chat-flow{max-height:calc(100dvh - 210px)}
 </header>
 <main>
   <div id="banner" class="err hidden"></div>
-  <div class="actions">
-    <button id="shot-btn" class="btn btn-primary">📸 立即截屏</button>
-    <button id="solve-btn" class="btn btn-primary">🧠 截题+回答</button>
+  <!-- 截图放最上面：打开页面先看到「电脑现在是什么画面」，这是投屏最主要的信息。
+       保存按钮紧跟其后（它保存的就是这张图），也让吸底栏只留高频动作。 -->
+  <div id="img-wrap" class="img-wrap hidden"><img id="img" alt="电脑屏幕截图"></div>
+  <div id="img-actions" class="img-actions hidden">
     <button id="save-btn" class="btn btn-secondary">💾 保存图片</button>
   </div>
-  <label class="switchline"><input id="auto" type="checkbox">自动刷新截图（每 3 秒）</label>
-  <div id="img-wrap" class="img-wrap hidden"><img id="img" alt="电脑屏幕截图"></div>
   <div class="tip hidden" id="save-tip">提示：iOS 浏览器长按图片也可保存</div>
-  <div id="partial" class="partial hidden"></div>
+  <!-- AI 对话其次：看完画面就看回答与追问。 -->
   <div id="chat-card" class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap">
       <div class="q" style="margin:0">💬 AI 对话（支持追问）</div>
       <span style="display:flex;gap:6px;flex:none">
         <button id="chat-expand" class="btn btn-secondary chat-expand-btn" type="button">⤢ 放大</button>
@@ -105,6 +145,28 @@ body.chat-expanded #chat-flow{max-height:calc(100dvh - 210px)}
     <div id="chat-flow" style="display:flex;flex-direction:column;gap:8px;margin:8px 0"></div>
     <div class="actions" style="margin:8px 0 0"><input id="ask-input" type="text" placeholder="继续追问…"><button id="ask-send" class="btn btn-primary">发送</button></div>
   </div>
+  <!-- 截图设置再往下：它们是「截之前要定的事」，但属于低频调整，不占首屏。
+       注意用 class 控制显隐：这里是 .hidden（display:none），不能写成行内
+       display:flex —— 行内样式优先级高于类，会让按钮在没截图时也一直显示。 -->
+  <div id="shot-settings" class="shot-settings">
+    <div class="auto-row">
+      <label class="switchline" style="flex:1 1 auto;min-width:0"><input id="auto" type="checkbox">自动提交问题</label>
+      <select id="auto-interval" class="auto-interval" title="自动提交的间隔">
+        <option value="3">每 3 秒</option>
+        <option value="5" selected>每 5 秒</option>
+        <option value="10">每 10 秒</option>
+        <option value="15">每 15 秒</option>
+        <option value="30">每 30 秒</option>
+        <option value="60">每 60 秒</option>
+      </select>
+    </div>
+    <div class="tip" style="padding:0;text-align:left;line-height:1.5">开启后按设定间隔自动截屏并交给 AI 解题（等同自动点「截题+回答」）。会持续调用模型、消耗额度；上一题还在解时本轮自动跳过。</div>
+    <div class="solve-opts">
+      <button id="mode-toggle" class="btn btn-secondary" type="button" title="切换截图解题的作答模式">🧩 核心代码</button>
+      <button id="think-toggle" class="btn btn-secondary" type="button" title="切换截图解题的思考模式">🧠 跟随</button>
+    </div>
+  </div>
+  <div id="partial" class="partial hidden"></div>
   <details id="clipboard-card" class="card clip-card">
     <summary>
       <span class="q" style="margin:0">📋 剪贴板双向同步</span>
@@ -123,7 +185,33 @@ body.chat-expanded #chat-flow{max-height:calc(100dvh - 210px)}
   <div id="feed"></div>
   <div id="err"></div>
   <div class="tip">本地直连 · 手机与电脑同一网络 · 低延迟</div>
+  <details id="debug-card" class="card clip-card">
+    <summary>
+      <span class="q" style="margin:0">🩺 诊断</span>
+      <span id="debug-brief" class="clip-brief">点开查看连接与识别状态</span>
+    </summary>
+    <div class="clip-body">
+      <div id="debug-body" class="debug-body"></div>
+      <div class="actions" style="margin-top:8px">
+        <button id="debug-reconnect" class="btn btn-secondary">重新连接</button>
+        <button id="debug-copy" class="btn btn-secondary">复制诊断信息</button>
+        <button id="debug-clear" class="btn btn-secondary">清空错误</button>
+      </div>
+      <div id="debug-err" class="tip hidden"></div>
+    </div>
+  </details>
 </main>
+<!-- 吸底操作栏：放在 main 之外，滚动时始终贴在屏幕底部（面试中单手操作最频繁的动作）。
+     safe-area 内边距兜住 iPhone 的 Home 指示条。 -->
+<div class="actionbar">
+  <button id="shot-btn" class="btn btn-primary">📸 立即截屏</button>
+  <button id="add-img-btn" class="btn btn-secondary" title="题干/约束跨屏时先加几张，再点「截题+回答」一起提交">➕ 加一图</button>
+  <!-- 清空待解截图：只在攒了图之后出现。没有它时到达上限就只能提交，
+       想改截内容得先提交一次（多花一次模型调用）。 -->
+  <button id="clear-img-btn" class="btn btn-secondary hidden" title="丢弃已攒的截图，重新截">✕ 清空</button>
+  <button id="solve-btn" class="btn btn-primary">🧠 截题+回答</button>
+  <button id="bug-btn" class="btn btn-secondary" title="把当前屏幕的代码/报错交给模型找问题">🐛 找 Bug</button>
+</div>
 <script>
 var frag = new URLSearchParams(location.hash.replace(/^#/, ""));
 var sid = frag.get("sid") || "";
@@ -160,8 +248,16 @@ function connect(){
     + "/relay?role=phone&sid=" + encodeURIComponent(sid) + "&t=" + encodeURIComponent(tok);
   try { ws = new WebSocket(wsUrl); } catch(e){ setErr("连接失败"); return; }
   ws.binaryType = "arraybuffer";
-  ws.addEventListener("open", function(){ setStatus(true); setErr(""); });
-  ws.addEventListener("close", function(){ setStatus(false); setTimeout(connect, 2000); });
+  ws.addEventListener("open", function(){
+    setStatus(true); setErr("");
+    netStats.connectAt = Date.now();   // 诊断面板显示本次连接时长
+  });
+  ws.addEventListener("close", function(){
+    setStatus(false);
+    netStats.connectAt = 0;
+    if (debugCard && debugCard.open) renderDebug();
+    setTimeout(connect, 2000);
+  });
   ws.addEventListener("error", function(){});
   ws.addEventListener("message", function(e){
     if (typeof e.data === "string") handleText(e.data);
@@ -176,6 +272,9 @@ function handleBinary(data){
   currentImgUrl = url;
   $img.src = url;
   $imgWrap.classList.remove("hidden");
+  // 保存按钮跟着截图一起出现/隐藏：没图时留着它只会占位置。
+  var actions = document.getElementById("img-actions");
+  if (actions) actions.classList.remove("hidden");
   document.getElementById("save-tip").classList.remove("hidden");
 }
 
@@ -201,10 +300,56 @@ function stripMarkdown(t){
   }).join("\n").replace(/\n{3,}/g,"\n\n");
 }
 
+// 把回答正文渲染进元素：``` 围栏内的代码用独立代码块，其余按正文，行内 `x` 用行内代码样式。
+// 全程用 textContent / createTextNode 构建，不用 innerHTML：回答内容来自模型（可能受截图内容影响），
+// 拼 HTML 会引入注入面；用 DOM 节点既安全又能拿到同样样式。
+function renderChatBody(el, text){
+  el.textContent = "";
+  var source = String(text || "");
+  // 按 ``` 切成「正文 / 代码」交替段：奇数段是代码（围栏内）。
+  var parts = source.split(/^\s*```[^\n]*\n?/m);
+  for (var i = 0; i < parts.length; i++){
+    var chunk = parts[i];
+    if (chunk === "") continue;
+    if (i % 2 === 1){
+      // 代码段：去掉结尾可能残留的围栏行
+      var code = chunk.replace(/\n?^\s*```\s*$/m, "").replace(/\s+$/, "");
+      if (!code) continue;
+      var pre = document.createElement("pre");
+      pre.className = "code-block";
+      pre.textContent = code;
+      el.appendChild(pre);
+    } else {
+      // 正文段：拆出行内代码，其余保持原样（含换行）
+      var pieces = chunk.split("`");
+      for (var j = 0; j < pieces.length; j++){
+        if (pieces[j] === "") continue;
+        if (j % 2 === 1){
+          var inline = document.createElement("code");
+          inline.className = "inline-code";
+          inline.textContent = pieces[j];
+          el.appendChild(inline);
+        } else {
+          el.appendChild(document.createTextNode(pieces[j]));
+        }
+      }
+    }
+  }
+}
+
 function handleText(raw){
   var msg; try { msg = JSON.parse(raw); } catch(_) { return; }
   switch (msg.type) {
-    case "hello": setStatus(true); break;
+    case "hello":
+      setStatus(true);
+      if (msg.visionMode) applyVisionMode(msg.visionMode);  // 断线重连后同步当前模式
+      if (msg.visionThinking !== undefined) applyVisionThinking(msg.visionThinking);
+      // 重连后待解张数要跟服务端一致，否则按钮计数会显示成旧的。
+      applySolvePending(msg.solvePending || 0, msg.solveImageLimit || 3);
+      // 自动提交的勾选与间隔也要回填：状态只活在服务端循环里，
+      // 不恢复的话界面显示未勾选、后台其实还在按间隔提交。
+      applyAutoState(msg.autoSolve, msg.autoIntervalSec);
+      break;
     case "partial":
       if (msg.text) { $partial.textContent = "🎙 " + msg.text; $partial.classList.remove("hidden"); }
       break;
@@ -244,6 +389,11 @@ function handleText(raw){
       lastDesktopTurn = 0;
       $partial.classList.add("hidden");
       $partial.textContent = "";
+      // 上一场攒的待解截图已被服务端清掉，按钮计数同步归零。
+      applySolvePending(0, solveImageLimit);
+      // 服务端会连自动循环一起停掉（见 begin_new_session），勾选状态要跟着复位，
+      // 否则界面显示还在自动提交、实际已经停了。
+      applyAutoState(false, 0);
       setErr("");
       break;
     case "chat_cleared":
@@ -258,8 +408,96 @@ function handleText(raw){
     case "clipboard_ack":
       showClipStatus(msg.ok ? "✓ 已写入电脑剪贴板，电脑上直接 Ctrl+V" : "✗ 写入失败，请重试");
       break;
+    case "pong":
+      if (typeof msg.t === "number") {
+        netStats.rtt = Math.max(0, Date.now() - msg.t);
+        netStats.lastPong = Date.now();
+        if (debugCard && debugCard.open) renderDebug();
+      }
+      break;
+    case "debug":
+      netStats.lastSnapshot = msg;
+      if (debugCard && debugCard.open) renderDebug();
+      break;
+    case "vision_mode":
+      applyVisionMode(msg.mode || "core_code");
+      break;
+    case "vision_thinking":
+      applyVisionThinking(msg.mode || "");
+      break;
+    case "solve_pending":
+      applySolvePending(msg.count || 0, msg.limit || 3);
+      break;
   }
 }
+
+// ---------------------------------------------------------------- 作答模式切换
+// 模式存在电脑端 config（visionAnswerMode），手机只做触发与展示：
+// {type:"vision_mode", mode} → 服务端只写这一个键 → 广播回来统一刷新（多台手机一致）。
+var visionMode = "core_code";
+function applyVisionMode(mode){
+  visionMode = mode === "acm" ? "acm" : "core_code";
+  var btn = document.getElementById("mode-toggle");
+  if (!btn) return;
+  var isAcm = visionMode === "acm";
+  btn.textContent = isAcm ? "🧩 ACM 完整程序" : "🧩 核心代码";
+  btn.title = isAcm
+    ? "当前：ACM 模式（给完整可编译程序）—— 点击切回核心代码"
+    : "当前：核心代码模式（只给关键实现）—— 点击切到 ACM";
+  btn.style.borderColor = isAcm ? "rgba(96,165,250,.5)" : "";
+  btn.style.color = isAcm ? "#93c5fd" : "";
+}
+document.getElementById("mode-toggle").onclick = function(){
+  var next = visionMode === "acm" ? "core_code" : "acm";
+  if (send({ type:"vision_mode", mode: next })) {
+    setErr("");
+    showClipStatus("已切换为" + (next === "acm" ? "ACM 完整程序" : "核心代码") + "模式");
+  }
+};
+
+// 解题思考模式循环：跟随字幕 AI → 关闭 → 自动 → 中度 → 深度 → 跟随。
+// 面试中「关闭」首字最快（约 1 秒）；「中度/深度」显式让模型推理，但实测很慢
+// （中度约 23 秒、深度约 33 秒，推理上万 token），只适合难题或笔试离线场景。
+// 与作答模式同样是「服务端只写一个键 + 广播回来」，多台手机保持一致。
+var visionThinking = "";
+var THINKING_ORDER = ["", "off", "auto", "medium", "high"];
+var THINKING_LABELS = {
+  "": "🧠 跟随",
+  "off": "🧠 关闭思考",
+  "auto": "🧠 自动思考",
+  "medium": "🧠 中度思考",
+  "high": "🧠 深度思考"
+};
+var THINKING_TITLES = {
+  "": "当前：跟随字幕 AI 的思考模式 —— 点击切到「关闭思考」",
+  "off": "当前：关闭思考（首字最快）—— 点击切到「自动思考」",
+  "auto": "当前：自动思考（不干预，由模型决定）—— 点击切到「中度思考」",
+  "medium": "当前：中度思考（显式推理，实测约 23 秒）—— 点击切到「深度思考」",
+  "high": "当前：深度思考（最强推理，实测约 33 秒；建议只用于难题）—— 点击切回「跟随」"
+};
+// 推理档会显著变慢，用不同颜色提示「当前不是实时档」。
+var THINKING_SLOW = { "medium": true, "high": true };
+function applyVisionThinking(mode){
+  visionThinking = THINKING_LABELS[mode] ? mode : "";
+  var btn = document.getElementById("think-toggle");
+  if (!btn) return;
+  btn.textContent = THINKING_LABELS[visionThinking];
+  btn.title = THINKING_TITLES[visionThinking];
+  // 只在非默认态高亮：默认「跟随」与普通按钮无异，避免误导成已开启特殊模式。
+  // 推理档用红色系（比 off/auto 的黄色更醒目），提示会明显变慢。
+  var slow = THINKING_SLOW[visionThinking];
+  var active = visionThinking !== "";
+  btn.style.borderColor = slow ? "rgba(248,113,113,.55)" : (active ? "rgba(251,191,36,.5)" : "");
+  btn.style.color = slow ? "#fca5a5" : (active ? "#fcd34d" : "");
+}
+document.getElementById("think-toggle").onclick = function(){
+  var index = THINKING_ORDER.indexOf(visionThinking);
+  var next = THINKING_ORDER[(index + 1) % THINKING_ORDER.length];
+  if (send({ type:"vision_thinking", mode: next })) {
+    setErr("");
+    showClipStatus("解题思考：" + THINKING_LABELS[next].replace("🧠 ", ""));
+  }
+};
 
 var pcClipText = "";
 var lastPhonePush = "";
@@ -274,10 +512,11 @@ function setClipBrief(text){
 function showPcClipboard(text){
   if (!text) return;
   pcClipText = text;
-  var card = document.getElementById("clipboard-card");
   document.getElementById("pc-clip").textContent = text.length > 600 ? text.slice(0, 600) + "…" : text;
+  // 不自动展开卡片：电脑剪贴板变化频繁（面试中复制粘贴很常见），强制弹开会
+  // 反复顶动页面、打断阅读回答。可发现性由标题行的摘要（setClipBrief）兜住，
+  // 用户想看全文时自己点开——点开后也不再被后续内容强制关闭。
   setClipBrief(text);
-  if (card) card.open = true;
 }
 // 聊天流内滚动到底。不能用 window.scrollTo(document.body.scrollHeight)：
 // 页面底部是字幕历史与页脚，那样会把聊天卡片顶出视野，回答越长推得越远。
@@ -327,7 +566,7 @@ function appendChat(kind, text, streaming, turn){
   if (last && last.dataset && last.dataset.kind === expected
       && last.dataset.open === "1" && sameTurn) {
     last.dataset.open = streaming ? "1" : "0";
-    last.textContent = prefix + text + (streaming ? " ▍" : "");
+    setChatContent(last, prefix, text, streaming);
     if (follow || kind === "me") scrollChatToBottom();
     return;
   }
@@ -361,11 +600,29 @@ function appendChat(kind, text, streaming, turn){
     div.style.background = "rgba(255,255,255,.05)";
     div.style.border = "1px solid rgba(255,255,255,.10)";
   }
-  div.textContent = prefix + text + (streaming ? " ▍" : "");
+  setChatContent(div, prefix, text, streaming);
   $chatFlow.appendChild(div);
   while ($chatFlow.children.length > 50) $chatFlow.removeChild($chatFlow.firstChild);
   // 新气泡出现时，只有用户原本就在底部才跟随（自己发的提问除外）。
   if (follow || kind === "me") scrollChatToBottom();
+}
+
+// 写入气泡内容：流式期间保持纯文本，只在 done 时渲染代码块。
+// 流式期间不能渲染：围栏只闭合到一半（``` 还没配上收尾），会把后半段正文误判成代码。
+// 前缀（🤖/📸）与流式光标 ▍ 用独立节点，渲染时不会被 code 样式影响。
+function setChatContent(el, prefix, text, streaming){
+  el.textContent = "";
+  var head = document.createElement("span");
+  head.textContent = prefix;
+  el.appendChild(head);
+  var body = document.createElement("span");
+  if (streaming){
+    body.textContent = String(text || "") + " ▍";
+  } else {
+    body.style.whiteSpace = "pre-wrap";
+    renderChatBody(body, text);
+  }
+  el.appendChild(body);
 }
 
 function send(obj){
@@ -377,9 +634,50 @@ document.getElementById("shot-btn").onclick = function(){
   if (send({ type:"trigger" })) setErr("");
 };
 document.getElementById("solve-btn").onclick = function(){
-  appendChat("solve", "正在截屏解题…", true);
+  // 待解缓冲非空时提交的是那几张（题干跨屏攒的），否则等价于现场截一张。
+  var tip = pendingSolveCount > 0
+    ? "正在提交 " + pendingSolveCount + " 张截图解题…"
+    : "正在截屏解题…";
+  appendChat("solve", tip, true);
   if (send({ type:"solve" })) setErr("");
 };
+document.getElementById("bug-btn").onclick = function(){
+  // 找 Bug：与解题共用截图与流式通道，只是换成查错的提示词。
+  var tip = pendingSolveCount > 0
+    ? "正在提交 " + pendingSolveCount + " 张截图找 Bug…"
+    : "正在截屏找 Bug…";
+  appendChat("solve", tip, true);
+  if (send({ type:"solve_bug" })) setErr("");
+};
+document.getElementById("add-img-btn").onclick = function(){
+  // 加一图：把当前屏幕攒进待解缓冲，攒够再点「截题+回答」一次性提交。
+  if (send({ type:"solve_add" })) setErr("");
+};
+document.getElementById("clear-img-btn").onclick = function(){
+  if (send({ type:"solve_clear" })) setErr("");
+};
+// 待解张数：服务端通过 solve_pending 广播，按钮上显示 n/上限。
+var pendingSolveCount = 0;
+var solveImageLimit = 3;
+function applySolvePending(count, limit){
+  pendingSolveCount = Math.max(0, Number(count) || 0);
+  solveImageLimit = Math.max(1, Number(limit) || 3);
+  var btn = document.getElementById("add-img-btn");
+  if (btn) {
+    btn.textContent = "➕ 加一图 " + pendingSolveCount + "/" + solveImageLimit;
+    btn.disabled = pendingSolveCount >= solveImageLimit;
+  }
+  // 攒了图之后要能一眼看出「提交的是攒的那几张」，而不是又截了一张。
+  var solveBtn = document.getElementById("solve-btn");
+  if (solveBtn) {
+    solveBtn.textContent = pendingSolveCount > 0
+      ? "🧠 提交 " + pendingSolveCount + " 图"
+      : "🧠 截题+回答";
+  }
+  // 清空按钮只在有图可清时出现，避免常态下多占一个位置。
+  var clearBtn = document.getElementById("clear-img-btn");
+  if (clearBtn) clearBtn.classList.toggle("hidden", pendingSolveCount === 0);
+}
 document.getElementById("ask-send").onclick = function(){
   var q = $askInput.value.trim();
   if (!q) return;
@@ -392,8 +690,39 @@ document.getElementById("chat-clear").onclick = function(){
 };
 $askInput.addEventListener("keydown", function(e){ if (e.key === "Enter") document.getElementById("ask-send").click(); });
 document.getElementById("save-btn").onclick = saveScreenshot;
-document.getElementById("auto").onchange = function(e){
-  send({ type:"auto", on: e.target.checked, interval: 3000 });
+// 自动提交状态回填（hello 帧）。服务端是唯一真相：勾选与间隔都以它为准。
+function applyAutoState(on, intervalSec){
+  var box = document.getElementById("auto");
+  if (box) box.checked = !!on;
+  var sel = document.getElementById("auto-interval");
+  if (sel && intervalSec) {
+    var want = String(intervalSec);
+    // 只接受下拉里存在的档位，避免服务端返回一个未列出的值把选择框置空
+    var known = Array.prototype.some.call(sel.options, function(o){ return o.value === want; });
+    if (known) sel.value = want;
+  }
+}
+// 自动提交问题：勾选后按设定间隔自动截屏 + 自动解题（等同反复点「截题+回答」）。
+// 勾选状态只活在服务端循环里，所以每次变更都把 on/interval/solve 一起发过去；
+// 刷新页面时由 hello 帧回填（否则界面显示未勾选、服务端却还在跑）。
+function currentAutoIntervalMs(){
+  var sel = document.getElementById("auto-interval");
+  return (sel && Number(sel.value) ? Number(sel.value) : 5) * 1000;
+}
+function sendAutoState(){
+  var on = document.getElementById("auto").checked;
+  send({ type:"auto", on: on, interval: currentAutoIntervalMs(), solve: true });
+}
+document.getElementById("auto").onchange = function(){
+  sendAutoState();
+  if (this.checked) showClipStatus("已开启自动提交：每 " + currentAutoIntervalMs()/1000 + " 秒自动截屏并解题");
+};
+// 间隔改动后，若已在运行要立刻按新间隔重启循环（否则要等下一次重新勾选才生效）
+document.getElementById("auto-interval").onchange = function(){
+  if (document.getElementById("auto").checked) {
+    sendAutoState();
+    showClipStatus("自动提交间隔已改为每 " + currentAutoIntervalMs()/1000 + " 秒");
+  }
 };
 document.getElementById("copy-btn").onclick = function(){
   if (!pcClipText) return;
@@ -490,6 +819,125 @@ function showClipStatus(message){
   clipStatus.classList.remove("hidden");
   setTimeout(function(){ clipStatus.classList.add("hidden"); }, 3000);
 }
+
+// ---------------------------------------------------------------- 诊断面板
+// 数据来源：WS {type:"debug"} 快照（服务端只放白名单字段：连接数/识别状态/
+// 队列积压/错误等，不含任何凭据或用户资料）。手机在局域网调不到 /api/* 管理接口
+// （那些要求回环地址），所以诊断只能走 relay。
+var netStats = { rtt: null, lastPong: 0, lastSnapshot: null, connectAt: 0 };
+
+function debugRow(key, value, warn){
+  var k = document.createElement("span"); k.className = "k"; k.textContent = key;
+  var v = document.createElement("span"); v.className = "v" + (warn ? " warn" : ""); v.textContent = value;
+  return [k, v];
+}
+
+function renderDebug(){
+  var box = document.getElementById("debug-body");
+  if (!box) return;
+  var snap = netStats.lastSnapshot || {};
+  box.innerHTML = "";
+  var rows = [];
+  // 本地可测的（不依赖快照）
+  var online = (ws && ws.readyState === WebSocket.OPEN);
+  rows.push(["连接", online ? "✓ 已连接" : "✗ 未连接", !online]);
+  if (netStats.connectAt) {
+    var up = Math.round((Date.now() - netStats.connectAt) / 1000);
+    rows.push(["本次连接时长", up + " 秒"]);
+  }
+  rows.push(["往返延迟", netStats.rtt == null ? "测量中…"
+    : (netStats.rtt + " ms" + (netStats.rtt > 500 ? "（偏高）" : "")), netStats.rtt > 500]);
+  if (!snap.type) {
+    rows.push(["电脑端快照", "等待中…（面板打开后约 2 秒）"]);
+  } else {
+    rows.push(["识别状态", String(snap.asrState || "?") + " · " + String(snap.asrLanguage || "?"),
+      snap.asrState !== "capturing"]);
+    rows.push(["解题引擎", snap.solveBusy ? "进行中" : "空闲"]);
+    rows.push(["连接设备数", String(snap.phones == null ? "?" : snap.phones)]);
+    rows.push(["场次编号", String(snap.session == null ? "?" : snap.session)]);
+    rows.push(["最近题图", (snap.images || 0) + " 字节"]);
+    rows.push(["剪贴板缓存", (snap.clipboardChars || 0) + " 字"]);
+    if (snap.wsQueue != null) {
+      rows.push(["服务端待发队列", String(snap.wsQueue) + (snap.wsQueue > 50 ? "（积压）" : ""),
+        snap.wsQueue > 50]);
+    }
+    if (snap.wsClients != null) rows.push(["服务端在线浏览器", String(snap.wsClients)]);
+    rows.push(["AI Key", snap.aiKeySet ? "✓ 已配置" : "✗ 未配置", !snap.aiKeySet]);
+    rows.push(["视觉模型 Key", snap.visionKeySet ? "✓ 已配置" : "✗ 未配置", !snap.visionKeySet]);
+    rows.push(["本场识别条目", String(snap.recordFinals == null ? "?" : snap.recordFinals)]);
+    rows.push(["本场解题次数", String(snap.recordSolves == null ? "?" : snap.recordSolves)]);
+    if (snap.lastError) {
+      rows.push(["最近错误", String(snap.lastError), true]);
+      if (snap.lastErrorAt) rows.push(["错误时间", String(snap.lastErrorAt).slice(11, 19)]);
+    } else {
+      rows.push(["最近错误", "无"]);
+    }
+  }
+  rows.forEach(function(pair){
+    debugRow(pair[0], pair[1], pair[2]).forEach(function(el){ box.appendChild(el); });
+  });
+  var brief = document.getElementById("debug-brief");
+  if (brief) {
+    brief.textContent = (online ? "已连接" : "未连接")
+      + (netStats.rtt != null ? " · " + netStats.rtt + "ms" : "")
+      + (snap.asrState ? " · " + snap.asrState : "");
+  }
+}
+
+function setDebugErr(message){
+  var el = document.getElementById("debug-err");
+  if (!el) return;
+  el.textContent = message || "";
+  if (message) el.classList.remove("hidden"); else el.classList.add("hidden");
+}
+
+// 诊断面板打开时订阅快照（服务端每 2 秒推一次），关闭即退订省流量。
+var debugCard = document.getElementById("debug-card");
+if (debugCard) {
+  debugCard.addEventListener("toggle", function(){
+    if (debugCard.open) {
+      send({ type:"debug", on:true });
+      send({ type:"ping", t: Date.now() });
+      renderDebug();
+      setTimeout(function(){ send({ type:"ping", t: Date.now() }); }, 600);
+    } else {
+      send({ type:"debug", on:false });
+    }
+  });
+}
+document.getElementById("debug-reconnect").onclick = function(){
+  setDebugErr("");
+  try { if (ws) ws.close(); } catch(_){}
+  // 复用既有的 close 处理器自动重连（2 秒后），这里只给用户即时反馈
+  setDebugErr("正在重新连接…");
+  setTimeout(function(){ setDebugErr(ws && ws.readyState === WebSocket.OPEN ? "" : "重连中，若一直失败请检查是否同一网络"); }, 3000);
+};
+document.getElementById("debug-copy").onclick = function(){
+  var snap = netStats.lastSnapshot || {};
+  var lines = ["VoxRibbon 手机诊断",
+    "时间: " + new Date().toLocaleString(),
+    "连接: " + (ws && ws.readyState === WebSocket.OPEN ? "已连接" : "未连接"),
+    "往返延迟: " + (netStats.rtt == null ? "未知" : netStats.rtt + " ms"),
+    "识别: " + (snap.asrState || "?") + " / " + (snap.asrLanguage || "?") + " 语言",
+    "解题引擎: " + (snap.solveBusy ? "进行中" : "空闲"),
+    "设备数: " + (snap.phones == null ? "?" : snap.phones),
+    "服务端队列: " + (snap.wsQueue == null ? "?" : snap.wsQueue),
+    "AI Key: " + (snap.aiKeySet ? "已配置" : "未配置"),
+    "视觉 Key: " + (snap.visionKeySet ? "已配置" : "未配置"),
+    "最近错误: " + (snap.lastError || "无")];
+  var text = lines.join("\n");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function(){ setDebugErr("诊断信息已复制"); },
+      function(){ setDebugErr("复制失败，请手动选择文本"); });
+  } else {
+    window.prompt("复制以下内容：", text);
+  }
+};
+document.getElementById("debug-clear").onclick = function(){
+  setErr("");
+  setDebugErr("已清空本机错误提示");
+  setTimeout(function(){ setDebugErr(""); }, 2000);
+};
 
 // 字号档位：点「Aa」循环切换，记住选择。默认「大」——面试时手机常放在远处看。
 var FS_STEPS = [{name:"小",px:15},{name:"中",px:17},{name:"大",px:19},{name:"特大",px:22}];

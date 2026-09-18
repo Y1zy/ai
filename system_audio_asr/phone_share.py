@@ -31,6 +31,14 @@ CONFIG_PATH = APP_DIR / "config.json"
 
 MAX_IMAGE_WIDTH = 1600
 JPEG_QUALITY = 75
+# 一次解题最多挂几张截图。题干/约束/样例跨屏时用得上，但每张（1600px、q75）
+# base64 后约 183 KB，全都会进模型输入，因此默认 3 张、上限 5 张。
+DEFAULT_MAX_SOLVE_IMAGES = 3
+MAX_SOLVE_IMAGES_LIMIT = 5
+# 自动提交问题的可选间隔（秒）。手机上以档位下拉呈现，服务端用同一张表校验，
+# 避免手机端传任意值（如 0.1 秒）把模型额度瞬间烧光。
+AUTO_INTERVAL_LEVELS = (3, 5, 10, 15, 30, 60)
+DEFAULT_AUTO_INTERVAL_SECONDS = 5
 TRANSCRIPT_EVENT_TYPES = {"partial", "final", "status"}
 MAX_CLIPBOARD_CHARS = 50000
 CLIPBOARD_POLL_SECONDS = 0.2
@@ -44,12 +52,84 @@ GMEM_MOVEABLE = 0x0002
 
 VISION_KEY_PATH = APP_DIR / "vision.key"
 VISION_ENTROPY = b"WasapiParaformerOverlay.Vision.v1"
-SOLVE_PROMPT = (
-    "请识别图中的题目或问题，直接给出简洁的答案与关键步骤。"
-    "如果是代码题给出核心代码；如果是选择题先给选项字母再解释。"
+# 解题作答模式：core_code = 只给核心实现（历史默认）；acm = 完整可编译程序。
+# 两者共用同一前缀与后缀，只有中间的「作答要求」块不同——这样 core_code
+# 拼出来与历史上的 SOLVE_PROMPT 逐字一致（行为零变化）。
+ANSWER_MODE_CORE_CODE = "core_code"
+ANSWER_MODE_ACM = "acm"
+ANSWER_MODES = (ANSWER_MODE_CORE_CODE, ANSWER_MODE_ACM)
+DEFAULT_ANSWER_MODE = ANSWER_MODE_CORE_CODE
+
+_SOLVE_PROMPT_PREFIX = "请识别图中的题目或问题，直接给出简洁的答案与关键步骤。"
+# 代码必须用 ``` 围栏包裹：手机气泡与桌面字幕窗会据此渲染成独立的等宽代码块
+# （此前禁止一切 Markdown，代码与正文混在一起、缩进丢失，抄代码容易漏行）。
+# 加粗/标题仍然禁止——它们在两种渲染里都没有对应样式，只会留下多余符号。
+_SOLVE_PROMPT_SUFFIX = (
     "不要复述题目，不要输出多余客套话。"
-    "直接输出纯文本，不要使用 Markdown 标记（如 **加粗**、# 标题、代码块围栏）。"
+    "代码必须用 ``` 代码块围栏包裹（标明语言），正文不要使用其他 Markdown 标记"
+    "（如 **加粗**、# 标题）。"
 )
+
+# core_code：只给核心代码实现（默认）。
+_SOLVE_PROMPT_CORE_CODE_BODY = "如果是代码题给出核心代码；如果是选择题先给选项字母再解释。"
+
+# acm：完整可编译程序——头文件、main、输入输出、样例走查。
+# 语言默认 C++：解题链路不带简历（题干在截图里已完整），模型无从得知候选人技术栈，
+# 不写明会随机给 Python，而笔试/ACM 场景通常要能直接提交的完整程序。
+_SOLVE_PROMPT_ACM_BODY = (
+    "如果是代码题，请给出完整可编译运行的程序：包含必要的头文件、完整的输入读取与"
+    "结果输出，能直接提交到在线评测。默认使用 C++（含 #include、main 函数、cin/cout "
+    "读写）；若题目明确要求其他语言则遵循题目。先用一两句话说明算法思路与复杂度，"
+    "再给完整代码，最后用一个样例走查验证。"
+    "如果是选择题先给选项字母再解释。"
+)
+
+
+def build_solve_prompt(mode: Any = DEFAULT_ANSWER_MODE) -> str:
+    """按作答模式拼装内置解题提示词（用户自定义 solvePrompt 优先级更高）。"""
+    body = _SOLVE_PROMPT_ACM_BODY if normalize_answer_mode(mode) == ANSWER_MODE_ACM else _SOLVE_PROMPT_CORE_CODE_BODY
+    return _SOLVE_PROMPT_PREFIX + body + _SOLVE_PROMPT_SUFFIX
+
+
+# 找 Bug 任务：与「解题」是两件事（一个给答案、一个查错），因此不走作答模式，
+# 而是一个独立的内置提示词。允许代码围栏，便于两端渲染修复后的代码。
+BUG_PROMPT = (
+    "请检查图中代码或报错信息的问题。"
+    "先用一两句话指出问题出在哪里、为什么错（引用关键的变量名或行）；"
+    "如果有多个问题，按严重程度依次列出。"
+    "然后给出修复后的代码，代码必须用 ``` 代码块围栏包裹（标明语言）。"
+    "正文不要使用其他 Markdown 标记（如 **加粗**、# 标题）。"
+    "不要复述代码全文，不要输出多余客套话。"
+)
+
+# 解题任务类型：solve = 解出题目（走作答模式）/ bug = 找 Bug（走 BUG_PROMPT）
+SOLVE_TASK_SOLVE = "solve"
+SOLVE_TASK_BUG = "bug"
+SOLVE_TASKS = (SOLVE_TASK_SOLVE, SOLVE_TASK_BUG)
+
+
+def normalize_solve_task(value: Any) -> str:
+    """把任意输入规范到受支持的任务类型；无法识别时回退解题（行为零变化）。"""
+    task = str(value or "").strip().lower()
+    return task if task in SOLVE_TASKS else SOLVE_TASK_SOLVE
+
+
+def build_solve_prompt_for_task(mode: Any, task: Any = SOLVE_TASK_SOLVE) -> str:
+    """按任务类型给出内置提示词：找 Bug 用专用提示词，解题用作答模式。"""
+    if normalize_solve_task(task) == SOLVE_TASK_BUG:
+        return BUG_PROMPT
+    return build_solve_prompt(mode)
+
+
+def normalize_answer_mode(value: Any) -> str:
+    """把任意输入规范到受支持的作答模式；无法识别时回退默认（行为零变化）。"""
+    mode = str(value or "").strip().lower()
+    return mode if mode in ANSWER_MODES else DEFAULT_ANSWER_MODE
+
+
+# 默认（core_code）内置提示词：与历史文本逐字一致。保留该名字，
+# 设置页「解题提示词」的默认值展示与历史引用都指向它。
+SOLVE_PROMPT = build_solve_prompt(DEFAULT_ANSWER_MODE)
 SOLVE_STREAM_FLUSH_SECONDS = 0.15
 
 _user32 = ctypes.windll.user32
@@ -341,20 +421,112 @@ def load_vision_config() -> dict[str, Any]:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
     except (OSError, ValueError):
         raw = {}
-    # 视觉模型独立配置，但思考模式与文字助手共用同一个开关：
-    # 解题也是面试实时场景，思考会显著拉长首字延迟。
-    from .ai_stream import normalize_thinking_mode
+    from .ai_stream import THINKING_MODES, normalize_max_tokens, normalize_thinking_mode
+
+    # 思考模式："" = 跟随字幕 AI；其余取值（off/auto/medium/high）在解题独立生效。
+    # 解题是独立链路（算法题/笔试题为主），与实时字幕的取舍不同，
+    # 故留独立开关而不是硬绑 aiThinkingMode。
+    # 白名单必须用共享常量而不是字面量集合：写死 {"off","auto"} 会让新增的
+    # medium/high 静默退化成「跟随字幕 AI」，界面上看不出任何异常。
+    thinking = str(raw.get("visionThinkingMode") or "").strip().lower()
+    if thinking not in THINKING_MODES:
+        thinking = normalize_thinking_mode(raw.get("aiThinkingMode"))
 
     return {
         "enabled": bool(raw.get("visionEnabled", False)),
         "baseUrl": str(raw.get("visionBaseUrl", "")).rstrip("/"),
         "model": str(raw.get("visionModel", "")),
-        "resume": str(raw.get("resumeContext", "")),
-        "jd": str(raw.get("jdContext", "")),
-        # 允许用户在设置里自定义解题提示词；为空回落内置默认。
-        "prompt": str(raw.get("solvePrompt", "")).strip() or SOLVE_PROMPT,
-        "thinkingMode": normalize_thinking_mode(raw.get("aiThinkingMode")),
+        # 简历/JD/知识库不在此处返回：解题不需要面试上下文（题干在截图里完整）。
+        # 作答模式决定内置提示词（core_code 只给核心实现 / acm 给完整可编译程序）；
+        # 用户自定义 solvePrompt 优先级最高，一旦填写就与模式无关。
+        "answerMode": normalize_answer_mode(raw.get("visionAnswerMode")),
+        "prompt": (
+            str(raw.get("solvePrompt", "")).strip()
+            or build_solve_prompt(raw.get("visionAnswerMode"))
+        ),
+        "thinkingMode": thinking,
+        # 回答长度独立档位：算法题核心代码较长，被截断就没法抄。
+        "maxTokens": normalize_max_tokens(raw.get("visionMaxTokens")),
+        # 一次解题最多挂几张截图（题干跨屏时用；越多 token 越多）。
+        "maxImages": normalize_max_solve_images(raw.get("visionMaxImages")),
     }
+
+
+def normalize_max_solve_images(value: Any) -> int:
+    """把一次解题的截图张数规范到受支持范围：1..5，非法值回退默认 3。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_SOLVE_IMAGES
+    return max(1, min(MAX_SOLVE_IMAGES_LIMIT, number))
+
+
+def normalize_auto_interval_ms(value: Any) -> float:
+    """把任意输入规范到受支持的间隔档位，返回毫秒（供 asyncio.sleep 用）。
+
+    非法值与越界值都吸附到最近档位：自动提交会真实消耗模型额度，
+    不能让手机端传极小值（如 0.1 秒）把额度瞬间烧光。
+    """
+    try:
+        seconds = float(value) / 1000.0
+    except (TypeError, ValueError):
+        seconds = float(DEFAULT_AUTO_INTERVAL_SECONDS)
+    snapped = min(AUTO_INTERVAL_LEVELS, key=lambda level: (abs(level - seconds), level))
+    return snapped * 1000.0
+
+
+def _read_config_value(key: str) -> Any:
+    """只读 config.json 的单个键；文件缺失/损坏时返回 None（不抛异常）。"""
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
+    except (OSError, ValueError):
+        return None
+    return raw.get(key) if isinstance(raw, dict) else None
+
+
+def _write_single_config_key(key: str, normalized: Any) -> Any:
+    """只改写 config.json 的一个键（手机端切换类操作的唯一写入口）。
+
+    手机在局域网，调不到 /api/settings（require_local 只放行回环地址），所以
+    切换必须走 relay。为避免手机端越权改配置，这里刻意只接受键名与已白名单
+    规范化的值，其余字段一律不碰、原样保留。
+    """
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    raw[key] = normalized
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = CONFIG_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, CONFIG_PATH)
+    return normalized
+
+
+def set_vision_answer_mode(mode: Any) -> str:
+    """手机端切换作答模式：**只写 visionAnswerMode 这一个键**。"""
+    return _write_single_config_key("visionAnswerMode", normalize_answer_mode(mode))
+
+
+def normalize_vision_thinking_mode(value: Any) -> str:
+    """解题思考模式的独立取值："" = 跟随字幕 AI，或 off/auto/medium/high。
+
+    与字幕 AI 的区别是多了 "" 这一档（跟随）。非法值回退 ""（跟随），
+    且白名单来自 ai_stream.THINKING_MODES，新增档位时无需在这里改字面量。
+    """
+    from .ai_stream import THINKING_MODES
+
+    mode = str(value or "").strip().lower()
+    return mode if mode in THINKING_MODES else ""
+
+
+def set_vision_thinking_mode(mode: Any) -> str:
+    """手机端切换解题思考模式：**只写 visionThinkingMode 这一个键**。"""
+    return _write_single_config_key(
+        "visionThinkingMode", normalize_vision_thinking_mode(mode)
+    )
 
 
 class SolveEngine:
@@ -368,15 +540,30 @@ class SolveEngine:
     def busy(self) -> bool:
         return self._busy.locked()
 
-    def solve(self, jpeg: bytes) -> None:
-        """后台线程执行；结果与错误都通过 on_delta 回调（text/done）通知。"""
+    def solve(self, images: bytes | list[bytes], task: Any = SOLVE_TASK_SOLVE) -> None:
+        """后台线程执行；结果与错误都通过 on_delta 回调（text/done）通知。
+
+        支持一次提交多张截图：算法题的题干、约束、样例常分散在多屏，
+        单张截图会漏掉条件，导致答案按错误的题意给出。
+        为兼容既有调用（桌面热键），也接受单张 bytes。
+
+        task：solve = 解出题目（走作答模式）；bug = 找 Bug（走 BUG_PROMPT）。
+        """
         if not self._busy.acquire(blocking=False):
             self._emit("上一个解题请求还在进行中，请稍候", True)
             return
 
+        batch = [images] if isinstance(images, (bytes, bytearray)) else list(images)
+        batch = [image for image in batch if image]
+        if not batch:
+            self._busy.release()
+            self._emit("没有可提交的截图", True)
+            return
+        normalized_task = normalize_solve_task(task)
+
         def runner() -> None:
             try:
-                self._run_stream(jpeg)
+                self._run_stream(batch, normalized_task)
             except Exception as exc:
                 self._emit(f"解题失败：{exc}", True)
             finally:
@@ -392,7 +579,7 @@ class SolveEngine:
             except Exception:
                 pass
 
-    def _run_stream(self, jpeg: bytes) -> None:
+    def _run_stream(self, images: list[bytes], task: str = SOLVE_TASK_SOLVE) -> None:
         import httpx
 
         vision = load_vision_config()
@@ -412,36 +599,47 @@ class SolveEngine:
         except ValueError as exc:
             raise RuntimeError(f"视觉模型 {exc}") from exc
 
-        data_url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
-        context_parts = []
-        if vision["resume"]:
-            context_parts.append("[Resume]\n" + vision["resume"][:4000])
-        if vision["jd"]:
-            context_parts.append("[JD]\n" + vision["jd"][:2000])
-        context_block = ("\n\n".join(context_parts) + "\n\n") if context_parts else ""
-        user_text = context_block + vision["prompt"]
+        # 多张截图按提交顺序拼接（同一道题的不同部分）。图片之间不插入文字说明，
+        # 由提示词统一交代「多张属于同一道题」，避免打断模型对图序的理解。
+        image_parts = [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(image).decode("ascii")},
+            }
+            for image in images
+        ]
+        # 解题是独立链路：题干在截图里已完整，不带简历/JD/知识库等面试上下文
+        # （算法题/笔试题用不上，白占 token 与首字延迟）。
+        # 找 Bug 是另一件事（查错而非求解），用它自己的内置提示词；
+        # 自定义 solvePrompt 只作用于解题，不覆盖找 Bug（否则自定义解题模板
+        # 会让「找 Bug」按钮去做解题，用户无从察觉）。
+        user_text = vision["prompt"] if task == SOLVE_TASK_SOLVE else BUG_PROMPT
+        if len(image_parts) > 1:
+            subject = "这道题的不同部分" if task == SOLVE_TASK_SOLVE else "同一段代码/报错的不同部分"
+            user_text = (
+                f"以下 {len(image_parts)} 张截图是{subject}（按顺序给出），"
+                "请把它们合起来理解，不要当成多个独立问题。\n\n" + user_text
+            )
 
         messages = [
             {
                 "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                    {"type": "text", "text": user_text},
-                ],
+                "content": image_parts + [{"type": "text", "text": user_text}],
             }
         ]
 
         from .ai_stream import stream_chat_completion
 
-        # max_tokens 放大到 2048：部分网关把思考 token 也计入上限，
-        # 1500 在长题目下可能返回 200 但 content 为空。
+        # max_tokens 用解题独立档位（默认 2048）：部分网关把思考 token 也计入上限，
+        # 1500 在长题目下可能返回 200 但 content 为空；算法题核心代码较长，
+        # 需要更多时在设置页单独调大（不影响字幕 AI）。
         final_text = stream_chat_completion(
             url=vision["baseUrl"] + "/chat/completions",
             api_key=api_key,
             model=vision["model"],
             messages=messages,
             on_snapshot=self._emit,
-            max_tokens=2048,
+            max_tokens=vision.get("maxTokens"),
             temperature=0.2,
             flush_seconds=SOLVE_STREAM_FLUSH_SECONDS,
             validate=False,  # 上面已用更具体的文案校验过
@@ -544,6 +742,14 @@ class PhoneRelay:
         self._phones: set[Any] = set()
         self._latest_jpeg: bytes | None = None
         self._auto_generation = 0
+        # 自动提交（定时截屏 + 自动解题）的当前状态：勾选状态只活在服务端循环里，
+        # 手机刷新页面后要能通过 hello 帧恢复，故单独记录。
+        self._auto_solve = False
+        self._auto_interval_ms = DEFAULT_AUTO_INTERVAL_SECONDS * 1000.0
+        # 待解截图缓冲：题干跨多屏时先「加一图」攒起来，再一次性提交（多图一题）。
+        # 单独加锁：截屏走线程池、WebSocket 消息走事件循环，两个线程都会改它。
+        self._pending_solve_images: list[bytes] = []
+        self._pending_lock = threading.Lock()
         # 场次编号：开始新一场时自增，用于丢弃旧场次在途的解题流；
         # _solve_generation 记录当前正在跑的解题属于哪一场。
         self._session_generation = 0
@@ -553,6 +759,10 @@ class PhoneRelay:
         self.solve_engine = SolveEngine()
         self.solve_engine.on_delta = self._on_solve_delta
         self.desktop_publisher: Any = None  # callable(payload: dict) 桌面字幕窗分发
+        # Debug 快照供应方（server.create_app 注入）：返回白名单字段的字典。
+        # 用回调而非直接引用 server，避免 phone_share ↔ server 循环导入。
+        self.debug_snapshot_provider: Any = None  # callable() -> dict
+        self._debug_subscribed = False
         # 手机端追问上下文：最近的问答对（user/assistant 交替，上限 12 条）。
         self.phone_chat_history: list[dict] = []
         self._chat_lock = threading.Lock()
@@ -586,30 +796,121 @@ class PhoneRelay:
         """标记新一场开始：停自动截图、丢弃缓存帧，并让旧场次的在途流失效。"""
         self._session_generation += 1
         self.stop_auto_capture()
+        # 上一场攒下的待解截图不能带进新一场：否则新一场的第一次提交会混入旧题。
+        self.clear_pending_solve_images()
 
-    def request_solve(self) -> bool:
+    def _debug_payload(self) -> dict:
+        """诊断快照（白名单字段集合）。
+
+        手机在局域网、调不到 /api/* 的管理接口（那些要求回环地址），所以诊断
+        信息只能经 relay 下发。这里只放排障必需且不敏感的事实：
+        绝不包含 API Key、完整 config、含凭据的 baseUrl 或用户资料。
+        """
+        data: dict = {
+            "type": "debug",
+            "sentAt": time.time(),
+            "phones": len(self._phones),
+            "session": self._session_generation,
+            "solveBusy": self.solve_engine.busy,
+            "images": len(self._latest_jpeg) if self._latest_jpeg else 0,
+            "clipboardChars": len(self.latest_clipboard_text or ""),
+        }
+        provider = self.debug_snapshot_provider
+        if provider is not None:
+            try:
+                extra = provider()
+                if isinstance(extra, dict):
+                    data.update(extra)
+            except Exception:
+                data["snapshotError"] = True
+        return data
+
+    def _push_debug_if_subscribed(self) -> None:
+        """仅供内部定时调用：订阅开启时下发一次快照。"""
+        if self._debug_subscribed:
+            try:
+                self.schedule_json(self._debug_payload())
+            except Exception:
+                pass
+
+    def request_solve(self, task: Any = SOLVE_TASK_SOLVE, quiet_busy: bool = False) -> bool:
         """触发一次截图解题；返回 False 表示引擎未启用或正在进行。
+
+        待解缓冲非空时提交缓冲里的全部截图（多图一题），否则现场截一张立即提交
+        （桌面热键 Ctrl+Shift+C 与手机直接点「截题+回答」都走这条，行为与历史一致）。
+
+        task：solve = 解出题目；bug = 找 Bug（同一套截图与流式通道，换提示词）。
 
         busy 时主动推一条 done 提示给手机：否则手机点了「截题+回答」后
         只会看到自己插入的"正在截屏解题…"气泡永远不封口，以为卡住了。
+        quiet_busy=True（自动提交）时不推该提示：自动模式下用户没点任何按钮，
+        每隔几秒就弹一条"请求还在进行中"只是噪音，且解题本来就可能比间隔慢。
         """
         if self.solve_engine.busy:
-            self._on_solve_delta("上一个解题请求还在进行中，请稍候", True)
-            return False
-        try:
-            jpeg = capture_screen_jpeg()
-        except Exception:
-            self._on_solve_delta("电脑端屏幕采集失败", True)
+            if not quiet_busy:
+                self._on_solve_delta("上一个解题请求还在进行中，请稍候", True)
             return False
         from .recorder import session_recorder
 
-        session_recorder.add_solve_image(jpeg)
-        self._latest_jpeg = jpeg
-        self._drain_bytes_threadsafe(jpeg)
+        with self._pending_lock:
+            pending = list(self._pending_solve_images)
+            had_pending = bool(pending)
+            self._pending_solve_images.clear()
+        # 只在确实清掉了待解图时才广播：常态（直接截一张）不发多余消息，
+        # 避免给手机加噪音、也保持「先来截图帧」的既有顺序。
+        if had_pending:
+            self._push_pending_state(0)
+        if pending:
+            images = pending
+        else:
+            try:
+                images = [capture_screen_jpeg()]
+            except Exception:
+                self._on_solve_delta("电脑端屏幕采集失败", True)
+                return False
+        # 多张图共用同一个批次号，落盘时才能整批归到这一次解题上。
+        session_recorder.add_solve_images(images)
+        self._latest_jpeg = images[-1]
+        self._drain_bytes_threadsafe(images[-1])
         # 记录本次解题属于哪一场，供 _on_solve_delta 判断增量是否已过期
         self._solve_generation = self._session_generation
-        self.solve_engine.solve(jpeg)
+        self.solve_engine.solve(images, task)
         return True
+
+    def add_pending_solve_image(self) -> int:
+        """把当前屏幕追加到待解缓冲，返回缓冲张数；0 表示已满或采集失败。
+
+        题干跨多屏时用：连点几次「加一图」把各部分都截进来，再点「截题+回答」
+        一次性提交。上限由 visionMaxImages 配置决定。
+        """
+        limit = max(1, int(load_vision_config().get("maxImages") or DEFAULT_MAX_SOLVE_IMAGES))
+        try:
+            jpeg = capture_screen_jpeg()
+        except Exception:
+            return -1
+        with self._pending_lock:
+            if len(self._pending_solve_images) >= limit:
+                return 0
+            self._pending_solve_images.append(jpeg)
+            count = len(self._pending_solve_images)
+        self._push_pending_state(count)
+        # 手机端同时看到最新一张，便于确认截到的是不是想要的那屏
+        self._latest_jpeg = jpeg
+        self._drain_bytes_threadsafe(jpeg)
+        return count
+
+    def clear_pending_solve_images(self) -> None:
+        with self._pending_lock:
+            self._pending_solve_images.clear()
+        self._push_pending_state(0)
+
+    def _push_pending_state(self, count: int) -> None:
+        """待解张数变化时广播给所有手机。"""
+        limit = max(1, int(load_vision_config().get("maxImages") or DEFAULT_MAX_SOLVE_IMAGES))
+        try:
+            self.schedule_json({"type": "solve_pending", "count": count, "limit": limit})
+        except Exception:
+            pass
 
     def _drain_bytes_threadsafe(self, data: bytes) -> None:
         if not self._phones:
@@ -638,7 +939,26 @@ class PhoneRelay:
                 pass
         self._phones.add(websocket)
         try:
-            await websocket.send_json({"type": "hello", "sid": sid})
+            await websocket.send_json({
+                "type": "hello",
+                "sid": sid,
+                # 当前作答模式：手机端据此高亮切换按钮（core_code / acm）。
+                "visionMode": normalize_answer_mode(
+                    _read_config_value("visionAnswerMode")
+                ),
+                # 当前解题思考模式："" = 跟随字幕 AI / off / auto。
+                "visionThinking": normalize_vision_thinking_mode(
+                    _read_config_value("visionThinkingMode")
+                ),
+                # 待解截图张数与上限：重连后按钮上的计数要对得上。
+                "solvePending": len(self._pending_solve_images),
+                "solveImageLimit": load_vision_config().get("maxImages")
+                or DEFAULT_MAX_SOLVE_IMAGES,
+                # 自动提交的当前状态：重连后复选框与间隔下拉要显示服务端的实际值
+                # （勾选状态只存在于服务端循环里，刷新页面不会自己恢复）。
+                "autoSolve": self._auto_solve,
+                "autoIntervalSec": int(self._auto_interval_ms / 1000),
+            })
             latest = self._latest_jpeg
             if latest:
                 await websocket.send_bytes(latest)
@@ -661,7 +981,15 @@ class PhoneRelay:
                 if kind == "trigger":
                     self._spawn(self._capture_and_push())
                 elif kind == "solve":
-                    self._spawn(self._handle_solve())
+                    self._spawn(self._handle_solve(SOLVE_TASK_SOLVE))
+                elif kind == "solve_bug":
+                    # 找 Bug：与解题同一套截图/流式通道，只是换内置提示词。
+                    self._spawn(self._handle_solve(SOLVE_TASK_BUG))
+                elif kind == "solve_add":
+                    # 追加一张待解截图（题干跨屏时连点几次，再一次性提交）。
+                    self._spawn(self._handle_solve_add())
+                elif kind == "solve_clear":
+                    self.clear_pending_solve_images()
                 elif kind == "ask":
                     phone_text = str(payload.get("text", ""))[:4000]
                     if phone_text:
@@ -671,11 +999,35 @@ class PhoneRelay:
                         self.phone_chat_history.clear()
                     self.schedule_json({"type": "chat_cleared"})
                 elif kind == "auto":
-                    self._set_auto(bool(payload.get("on")), payload.get("interval"))
+                    # solve=true 时为「自动提交问题」（定时截屏并自动解题），
+                    # 否则是原「自动刷新截图」（只推送画面）。
+                    self._set_auto(
+                        bool(payload.get("on")),
+                        payload.get("interval"),
+                        solve=bool(payload.get("solve")),
+                    )
                 elif kind == "clipboard":
                     phone_text = str(payload.get("text", ""))[:MAX_CLIPBOARD_CHARS]
                     if phone_text:
                         self._spawn(self._handle_clipboard(phone_text))
+                elif kind == "vision_mode":
+                    # 手机端切写作答模式：只写 visionAnswerMode 一个键，白名单校验后
+                    # 向所有手机广播当前值（多台手机时保持一致）。
+                    applied = set_vision_answer_mode(payload.get("mode"))
+                    self.schedule_json({"type": "vision_mode", "mode": applied})
+                elif kind == "vision_thinking":
+                    # 手机端切换解题思考模式：同样只写 visionThinkingMode 一个键。
+                    # 三态 "" = 跟随字幕 AI / off / auto。
+                    applied = set_vision_thinking_mode(payload.get("mode"))
+                    self.schedule_json({"type": "vision_thinking", "mode": applied})
+                elif kind == "ping":
+                    # 手机端测 RTT：原样回带时间戳，不做任何计算。
+                    self.schedule_json({"type": "pong", "t": payload.get("t")})
+                elif kind == "debug":
+                    # 只允许开关订阅，不接受任何写入参数（手机不能改配置）。
+                    self._debug_subscribed = bool(payload.get("on"))
+                    if self._debug_subscribed:
+                        self.schedule_json(self._debug_payload())
         except Exception:
             pass
         finally:
@@ -684,8 +1036,26 @@ class PhoneRelay:
             if not self._phones:
                 self.stop_auto_capture()
 
-    async def _handle_solve(self) -> None:
-        await asyncio.to_thread(self.request_solve)
+    async def _handle_solve(self, task: str = SOLVE_TASK_SOLVE) -> None:
+        await asyncio.to_thread(self.request_solve, task)
+
+    async def _handle_solve_add(self) -> None:
+        """追加一张待解截图；失败/已满时回一条提示，避免手机端无声无息。"""
+        added = await asyncio.to_thread(self.add_pending_solve_image)
+        if added == -1:
+            self.schedule_json(
+                {"type": "ai", "text": "电脑端屏幕采集失败", "done": True, "source": "solve"}
+            )
+        elif added == 0:
+            limit = load_vision_config().get("maxImages") or DEFAULT_MAX_SOLVE_IMAGES
+            self.schedule_json(
+                {
+                    "type": "ai",
+                    "text": f"已达上限（{limit} 张），请先点「截题+回答」提交，或点清空重来",
+                    "done": True,
+                    "source": "solve",
+                }
+            )
 
     async def _handle_ask(self, question: str) -> None:
         """手机文字提问：系统提示词 + 最近对话历史（追问）+ 本次问题走真实 AI 管线。"""
@@ -802,20 +1172,30 @@ class PhoneRelay:
             if not self._phones:
                 self.stop_auto_capture()
 
-    def _set_auto(self, on: bool, interval_ms: Any) -> None:
+    def _set_auto(self, on: bool, interval_ms: Any, solve: bool = False) -> None:
+        """开关自动循环。
+
+        solve=False：只定时截屏推送到手机（原「自动刷新截图」）。
+        solve=True ：定时截屏并**自动提交给 AI 解题**（「自动提交问题」）。
+                    引擎忙碌时跳过本轮而不是排队——解题常要十几秒到几十秒，
+                    排队会让积压的请求在面试结束后还在跑。
+        """
         self._auto_generation += 1
+        interval = normalize_auto_interval_ms(interval_ms)
+        self._auto_solve = bool(solve)
+        self._auto_interval_ms = interval
         if not on or self._running_loop() is None:
+            self._auto_solve = False
             return
-        try:
-            interval = float(interval_ms)
-        except (TypeError, ValueError):
-            interval = 3000.0
-        interval = max(1000.0, min(10000.0, interval)) / 1000.0
         generation = self._auto_generation
 
         async def auto_loop() -> None:
             while generation == self._auto_generation:
-                await self._capture_and_push()
+                if solve:
+                    # quiet_busy：自动模式下不因「上一次还在跑」刷提示（见 request_solve）。
+                    await asyncio.to_thread(self.request_solve, SOLVE_TASK_SOLVE, True)
+                else:
+                    await self._capture_and_push()
                 await asyncio.sleep(interval)
 
         self._spawn(auto_loop())
@@ -837,9 +1217,10 @@ class PhoneRelay:
             self._call_soon_threadsafe(self._drain_bytes, jpeg)
 
     def stop_auto_capture(self) -> None:
-        """停止自动刷新截图并丢弃缓存帧（手机断开、开始新一场时调用）。
+        """停止自动刷新/自动提交并丢弃缓存帧（手机断开、开始新一场时调用）。
 
         仅递增 generation 让 auto_loop 自然退出，不在此处打断正在进行的截屏。
         """
         self._auto_generation += 1
+        self._auto_solve = False
         self._latest_jpeg = None

@@ -209,7 +209,9 @@ def test_vision_config_reads_shared_config(tmp_path: Path, monkeypatch):
     assert vision["enabled"] is True
     assert vision["baseUrl"] == "https://example.com/v1"  # 尾斜杠已去掉
     assert vision["model"] == "test-vision"
-    assert vision["resume"] == "简历内容"
+    # 简历不再从这里返回：截图解题是独立链路，请求体不带面试上下文
+    # （见 test_solve_payload_has_no_interview_context）。
+    assert "resume" not in vision
 
 
 def test_solve_engine_streams_and_throttles(monkeypatch):
@@ -219,8 +221,6 @@ def test_solve_engine_streams_and_throttles(monkeypatch):
         "enabled": True,
         "baseUrl": "https://vision.example/v1",
         "model": "test-vision",
-        "resume": "简历",
-        "jd": "",
         "prompt": phone_share.SOLVE_PROMPT,
     })
     monkeypatch.setattr(phone_share, "load_vision_key", lambda: "vk-123")
@@ -277,14 +277,218 @@ def test_solve_engine_streams_and_throttles(monkeypatch):
     joined = "".join(text for text, _ in events)
     assert "答案A" in joined and "答案B" in joined
     assert events[-1][1] is True  # 最后一条 done=True
-    assert any("[Resume]" in text for text, _ in events) is False  # 简历在 user_text，不在 delta 里
+    assert any("[Resume]" in text for text, _ in events) is False  # 解题不带面试上下文
+
+
+def test_solve_payload_has_no_interview_context(monkeypatch, tmp_path):
+    """截图解题是独立链路：请求体里不能出现简历/JD/知识库等面试上下文。
+
+    解题面向算法题/笔试题，题干在截图里已完整，带上下文纯属白占 token
+    与首字延迟（早期实现还硬编码截断 4000/2000，简历变长会静默丢失）。
+    """
+    engine = phone_share.SolveEngine()
+    events: list[tuple[str, bool]] = []
+    captured: dict = {}
+
+    # 配好简历/JD/知识库，断言它们不会出现在解题请求里
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "resumeContext": "RESUME_MARKER_XYZ",
+        "jdContext": "JD_MARKER_XYZ",
+        "targetCompany": "COMPANY_MARKER_XYZ",
+        "visionEnabled": True,
+        "visionBaseUrl": "https://vision.example/v1",
+        "visionModel": "test-vision",
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(phone_share, "load_vision_key", lambda: "vk-123")
+
+    class FakeResponse:
+        status_code = 200
+
+        def iter_lines(self):
+            return iter(['data: {"choices":[{"delta":{"content":"ok"}}]}', "data: [DONE]"])
+
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stream(self, method, url, json=None, headers=None):
+            captured["text"] = json["messages"][0]["content"][1]["text"]
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.Client", FakeClient)
+    monkeypatch.setattr("system_audio_asr.settings.validate_public_http_url", lambda url: url)
+    engine.on_delta = lambda text, done: events.append((text, done))
+    engine.solve(b"\xff\xd8fake")
+    while engine.busy:
+        time.sleep(0.01)
+
+    text = captured.get("text", "")
+    assert text, "未捕获到解题请求"
+    for marker in ("RESUME_MARKER_XYZ", "JD_MARKER_XYZ", "COMPANY_MARKER_XYZ", "[Resume]", "[JD]"):
+        assert marker not in text, f"解题请求混入了面试上下文: {marker}"
+
+
+def test_solve_thinking_mode_is_independent(monkeypatch, tmp_path):
+    """解题思考模式独立于字幕 AI：visionThinkingMode=auto 时不应被 aiThinkingMode=off 覆盖。"""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "visionThinkingMode": "auto",   # 解题：思考
+        "aiThinkingMode": "off",        # 字幕：不思考
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+    assert phone_share.load_vision_config()["thinkingMode"] == "auto"
+
+    # 反过来：解题 off + 字幕 auto
+    config_path.write_text(json.dumps({
+        "visionThinkingMode": "off",
+        "aiThinkingMode": "auto",
+    }, ensure_ascii=False), encoding="utf-8")
+    assert phone_share.load_vision_config()["thinkingMode"] == "off"
+
+
+def test_solve_thinking_mode_follows_when_unset(monkeypatch, tmp_path):
+    """未设置（空串）时跟随字幕 AI：保持历史行为，避免升级后行为突变。"""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "visionThinkingMode": "",
+        "aiThinkingMode": "off",
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+    assert phone_share.load_vision_config()["thinkingMode"] == "off"
+
+    # 非法值同样回退到"跟随"
+    config_path.write_text(json.dumps({
+        "visionThinkingMode": "forced",
+        "aiThinkingMode": "auto",
+    }, ensure_ascii=False), encoding="utf-8")
+    assert phone_share.load_vision_config()["thinkingMode"] == "auto"
+
+
+def test_solve_max_tokens_is_independent(monkeypatch, tmp_path):
+    """解题长度上限独立于字幕 AI 档位（算法题代码长，可单独调大）。"""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "visionMaxTokens": 8192,   # 解题：长
+        "aiMaxTokens": 256,        # 字幕：短
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+    assert phone_share.load_vision_config()["maxTokens"] == 8192
+
+    # 缺键回退默认 2048
+    config_path.write_text(json.dumps({}, ensure_ascii=False), encoding="utf-8")
+    assert phone_share.load_vision_config()["maxTokens"] == 2048
+
+
+# ---------------------------------------------------------------- 作答模式
+# core_code（默认）= 只给核心实现；acm = 完整可编译程序（面向笔试/ACM）。
+
+
+def test_solve_prompt_core_code_is_stable() -> None:
+    """默认模式的提示词锁定为当前文本，防止无意改动。
+
+    注意：此文本**已与最初版本有意不同**——后缀从「不要使用 Markdown 标记
+    （… 代码块围栏）」改成了「代码必须用 ``` 代码块围栏包裹」。原因是手机气泡
+    与桌面字幕窗现在会按围栏渲染等宽代码块，而此前禁止围栏导致代码与正文混在
+    一起、缩进丢失，抄代码容易漏行。改这句是渲染生效的前提。
+    加粗/标题仍被禁止（两种渲染都没有对应样式，只会留下多余符号）。
+    """
+    expected = (
+        "请识别图中的题目或问题，直接给出简洁的答案与关键步骤。"
+        "如果是代码题给出核心代码；如果是选择题先给选项字母再解释。"
+        "不要复述题目，不要输出多余客套话。"
+        "代码必须用 ``` 代码块围栏包裹（标明语言），正文不要使用其他 Markdown 标记"
+        "（如 **加粗**、# 标题）。"
+    )
+    assert phone_share.SOLVE_PROMPT == expected
+    assert phone_share.build_solve_prompt() == expected
+    assert phone_share.build_solve_prompt("core_code") == expected
+    # 提示词必须真的要求围栏，否则两端的代码块渲染都拿不到输入。
+    assert "```" in phone_share.SOLVE_PROMPT
+
+
+def test_solve_prompt_acm_asks_for_complete_program() -> None:
+    """acm 模式要完整可编译程序：含头文件/main/输入输出，并默认用 C++。"""
+    acm = phone_share.build_solve_prompt("acm")
+    assert acm != phone_share.build_solve_prompt("core_code"), "两种模式产出相同提示词"
+    for marker in ("完整可编译", "头文件", "main", "C++", "输入", "输出"):
+        assert marker in acm, f"acm 提示词缺少关键要求: {marker}"
+
+
+def test_solve_prompt_mode_falls_back_to_core_code() -> None:
+    """非法模式回退 core_code，不抛异常；大小写不敏感（"ACM" 视为 acm）。"""
+    for bad in ("", None, "full", "unknown", "core"):
+        assert phone_share.build_solve_prompt(bad) == phone_share.SOLVE_PROMPT, bad
+    assert phone_share.normalize_answer_mode("bogus") == "core_code"
+    # 大小写不敏感：与 visionThinkingMode 的容错风格一致
+    assert phone_share.normalize_answer_mode("ACM") == "acm"
+    assert phone_share.normalize_answer_mode("  Acm  ") == "acm"
+    assert phone_share.build_solve_prompt("ACM") == phone_share.build_solve_prompt("acm")
+
+
+def test_load_vision_config_uses_answer_mode(monkeypatch, tmp_path) -> None:
+    """未自定义 solvePrompt 时，提示词随作答模式变化。"""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "visionAnswerMode": "acm",
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+    vision = phone_share.load_vision_config()
+    assert vision["answerMode"] == "acm"
+    assert "完整可编译" in vision["prompt"]
+
+    # 非法值回退 core_code
+    config_path.write_text(json.dumps({"visionAnswerMode": "bogus"}, ensure_ascii=False), encoding="utf-8")
+    vision = phone_share.load_vision_config()
+    assert vision["answerMode"] == "core_code"
+    assert vision["prompt"] == phone_share.SOLVE_PROMPT
+
+
+def test_custom_solve_prompt_overrides_answer_mode(monkeypatch, tmp_path) -> None:
+    """用户自定义解题提示词优先级最高，与作答模式无关。"""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "visionAnswerMode": "acm",
+        "solvePrompt": "只输出答案字母，不要解释。",
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+    assert phone_share.load_vision_config()["prompt"] == "只输出答案字母，不要解释。"
+
+
+def test_settings_normalizes_answer_mode() -> None:
+    """settings 层的枚举校验与 phone_share 的白名单一致（两端同步、大小写不敏感）。"""
+    from system_audio_asr.settings import normalize_settings
+
+    assert normalize_settings({"visionAnswerMode": "acm"})["visionAnswerMode"] == "acm"
+    assert normalize_settings({"visionAnswerMode": "core_code"})["visionAnswerMode"] == "core_code"
+    # 大小写不敏感（与 phone_share.normalize_answer_mode 一致）
+    assert normalize_settings({"visionAnswerMode": "ACM"})["visionAnswerMode"] == "acm"
+    assert normalize_settings({"visionAnswerMode": "AcM"})["visionAnswerMode"] == "acm"
+    for bad in ("bogus", "", None, "core"):
+        assert normalize_settings({"visionAnswerMode": bad})["visionAnswerMode"] == "core_code", bad
 
 
 def test_solve_engine_rejects_when_disabled(monkeypatch):
     engine = phone_share.SolveEngine()
     events: list[tuple[str, bool]] = []
     monkeypatch.setattr(phone_share, "load_vision_config", lambda: {
-        "enabled": False, "baseUrl": "", "model": "", "resume": "", "jd": "",
+        "enabled": False, "baseUrl": "", "model": "",
         "prompt": phone_share.SOLVE_PROMPT,
     })
     engine.on_delta = lambda text, done: events.append((text, done))
@@ -382,6 +586,251 @@ class TestRelayEndpoints:
         assert response.status_code == 200
         assert response.json()["ok"] is True
 
+    # ---------------------------------------------------------- 诊断（ping/debug）
+    # 手机在局域网、调不到 /api/* 管理接口（require_local 只放行回环地址），
+    # 所以诊断必须走 relay。
+
+    def test_relay_ping_echoes_timestamp(self, client, phone_path: Path):
+        """ping 原样回带时间戳，供手机算 RTT。"""
+        config = phone_share.load_phone_config(phone_path)
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            assert websocket.receive_json()["type"] == "hello"
+            websocket.send_text(json.dumps({"type": "ping", "t": 1234567}))
+            pong = websocket.receive_json()
+            assert pong["type"] == "pong"
+            assert pong["t"] == 1234567
+
+    def test_relay_debug_snapshot_has_no_secrets(self, client, phone_path: Path):
+        """诊断快照只含白名单字段：绝不带 API Key / 完整配置 / 凭据型 URL。"""
+        config = phone_share.load_phone_config(phone_path)
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            assert websocket.receive_json()["type"] == "hello"
+            websocket.send_text(json.dumps({"type": "debug", "on": True}))
+            snapshot = websocket.receive_json()
+            assert snapshot["type"] == "debug"
+            assert "phones" in snapshot and "session" in snapshot
+            # 快照里出现任何键名或值都不该涉及凭据
+            serialized = json.dumps(snapshot, ensure_ascii=False).lower()
+            for forbidden in ("apikey", "api_key", "sk-", "token", "baseurl", "password", "deepseek.key"):
+                assert forbidden not in serialized, f"诊断快照泄露了敏感字段: {forbidden}"
+
+    def test_relay_debug_rejects_config_writes(self, client, phone_path: Path, monkeypatch):
+        """手机不能借 debug 消息改配置——只接受 on 开关，其余参数被忽略。"""
+        config_before = phone_share.load_phone_config(phone_path)
+        config = config_before
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            assert websocket.receive_json()["type"] == "hello"
+            websocket.send_text(json.dumps({
+                "type": "debug", "on": True,
+                "aiBaseUrl": "http://evil.example/v1",   # 越权尝试
+                "resumeContext": "注入的简历",
+                "visionEnabled": False,
+            }))
+            websocket.receive_json()  # 快照照常返回
+        after = phone_share.load_phone_config(phone_path)
+        assert after == config_before, "手机端 debug 消息越权改动了配置"
+
+    # ---------------------------------------------------------- 作答模式切换
+    # 手机在局域网调不到 /api/settings（require_local），所以切换走 relay；
+    # 服务端只允许写 visionAnswerMode 这一个键。
+
+    def test_relay_vision_mode_switches_and_broadcasts(self, client, phone_path: Path, monkeypatch, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"visionAnswerMode": "core_code"}), encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+        config = phone_share.load_phone_config(phone_path)
+
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            hello = websocket.receive_json()
+            assert hello["type"] == "hello"
+            assert hello["visionMode"] == "core_code"      # hello 下发当前模式
+            websocket.send_text(json.dumps({"type": "vision_mode", "mode": "acm"}))
+            echoed = websocket.receive_json()
+            assert echoed == {"type": "vision_mode", "mode": "acm"}
+
+        saved = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        assert saved["visionAnswerMode"] == "acm"
+
+    def test_relay_vision_mode_rejects_other_config_keys(self, client, phone_path: Path, monkeypatch, tmp_path):
+        """手机不能借 vision_mode 消息改其它配置键。"""
+        config_path = tmp_path / "config.json"
+        original = {
+            "visionAnswerMode": "core_code",
+            "resumeContext": "真实简历",
+            "aiBaseUrl": "http://127.0.0.1:7863/v1",
+            "visionEnabled": True,
+        }
+        config_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+        config = phone_share.load_phone_config(phone_path)
+
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            websocket.receive_json()
+            websocket.send_text(json.dumps({
+                "type": "vision_mode", "mode": "acm",
+                "resumeContext": "注入",          # 越权尝试
+                "aiBaseUrl": "http://evil/v1",
+                "visionEnabled": False,
+            }))
+            websocket.receive_json()
+
+        saved = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        assert saved["visionAnswerMode"] == "acm", "合法的模式切换没生效"
+        for key in ("resumeContext", "aiBaseUrl", "visionEnabled"):
+            assert saved[key] == original[key], f"手机端越权改动了 {key}"
+
+    def test_relay_vision_mode_invalid_value_falls_back(self, client, phone_path: Path, monkeypatch, tmp_path):
+        """非法模式值回退 core_code，不会把配置写坏。"""
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"visionAnswerMode": "acm"}), encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+        config = phone_share.load_phone_config(phone_path)
+
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            websocket.receive_json()
+            websocket.send_text(json.dumps({"type": "vision_mode", "mode": "rm -rf /"}))
+            echoed = websocket.receive_json()
+            assert echoed["mode"] == "core_code"
+
+    def test_relay_vision_thinking_switches_and_broadcasts(
+        self, client, phone_path: Path, monkeypatch, tmp_path
+    ):
+        """手机端切解题思考模式：只写 visionThinkingMode，并向所有手机广播。"""
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"visionThinkingMode": ""}), encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+        config = phone_share.load_phone_config(phone_path)
+
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            websocket.receive_json()
+            websocket.send_text(json.dumps({"type": "vision_thinking", "mode": "auto"}))
+            echoed = websocket.receive_json()
+            assert echoed["type"] == "vision_thinking"
+            assert echoed["mode"] == "auto"
+
+        saved = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        assert saved["visionThinkingMode"] == "auto"
+
+    def test_relay_vision_thinking_rejects_other_config_keys(
+        self, client, phone_path: Path, monkeypatch, tmp_path
+    ):
+        """手机不能借 vision_thinking 消息改其它配置键（越权防护）。"""
+        config_path = tmp_path / "config.json"
+        original = {
+            "visionThinkingMode": "",
+            "resumeContext": "真实简历",
+            "aiBaseUrl": "http://127.0.0.1:7863/v1",
+            "visionAnswerMode": "core_code",
+        }
+        config_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+        config = phone_share.load_phone_config(phone_path)
+
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            websocket.receive_json()
+            websocket.send_text(json.dumps({
+                "type": "vision_thinking", "mode": "off",
+                "resumeContext": "注入",          # 越权尝试
+                "aiBaseUrl": "http://evil/v1",
+                "visionAnswerMode": "acm",
+            }))
+            websocket.receive_json()
+
+        saved = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        assert saved["visionThinkingMode"] == "off", "合法的思考模式切换没生效"
+        for key in ("resumeContext", "aiBaseUrl", "visionAnswerMode"):
+            assert saved[key] == original[key], f"手机端越权改动了 {key}"
+
+    def test_relay_vision_thinking_invalid_value_falls_back(
+        self, client, phone_path: Path, monkeypatch, tmp_path
+    ):
+        """非法思考模式值回退「跟随字幕 AI」（空串），不会把配置写坏。"""
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"visionThinkingMode": "auto"}), encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+        config = phone_share.load_phone_config(phone_path)
+
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            websocket.receive_json()
+            websocket.send_text(json.dumps({"type": "vision_thinking", "mode": "rm -rf /"}))
+            echoed = websocket.receive_json()
+            assert echoed["mode"] == ""
+
+    def test_normalize_vision_thinking_mode(self) -> None:
+        """白名单：空串（跟随）/off/auto/medium/high 合法，其余一律回退空串。"""
+        assert phone_share.normalize_vision_thinking_mode("off") == "off"
+        assert phone_share.normalize_vision_thinking_mode("AUTO") == "auto"
+        assert phone_share.normalize_vision_thinking_mode("") == ""
+        assert phone_share.normalize_vision_thinking_mode(None) == ""
+        for bad in ("on", "true", "跟随", "disable", "0"):
+            assert phone_share.normalize_vision_thinking_mode(bad) == "", bad
+
+    def test_normalize_vision_thinking_accepts_reasoning_tiers(self) -> None:
+        """medium/high 必须被接受：否则手机切到这两档会静默退回「跟随」。"""
+        assert phone_share.normalize_vision_thinking_mode("medium") == "medium"
+        assert phone_share.normalize_vision_thinking_mode("HIGH") == "high"
+        # 与 ai_stream 的档位表保持同步，新增档位时这里会提醒
+        from system_audio_asr.ai_stream import THINKING_MODES
+
+        for mode in THINKING_MODES:
+            assert phone_share.normalize_vision_thinking_mode(mode) == mode, mode
+
+    def test_load_vision_config_honours_reasoning_tiers(self, monkeypatch, tmp_path) -> None:
+        """解题链路的白名单必须放行 medium/high。
+
+        这里曾写死 {"off","auto"}，新增档位后会让它在 load_vision_config 里
+        静默退化成「跟随字幕 AI」——手机按钮显示切到了深度思考，实际却没生效。
+        """
+        for tier in ("medium", "high"):
+            config_path = tmp_path / f"config-{tier}.json"
+            config_path.write_text(
+                json.dumps({"visionThinkingMode": tier, "aiThinkingMode": "off"}),
+                encoding="utf-8",
+            )
+            monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+            loaded = phone_share.load_vision_config()
+            assert loaded["thinkingMode"] == tier, (
+                f"{tier} 档被静默降级成了 {loaded['thinkingMode']}"
+            )
+
+    def test_relay_vision_thinking_accepts_reasoning_tiers(
+        self, client, phone_path: Path, monkeypatch, tmp_path
+    ) -> None:
+        """手机端切到推理档要能落盘，而不是被白名单挡回空串。"""
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"visionThinkingMode": ""}), encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+        config = phone_share.load_phone_config(phone_path)
+
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            websocket.receive_json()
+            websocket.send_text(json.dumps({"type": "vision_thinking", "mode": "high"}))
+            echoed = websocket.receive_json()
+            assert echoed["mode"] == "high"
+
+        saved = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        assert saved["visionThinkingMode"] == "high"
+
     def test_relay_clipboard_message_writes_pc_clipboard(
         self, client, phone_path: Path, monkeypatch
     ):
@@ -409,8 +858,6 @@ class TestRelayEndpoints:
             "enabled": True,
             "baseUrl": "https://vision.example/v1",
             "model": "test-vision",
-            "resume": "",
-            "jd": "",
             "prompt": phone_share.SOLVE_PROMPT,
         })
         monkeypatch.setattr(phone_share, "load_vision_key", lambda: "vk-123")
@@ -473,7 +920,7 @@ class TestRelayEndpoints:
     def test_phone_solve_endpoint(self, client, phone_path: Path, monkeypatch):
         monkeypatch.setattr(phone_share, "capture_screen_jpeg", lambda: b"\xff\xd8stub")
         monkeypatch.setattr(phone_share, "load_vision_config", lambda: {
-            "enabled": False, "baseUrl": "", "model": "", "resume": "", "jd": "",
+            "enabled": False, "baseUrl": "", "model": "",
         })
         response = client.post("/api/phone/solve")
         assert response.status_code == 200

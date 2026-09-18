@@ -40,3 +40,6 @@ Thumbs.db
 deepseek-harness-codearts/
 dsh-reasoning-effort/
 .dsh-vision-toolkit/
+
+# 编辑器插件的运行时目录（如 video-agent-kit 写入的 plugin_root），非项目内容
+.video_agent/
