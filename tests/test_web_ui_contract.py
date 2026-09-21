@@ -194,6 +194,51 @@ def test_phone_renders_code_blocks_in_bubble() -> None:
     assert "streaming" in script
 
 
+def test_phone_code_blocks_render_through_production_path() -> None:
+    """代码块必须经**生产路径**（stripMarkdown → renderChatBody）真实渲染出来。
+
+    这条用例的价值在于纠正一类错误测法：单独调用 renderChatBody 传入带围栏的原文
+    会通过，但真实链路是 handleText → stripMarkdown → appendChat → setChatContent，
+    stripMarkdown 曾把围栏行删成空行、把反引号全删掉，导致代码块永远渲染不出来。
+    因此这里调用 tools/check_phone_render.py：它从 phone.html 抽出真实函数体，
+    在 node 里按生产顺序组合执行并断言产出。
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        import pytest
+
+        pytest.skip("未安装 node，跳过手机端渲染链路检查")
+    root = Path(__file__).resolve().parents[1]
+    done = subprocess.run(
+        [str(root / ".venv" / "Scripts" / "python.exe"), str(root / "tools" / "check_phone_render.py")]
+        if (root / ".venv" / "Scripts" / "python.exe").exists()
+        else ["python", str(root / "tools" / "check_phone_render.py")],
+        capture_output=True,
+        shell=False,
+        check=False,
+    )
+    output = done.stdout.decode("utf-8", errors="replace") + done.stderr.decode(
+        "utf-8", errors="replace"
+    )
+    assert done.returncode == 0, "生产路径下的代码块渲染失败：\n" + output
+
+
+def test_strip_markdown_keeps_fences() -> None:
+    """stripMarkdown 必须保留围栏与行内反引号 —— 它们是下游渲染的唯一依据。
+
+    只做源码契约断言（真实行为由上面的生产路径检查覆盖）。
+    """
+    script = _script(_PHONE)
+    start = script.index("function stripMarkdown")
+    body = script[start : start + 1400]
+    assert "inCode" in body, "stripMarkdown 未区分代码段与正文段"
+    # 围栏行必须原样 push（不能再 return ""）
+    assert "out.push(line)" in body, "stripMarkdown 仍在丢弃围栏行"
+    assert 'replace(/`/g,"")' not in body, "stripMarkdown 仍在删行内反引号"
+
+
 def test_phone_code_rendering_avoids_innerhtml_for_model_text() -> None:
     """回答内容来自模型（可能受截图影响），渲染它时不得拼 innerHTML。
 
@@ -302,6 +347,34 @@ def test_phone_save_button_hidden_in_expand_mode() -> None:
     body = hide_list.group(1)
     assert "#img-wrap" in body, "展开模式未隐藏截图"
     assert "#img-actions" in body, "展开模式未隐藏保存按钮（会与隐藏的截图脱节）"
+
+
+def test_hotword_cleanup_requires_confirmation() -> None:
+    """热词清理必须让用户确认后才删。
+
+    长度区分不了碎片与合法术语（「消息队列中间件」与「像素数据解码与」都是 7 字），
+    而删掉再保存会永久覆盖手动热词，因此必须把将删的词列给用户确认。
+    """
+    script = _script(_SETTINGS)
+    start = script.index("function cleanHotwordFragments")
+    body = script[start : start + 2200]
+    assert "window.confirm" in body, "热词清理没有确认步骤（会静默删掉合法长词）"
+    # 取消必须直接返回，不改动输入框
+    assert "已取消" in body, "缺少取消分支的反馈"
+    # 取消分支要在赋值之前返回
+    cancel_at = body.index("if(!confirmed)")
+    assign_at = body.index("$('hotwordExtra').value=final.join")
+    assert cancel_at < assign_at, "取消判断放在了赋值之后（取消也会删）"
+    # 提示里要列出将删的词
+    assert "removed.slice(0,10)" in body or "preview" in body, "未列出将删除的词"
+
+
+def test_hotword_cleanup_button_label_is_honest() -> None:
+    """按钮文案要如实说明按字数删，而不是含糊的「清理碎片」。"""
+    text = _html(_SETTINGS)
+    assert "移除超 6 字的中文词" in text, "按钮文案未说明实际判定规则"
+    hint = re.search(r'id="hotwordCleanHint"[^>]*>([^<]*)<', text)
+    assert hint and "合法术语" in hint.group(1), "提示未说明可能误删合法术语"
 
 
 def test_phone_actionbar_wraps_on_narrow_screens() -> None:

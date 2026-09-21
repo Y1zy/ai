@@ -39,6 +39,10 @@ MAX_SOLVE_IMAGES_LIMIT = 5
 # 避免手机端传任意值（如 0.1 秒）把模型额度瞬间烧光。
 AUTO_INTERVAL_LEVELS = (3, 5, 10, 15, 30, 60)
 DEFAULT_AUTO_INTERVAL_SECONDS = 5
+# 自动提交连续失败多少次后自停。模型未启用 / 网关不通这类问题不会自愈，
+# 一直重试只会每几秒推一条同样的错误：聊天气泡上限 50 条，按 3 秒间隔算
+# 约 2.5 分钟就把上限填满，把之前真正的解题回答与追问全挤掉。
+AUTO_FAILURE_LIMIT = 3
 TRANSCRIPT_EVENT_TYPES = {"partial", "final", "status"}
 MAX_CLIPBOARD_CHARS = 50000
 CLIPBOARD_POLL_SECONDS = 0.2
@@ -112,6 +116,11 @@ def normalize_solve_task(value: Any) -> str:
     """把任意输入规范到受支持的任务类型；无法识别时回退解题（行为零变化）。"""
     task = str(value or "").strip().lower()
     return task if task in SOLVE_TASKS else SOLVE_TASK_SOLVE
+
+
+# 解题失败的统一前缀：失败消息都以此为开头，自动循环据此识别本轮结果。
+# 用常量而不是各处写字面量：前缀一改，自动提交的降噪/自停会静默失效。
+_SOLVE_FAILURE_PREFIX = "解题失败："
 
 
 def build_solve_prompt_for_task(mode: Any, task: Any = SOLVE_TASK_SOLVE) -> str:
@@ -453,10 +462,15 @@ def load_vision_config() -> dict[str, Any]:
 
 
 def normalize_max_solve_images(value: Any) -> int:
-    """把一次解题的截图张数规范到受支持范围：1..5，非法值回退默认 3。"""
+    """把一次解题的截图张数规范到受支持范围：1..5，非法值回退默认 3。
+
+    必须捕获 OverflowError：JSON 里的 1e400 / Infinity 解析成 inf 后 int() 会抛，
+    而它不是 ValueError —— 漏掉会让 load_vision_config 失败，进而影响手机配对、
+    hello 帧与解题链路（与 settings.normalize_record_image_cap 同一坑）。
+    """
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return DEFAULT_MAX_SOLVE_IMAGES
     return max(1, min(MAX_SOLVE_IMAGES_LIMIT, number))
 
@@ -565,7 +579,7 @@ class SolveEngine:
             try:
                 self._run_stream(batch, normalized_task)
             except Exception as exc:
-                self._emit(f"解题失败：{exc}", True)
+                self._emit(f"{_SOLVE_FAILURE_PREFIX}{exc}", True)
             finally:
                 self._busy.release()
 
@@ -746,6 +760,12 @@ class PhoneRelay:
         # 手机刷新页面后要能通过 hello 帧恢复，故单独记录。
         self._auto_solve = False
         self._auto_interval_ms = DEFAULT_AUTO_INTERVAL_SECONDS * 1000.0
+        # 自动提交的降噪状态：连续失败计数 + 上一条已提示的失败文案。
+        self._auto_failures = 0
+        self._auto_last_failure = ""
+        # 本轮自动提交是否失败（由 _on_solve_delta 在收到失败消息时记录，
+        # auto_loop 每轮开始前清空）。用字符串而不是布尔：要把原因带给降噪逻辑。
+        self._auto_round_failure = ""
         # 待解截图缓冲：题干跨多屏时先「加一图」攒起来，再一次性提交（多图一题）。
         # 单独加锁：截屏走线程池、WebSocket 消息走事件循环，两个线程都会改它。
         self._pending_solve_images: list[bytes] = []
@@ -784,6 +804,10 @@ class PhoneRelay:
         # 但最后一条 done 仍要放行，否则旧气泡永远停在流式状态。
         if self._solve_generation != self._session_generation and not done:
             return
+        # 失败以「解题失败：xxx」的 done 消息形式回来；记下原因供自动循环降噪/自停。
+        # 只认失败前缀，避免把正常回答里出现的「失败」二字误判成失败。
+        if done and text.startswith(_SOLVE_FAILURE_PREFIX):
+            self._auto_round_failure = text[len(_SOLVE_FAILURE_PREFIX):].strip()
         self.schedule_json({"type": "ai", "text": text, "done": done, "source": "solve"})
         publisher = self.desktop_publisher
         if publisher is not None:
@@ -866,7 +890,9 @@ class PhoneRelay:
             try:
                 images = [capture_screen_jpeg()]
             except Exception:
-                self._on_solve_delta("电脑端屏幕采集失败", True)
+                # 带上统一前缀，自动提交才能识别成本轮失败（否则会误判成成功、
+                # 永远不触发降噪与自停）。
+                self._on_solve_delta(f"{_SOLVE_FAILURE_PREFIX}电脑端屏幕采集失败", True)
                 return False
         # 多张图共用同一个批次号，落盘时才能整批归到这一次解题上。
         session_recorder.add_solve_images(images)
@@ -1172,6 +1198,47 @@ class PhoneRelay:
             if not self._phones:
                 self.stop_auto_capture()
 
+    def _note_auto_success(self) -> None:
+        """自动提交成功一次：清零失败计数（偶发失败不该累积成自停）。"""
+        self._auto_failures = 0
+        self._auto_last_failure = ""
+
+    def _note_auto_failure(self, reason: str) -> None:
+        """自动提交失败一次：降噪提示，连续失败到上限就自停。
+
+        降噪规则：同一失败文案只提示第一次；原因变化时再提示一次
+        （否则用户看不到新原因）。连续失败达 AUTO_FAILURE_LIMIT 时停止循环，
+        并推一条停止通知 —— 这类问题不会自愈，一直重试只会刷屏。
+        """
+        reason = str(reason or "").strip() or "未知错误"
+        self._auto_failures += 1
+        first_time = reason != self._auto_last_failure
+        self._auto_last_failure = reason
+        if first_time:
+            self._on_solve_delta(f"自动提交失败：{reason}", True)
+        if self._auto_failures >= AUTO_FAILURE_LIMIT and self._auto_solve:
+            # 只在仍在运行时停一次：已经停掉后若还收到失败（在途的一轮），
+            # 不再重复喊「已停止」，否则又变成新的刷屏源。
+            self._auto_generation += 1  # 让 auto_loop 退出
+            self._auto_solve = False
+            self._on_solve_delta(
+                f"自动提交已停止（连续 {self._auto_failures} 次失败）：{reason}",
+                True,
+            )
+            self._push_auto_state()
+
+    def _push_auto_state(self) -> None:
+        """把自动提交的当前状态推给手机：停止后要让界面上的勾选一起复位，
+        否则界面显示仍在自动提交、实际循环已经退出。"""
+        try:
+            self.schedule_json({
+                "type": "auto_state",
+                "on": self._auto_solve,
+                "intervalSec": int(self._auto_interval_ms / 1000),
+            })
+        except Exception:
+            pass
+
     def _set_auto(self, on: bool, interval_ms: Any, solve: bool = False) -> None:
         """开关自动循环。
 
@@ -1193,7 +1260,17 @@ class PhoneRelay:
             while generation == self._auto_generation:
                 if solve:
                     # quiet_busy：自动模式下不因「上一次还在跑」刷提示（见 request_solve）。
-                    await asyncio.to_thread(self.request_solve, SOLVE_TASK_SOLVE, True)
+                    # 用返回值与失败回调判断本轮结果，供降噪与连续失败自停使用。
+                    self._auto_round_failure = ""
+                    submitted = await asyncio.to_thread(
+                        self.request_solve, SOLVE_TASK_SOLVE, True
+                    )
+                    # 本轮没有提交（引擎忙）不算失败：跳过即可，不计入失败次数。
+                    if submitted:
+                        if self._auto_round_failure:
+                            self._note_auto_failure(self._auto_round_failure)
+                        else:
+                            self._note_auto_success()
                 else:
                     await self._capture_and_push()
                 await asyncio.sleep(interval)

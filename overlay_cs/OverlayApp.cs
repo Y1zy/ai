@@ -1195,8 +1195,19 @@ namespace WasapiParaformerOverlay
         internal const int ContextTotalLimit = 32000;
 
         /// <summary>
-        /// 按顺序拼接上下文块，累计超过 limit 时丢弃放不下的整块（不切碎单块，
-        /// 避免留下半句话污染提示词）。与 Python overlay_context_block 的截断语义一致。
+        /// 截断一个放不下的块所需的最小剩余额度，与 Python
+        /// settings._CONTEXT_TRUNCATE_MIN_ROOM 保持一致。再小就连标签都放不下，
+        /// 截出来只剩残缺标记（如 "[Resu…"）反而误导模型，此时整块丢弃更干净。
+        /// </summary>
+        internal const int ContextTruncateMinRoom = 32;
+
+        /// <summary>
+        /// 按顺序拼接上下文块，累计超过 limit 时按剩余额度截断最后一块。
+        ///
+        /// 截断语义必须与 Python settings.overlay_context_block 一致：放不下的块
+        /// 按剩余额度截断并加省略号，剩余额度太小才整块丢弃。此前这里是「放不下就
+        /// 整块丢弃」（all-or-nothing），而 Python 已改为截断保留 —— 两端不一致会让
+        /// 同一份超长简历在设置页回答测试里能看到、桌面字幕 AI 却完全收不到。
         /// </summary>
         internal static string JoinContextSections(List<string> sections, int limit)
         {
@@ -1206,7 +1217,13 @@ namespace WasapiParaformerOverlay
             foreach (string section in sections)
             {
                 if (string.IsNullOrEmpty(section)) continue;
-                if (used + section.Length > limit) break;
+                if (used + section.Length > limit)
+                {
+                    int remaining = limit - used;
+                    if (remaining >= ContextTruncateMinRoom)
+                        kept.Add(section.Substring(0, remaining).TrimEnd() + "…");
+                    break;
+                }
                 kept.Add(section);
                 used += section.Length;
             }
@@ -1231,8 +1248,13 @@ namespace WasapiParaformerOverlay
         /// <summary>
         /// 按配置给请求体加思考控制字段。面试实时场景下思考会让首字延迟从约 1 秒
         /// 拉长到 10 秒以上，故提供关闭开关；auto 时不发送任何字段、保持模型默认。
-        /// 注意不要改用 reasoning_effort：实测本机网关对其响应相反（none 会让
-        /// 模型把预算全用于思考、正文返回 0 字）。
+        ///
+        /// 关于 reasoning_effort（2026-09-17 实测，仅本地网关 + deepseek-v4.1-flash，
+        /// 明细见 .runtime/thinking_probe*.json）：字幕 AI 只提供「关闭/自动」两档，
+        /// 不需要它；但若将来要加推理档，注意原注释里「不要用 reasoning_effort」
+        /// 的结论已被实测推翻 —— 出问题的是 "none" 这个值（会让推理暴涨、正文 0 字），
+        /// graded 值（low/medium/high）实际正常生效。且推理 token 计入 max_tokens，
+        /// 额度不足时正文会返回空（实测 4096 即空，8192 才有正文）。
         /// </summary>
         internal static void ApplyThinkingMode(Dictionary<string, object> payload, OverlayConfig config)
         {
@@ -1240,13 +1262,51 @@ namespace WasapiParaformerOverlay
                 payload["thinking"] = new Dictionary<string, object> { { "type", "disabled" } };
         }
 
-        /// <summary>响应是否表示网关不认 thinking 字段（用于自动降级重试）。</summary>
+        /// <summary>
+        /// 思考相关的请求字段：off 档发 thinking，推理档发 reasoning_effort。
+        /// 降级判断与去除都必须按「这两个中的任一个」处理 —— 只看 thinking 会漏掉
+        /// 推理档，用户换个不支持该字段的网关后每次请求都失败。
+        /// 与 Python ai_stream 的 _THINKING_FIELDS 保持一致。
+        /// </summary>
+        private static readonly string[] ThinkingFields = { "thinking", "reasoning_effort" };
+
+        /// <summary>请求体里是否带了任一思考字段（判断是否值得尝试降级重试）。</summary>
+        internal static bool HasThinkingField(Dictionary<string, object> payload)
+        {
+            if (payload == null) return false;
+            foreach (string field in ThinkingFields)
+                if (payload.ContainsKey(field)) return true;
+            return false;
+        }
+
+        /// <summary>去掉全部思考字段（只去一个的话，剩下的仍会被网关拒绝）。</summary>
+        internal static void StripThinkingFields(Dictionary<string, object> payload)
+        {
+            if (payload == null) return;
+            foreach (string field in ThinkingFields) payload.Remove(field);
+        }
+
+        /// <summary>
+        /// 响应是否表示网关不认思考字段（用于自动降级重试）。
+        ///
+        /// 判定要"够准"：宁可漏判（用户看到原始报错）也不要误判 —— 误判会让每个
+        /// 无关的 400（如 invalid api key）都白重试一次，把真实错误藏在重试后面。
+        /// 因此要求满足其一：① 报错直接点名思考字段；② 报错说的是"未知的参数/字段"
+        /// 这类措辞。OpenAI 官方用 "Unrecognized request argument supplied"，
+        /// 只认 unknown/unsupported/invalid 会漏掉它。与 Python 侧同规则。
+        /// </summary>
         internal static bool IsThinkingUnsupported(int statusCode, string body)
         {
             if (statusCode != 400 && statusCode != 422) return false;
             string text = (body ?? "").ToLowerInvariant();
-            return text.Contains("thinking") || text.Contains("unknown")
-                || text.Contains("unsupported") || text.Contains("invalid");
+            foreach (string field in ThinkingFields)
+                if (text.Contains(field)) return true;
+            bool saysUnknownParam = text.Contains("unrecognized") || text.Contains("unexpected")
+                || text.Contains("unknown") || text.Contains("unsupported")
+                || text.Contains("not supported");
+            bool mentionsParam = text.Contains("parameter") || text.Contains("argument")
+                || text.Contains("field") || text.Contains("param");
+            return saysUnknownParam && mentionsParam;
         }
 
         // 一次非流式对话：返回答案、响应里的实际模型名（中转站可能改路由）与耗时。
@@ -1335,10 +1395,12 @@ namespace WasapiParaformerOverlay
                 {
                     string body = await response.Content.ReadAsStringAsync();
                     if (response.IsSuccessStatusCode) return body;
-                    if (allowDowngrade && payload.ContainsKey("thinking")
+                    // 守卫与去除都按「全部思考字段」处理：只认 thinking 会漏掉
+                    // reasoning_effort，且只去掉一个会让剩下的仍被网关拒绝。
+                    if (allowDowngrade && HasThinkingField(payload)
                         && IsThinkingUnsupported((int)response.StatusCode, body))
                     {
-                        payload.Remove("thinking");
+                        StripThinkingFields(payload);
                         return await SendChatOnce(serializer, endpoint, apiKey, payload, token, false);
                     }
                     throw new InvalidOperationException("AI HTTP " + (int)response.StatusCode + ": " + body);
@@ -3614,6 +3676,25 @@ namespace WasapiParaformerOverlay
         }
 
         /// <summary>
+        /// 清理 AI 正文里的 Markdown 标记（加粗、标题前缀、行内反引号）。
+        ///
+        /// 与 CleanAiText 的区别：这里**只用于正文段**，不碰代码段。
+        /// CleanAiText 会把所有反引号删掉——那对「整段当纯文本」的调用方（如设置窗
+        /// 回答测试框）合适，但用在按围栏分段的字幕窗上会破坏代码（缩进与符号失真）。
+        /// 注意不要删 \\ 或 # 之外的字符：代码由调用方原样保留。
+        /// </summary>
+        internal static string CleanAiProse(string line)
+        {
+            if (string.IsNullOrEmpty(line)) return line ?? "";
+            string trimmed = line.TrimStart();
+            int hash = 0;
+            while (hash < trimmed.Length && trimmed[hash] == '#') hash++;
+            if (hash > 0 && hash < trimmed.Length && trimmed[hash] == ' ')
+                trimmed = trimmed.Substring(hash + 1);
+            return trimmed.Replace("**", "").Replace("__", "").Replace("`", "");
+        }
+
+        /// <summary>
         /// 按 ``` 围栏把文本切成「正文 / 代码」交替段，供字幕窗渲染。
         /// 返回项 IsCode 为 true 表示围栏内的代码。
         ///
@@ -3642,7 +3723,9 @@ namespace WasapiParaformerOverlay
                     inCode = !inCode;
                     continue;
                 }
-                buffer.Append(line).Append('\n');
+                // 正文行在这里就清理掉 Markdown 标记（代码行原样保留）。
+                // 放在分段内做：清理需要知道当前是否在代码段内，与分段是同一件事。
+                buffer.Append(inCode ? line : CleanAiProse(line)).Append('\n');
             }
             if (buffer.Length > 0)
                 parts.Add(new KeyValuePair<bool, string>(inCode, buffer.ToString().TrimEnd('\n')));

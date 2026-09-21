@@ -291,13 +291,39 @@ function saveScreenshot(){
   document.body.removeChild(link);
 }
 
+// 清理正文里的 Markdown 标记，但**必须放过代码**：
+// ``` 围栏与行内反引号要原样保留给 renderChatBody 解析，围栏之间的内容
+// （缩进、空行、符号）一律不碰。此前这里把围栏行删成空行、把反引号全删掉，
+// 导致下游按围栏解析的代码块渲染永远拿不到输入 —— 代码块在真实使用中完全不生效。
 function stripMarkdown(t){
   if(!t) return t||"";
-  return t.split("\n").map(function(line){
-    if(/^\s*```/.test(line)) return "";
-    var s=line.replace(/^\s*#+\s+/,"");
-    return s.replace(/\*\*/g,"").replace(/__/g,"").replace(/`/g,"");
-  }).join("\n").replace(/\n{3,}/g,"\n\n");
+  var lines = String(t).split("\n");
+  var out = [];
+  var inCode = false;
+  for(var i=0;i<lines.length;i++){
+    var line=lines[i];
+    if(/^\s*```/.test(line)){       // 围栏行：保留（renderChatBody 靠它切段）
+      inCode=!inCode;
+      out.push(line);
+      continue;
+    }
+    if(inCode){                     // 代码行：逐字保留（缩进即语义）
+      out.push(line);
+      continue;
+    }
+    var s=line.replace(/^\s*#+\s+/,"");          // 标题前缀
+    out.push(s.replace(/\*\*/g,"").replace(/__/g,""));  // 加粗（不动反引号）
+  }
+  // 空行折叠只在正文段生效：代码里的空行是排版的一部分，不能动。
+  var result=[];
+  var inCode2=false;
+  for(var k=0;k<out.length;k++){
+    if(/^\s*```/.test(out[k])) inCode2=!inCode2;
+    var isBlank=out[k].trim()==="";
+    if(!inCode2 && isBlank && result.length && result[result.length-1].trim()==="") continue;
+    result.push(out[k]);
+  }
+  return result.join("\n");
 }
 
 // 把回答正文渲染进元素：``` 围栏内的代码用独立代码块，其余按正文，行内 `x` 用行内代码样式。

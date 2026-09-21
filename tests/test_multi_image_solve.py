@@ -389,6 +389,70 @@ class TestAutoSubmitUsesCurrentThinkingTier:
         assert sent.get("thinking_mode") == "medium", "自动提交没有带上当前思考档位"
 
 
+class TestAutoSubmitFailureNoise:
+    """自动提交连续失败时的降噪与自停。
+
+    背景：模型未启用 / 网关不通 / Key 失效时，每次间隔都会推一条同样的失败消息。
+    聊天气泡上限是 50 条，按 3 秒间隔算约 2.5 分钟就把上限填满，之前真正的
+    解题回答与追问会被整屏重复错误挤掉。
+    """
+
+    def _relay(self) -> phone_share.PhoneRelay:
+        return phone_share.PhoneRelay()
+
+    def test_first_failure_is_reported(self) -> None:
+        """第一次失败要如实告诉用户原因（不能静默）。"""
+        relay = self._relay()
+        prompts: list[str] = []
+        relay._on_solve_delta = lambda text, done: prompts.append(text)
+        for _ in range(3):
+            relay._note_auto_failure("视觉模型未启用")
+        assert len(prompts) == 1, f"同一失败应只提示一次，实际 {len(prompts)} 次"
+        assert "视觉模型未启用" in prompts[0]
+
+    def test_repeated_failure_stops_loop(self, monkeypatch) -> None:
+        """连续失败到上限要停止循环，并推一条停止通知。"""
+        relay = self._relay()
+        prompts: list[str] = []
+        relay._on_solve_delta = lambda text, done: prompts.append(text)
+        relay._auto_generation = 7
+        relay._auto_solve = True  # 模拟自动提交正在运行（真实流程由 _set_auto 置位）
+
+        for _ in range(phone_share.AUTO_FAILURE_LIMIT + 2):
+            relay._note_auto_failure("电脑端屏幕采集失败")
+
+        # 首次失败 + 停止通知 = 2 条；中间的重复失败与停后的在途失败都不再刷屏
+        assert len(prompts) == 2, f"应只推 2 条（首次 + 停止），实际 {len(prompts)}: {prompts}"
+        assert "已停止" in prompts[-1]
+        assert relay._auto_generation != 7, "未停止自动循环（generation 未递增）"
+        assert relay._auto_solve is False, "未复位自动提交标志"
+
+    def test_success_resets_failure_streak(self) -> None:
+        """中途成功要清零计数，否则偶发失败累积几次就被误停。"""
+        relay = self._relay()
+        prompts: list[str] = []
+        relay._on_solve_delta = lambda text, done: prompts.append(text)
+        relay._auto_generation = 3
+
+        relay._note_auto_failure("失败 A")
+        relay._note_auto_success()
+        relay._note_auto_failure("失败 B")
+
+        assert relay._auto_failures == 1, "成功后未清零失败计数"
+        assert relay._auto_generation == 3, "不应停止"
+        # 两次失败文案不同，各提示一次
+        assert len(prompts) == 2
+
+    def test_different_failure_message_is_reported(self) -> None:
+        """失败原因变化时要再提示一次，否则用户看不到新原因。"""
+        relay = self._relay()
+        prompts: list[str] = []
+        relay._on_solve_delta = lambda text, done: prompts.append(text)
+        relay._note_auto_failure("视觉模型未启用")
+        relay._note_auto_failure("电脑端屏幕采集失败")
+        assert len(prompts) == 2, "失败原因变化后未再提示"
+
+
 class TestRecordImageCapConfig:
     def test_default_is_two_hundred(self) -> None:
         assert DEFAULTS["recordImageCap"] == 200

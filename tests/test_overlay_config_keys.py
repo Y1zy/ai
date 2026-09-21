@@ -66,6 +66,38 @@ def test_csharp_load_reads_all_saved_keys() -> None:
     assert saved == loaded, f"Save/Load 键集合不一致: 仅 Save={sorted(saved - loaded)}, 仅 Load={sorted(loaded - saved)}"
 
 
+def test_csharp_thinking_fields_cover_reasoning_effort() -> None:
+    """C# 的思考字段表必须同时含 thinking 与 reasoning_effort。
+
+    降级守卫与去除都依赖它：漏掉 reasoning_effort 会让推理档在不支持的网关
+    上永不降级（每次请求都失败），只去掉一个字段则重试仍被拒。
+    与 Python ai_stream._THINKING_FIELDS 保持一致。
+    """
+    from system_audio_asr.ai_stream import _THINKING_FIELDS
+
+    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    match = re.search(r'ThinkingFields\s*=\s*\{([^}]*)\}', text)
+    assert match, "未找到 C# ThinkingFields 字段表"
+    fields = re.findall(r'"([^"]*)"', match.group(1))
+    assert set(fields) == set(_THINKING_FIELDS), (
+        f"思考字段表不一致: C#={fields} Python={list(_THINKING_FIELDS)}"
+    )
+
+
+def test_csharp_has_and_strip_thinking_helpers() -> None:
+    """C# 必须提供「判断是否带思考字段」与「全部去掉」两个辅助方法。
+
+    降级代码若退回「只检查/只删除 thinking」的写法，推理档就会被漏掉。
+    """
+    text = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    assert "HasThinkingField(" in text, "缺少 HasThinkingField（守卫会漏掉推理档）"
+    assert "StripThinkingFields(" in text, "缺少 StripThinkingFields（重试时去不干净）"
+    # 降级分支必须用这两个方法，而不是自己判断键名
+    downgrade = text[text.index("allowDowngrade &&") : text.index("allowDowngrade &&") + 260]
+    assert "HasThinkingField(payload)" in downgrade, "降级守卫未使用共享方法"
+    assert "StripThinkingFields(payload)" in downgrade, "降级去除未使用共享方法"
+
+
 def test_vision_thinking_levels_match_python() -> None:
     """C# 的解题思考档位表必须与 Python 一致（含「跟随」这一档）。
 

@@ -98,7 +98,13 @@ def _ask_ai_blocking(
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": question})
-    from .ai_stream import apply_thinking_mode, is_thinking_unsupported, normalize_max_tokens
+    from .ai_stream import (
+        apply_thinking_mode,
+        has_thinking_field,
+        is_thinking_unsupported,
+        normalize_max_tokens,
+        strip_thinking_fields,
+    )
 
     request_body: dict = {
         "model": settings["aiModel"],
@@ -113,9 +119,11 @@ def _ask_ai_blocking(
     apply_thinking_mode(request_body, settings.get("aiThinkingMode"))
     started = time.monotonic()
     status, payload = _post_chat(endpoint, request_body, api_key)
-    # 网关不认 thinking 字段时自动去掉该字段重试一次，避免开关导致完全不可用。
-    if status >= 400 and "thinking" in request_body and is_thinking_unsupported(status, payload):
-        request_body.pop("thinking", None)
+    # 网关不认思考字段时自动重试一次，避免开关导致完全不可用。
+    # 守卫与去除都用 ai_stream 的共享实现：连接测试用的虽是字幕 AI 档位（只有
+    # thinking），但保持一致可避免将来字幕 AI 引入推理档时这里漏改。
+    if status >= 400 and has_thinking_field(request_body) and is_thinking_unsupported(status, payload):
+        request_body = strip_thinking_fields(request_body)
         status, payload = _post_chat(endpoint, request_body, api_key)
     seconds = round(time.monotonic() - started, 1)
     if status >= 400:

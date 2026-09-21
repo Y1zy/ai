@@ -53,6 +53,25 @@ THINKING_MIN_TOKENS = 8192
 # 对外的两个推理档 → reasoning_effort 取值
 _REASONING_EFFORT = {THINKING_MEDIUM: "medium", THINKING_HIGH: "high"}
 
+# 思考相关的请求字段：off 档发 thinking，推理档发 reasoning_effort。
+# 降级重试与守卫都必须按「这两个中的任一个」判断，只看 thinking 会漏掉推理档 ——
+# 表现为用户切到中度/深度后换个网关就每次解题都失败。
+_THINKING_FIELDS = ("thinking", "reasoning_effort")
+
+
+def has_thinking_field(payload: dict[str, Any]) -> bool:
+    """请求体里是否带了任一思考字段（用于判断是否值得尝试降级重试）。"""
+    return any(field in payload for field in _THINKING_FIELDS)
+
+
+def strip_thinking_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """去掉全部思考字段后返回新请求体。
+
+    必须两个都去掉：只去掉被拒的那个，剩下的仍会被网关拒绝，
+    用户看到的还是失败。
+    """
+    return {key: value for key, value in payload.items() if key not in _THINKING_FIELDS}
+
 
 def normalize_thinking_mode(value: Any) -> str:
     """把任意输入规范到受支持的取值；无法识别时回退默认（不干预）。"""
@@ -88,15 +107,30 @@ def apply_thinking_mode(payload: dict[str, Any], mode: Any) -> dict[str, Any]:
 
 
 def is_thinking_unsupported(status: int, body: bytes) -> bool:
-    """判断失败响应是否表示网关不认 thinking 字段。
+    """判断失败响应是否表示网关不认思考相关字段。
 
-    部分中转/上游会以 400/422 拒绝未知参数（报错里通常带 thinking 字样）。
-    调用方据此自动降级重试，避免用户开了开关反而完全不可用。
+    部分中转/上游会以 400/422 拒绝未知参数。调用方据此自动降级重试，
+    避免用户开了开关反而完全不可用。
+
+    判定要"够准"：宁可漏判（用户看到原始报错）也不要误判 —— 误判会让每个
+    无关的 400（如 invalid api key）都白重试一次，把真实错误藏在重试后面。
+    因此要求满足其一：
+      ① 报错里直接点名了思考字段（thinking / reasoning_effort）；
+      ② 报错说的是"未知的参数/字段"这类措辞（参数名可能被网关略去）。
+    OpenAI 官方拒未知参数用 "Unrecognized request argument supplied: xxx"，
+    只认 unknown/unsupported/invalid 会漏掉它，导致降级形同虚设。
     """
     if status not in (400, 422):
         return False
     text = body.decode("utf-8", errors="replace").lower()
-    return "thinking" in text or "unknown" in text or "unsupported" in text or "invalid" in text
+    if any(field in text for field in _THINKING_FIELDS):
+        return True
+    says_unknown_param = any(
+        marker in text
+        for marker in ("unrecognized", "unexpected", "unknown", "unsupported", "not supported")
+    )
+    mentions_param = any(word in text for word in ("parameter", "argument", "field", "param"))
+    return says_unknown_param and mentions_param
 
 
 # 回答长度上限档位（max_tokens）。额度同时决定"回答能写多长"：给太多，模型会把
@@ -200,9 +234,11 @@ def stream_chat_completion(
             ) as response:
                 if response.status_code >= 400:
                     body = response.read()
-                    # 网关不认 thinking 字段时自动降级：去掉该字段重试一次，
-                    # 避免用户开启「关闭思考」后反而完全不可用。
-                    if "thinking" in request_payload and is_thinking_unsupported(
+                    # 网关不认思考字段时自动降级：去掉后重试一次，
+                    # 避免用户开启思考相关选项后反而完全不可用。
+                    # 守卫用 has_thinking_field：off 档发 thinking、推理档发
+                    # reasoning_effort，只看前者会让推理档永不降级。
+                    if has_thinking_field(request_payload) and is_thinking_unsupported(
                         response.status_code, body
                     ):
                         raise _ThinkingUnsupported(body)
@@ -231,8 +267,9 @@ def stream_chat_completion(
         try:
             run_once(payload)
         except _ThinkingUnsupported:
-            # 该网关不支持 thinking 字段：去掉后按默认（自动思考）重跑。
-            fallback = {k: v for k, v in payload.items() if k != "thinking"}
+            # 该网关不认思考字段：全部去掉后按默认（自动思考）重跑。
+            # 去掉全部而不是只去掉被拒的那个：剩下的字段仍会被拒。
+            fallback = strip_thinking_fields(payload)
             accumulated.clear()
             run_once(fallback)
 

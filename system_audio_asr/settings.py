@@ -95,11 +95,16 @@ RECORD_IMAGE_CAP_LEVELS = (100, 200, 300, 500)
 
 
 def normalize_record_image_cap(value: Any) -> int:
-    """把题图保留上限吸附到受支持档位；非法值回退默认档。"""
+    """把题图保留上限吸附到受支持档位；非法值回退默认档。
+
+    必须捕获 OverflowError：JSON 里的 1e400 / Infinity 会解析成 inf，
+    int(inf) 抛的不是 ValueError。漏掉它会让 load_settings 整体失败
+    （服务启动、设置页、识别取热词都会挂），与 normalize_max_tokens 同坑。
+    """
     default = int(DEFAULTS["recordImageCap"])
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return min(RECORD_IMAGE_CAP_LEVELS, key=lambda level: (abs(level - number), level))
 
@@ -277,7 +282,9 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
     # 同样用字面量，避免 config 层 import phone_share 带进 ctypes/PIL。
     try:
         max_images = int(result["visionMaxImages"])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError：JSON 的 1e400 会解析成 inf，int(inf) 抛的不是 ValueError，
+        # 漏掉会让 load_settings 整体失败（与 normalize_max_tokens 同坑）。
         max_images = int(DEFAULTS["visionMaxImages"])
     result["visionMaxImages"] = max(1, min(5, max_images))
     # 题图保留上限：吸附到档位表（非法值回退默认）。
@@ -361,14 +368,21 @@ _NO_MARKDOWN_LINE = "直接输出纯文本，不要使用 Markdown 标记（如 
 # 面试上下文总长度上限：简历 + JD + 附加背景 + 知识库合计，防止撑爆模型上下文窗口
 _CONTEXT_TOTAL_LIMIT = 32000
 
+# 截断一个放不下的块所需的最小剩余额度：再小就连标签都放不下、截出来只剩残缺
+# 标记（如 "[Resu…"）反而误导模型，此时整块丢弃更干净。
+# 与 C# OverlayApp.ContextTruncateMinRoom 保持一致（跨端同一套截断规则）。
+_CONTEXT_TRUNCATE_MIN_ROOM = 32
+
 
 def overlay_context_block() -> str:
     """读取面试上下文（简历/JD/公司/附加背景）并追加知识库条目。
 
     组成顺序：config.json 的四个字段在前（保持既有行为），知识库追加在后。
     总长度统一截断，避免用户填充大量资料后请求因超长而失败。
-    供面试链路使用（字幕 AI 的系统提示词、设置页「回答测试」、手机追问）；
-    截图解题是独立链路，不带这些上下文。
+
+    截断语义与 C# OverlayApp.JoinContextSections 保持一致（跨端同一套规则）：
+    放不下的块按剩余额度截断并加省略号，剩余额度太小（连标签都放不下）才整块丢弃。
+    两端不一致会导致同一份超长简历在设置页能看到、桌面字幕 AI 却完全收不到。
     """
     try:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
@@ -387,10 +401,10 @@ def overlay_context_block() -> str:
             continue
         block = label + "\n" + value
         if used + len(block) > _CONTEXT_TOTAL_LIMIT:
-            # 放不下整块时不静默丢弃：单块就超限（如超长简历）时按剩余额度截断，
-            # 否则用户在截图题/回答测试里会看到"资料像没生效"而无任何提示。
+            # 放不下整块时不静默丢弃：按剩余额度截断，否则用户会看到
+            # 「资料像没生效」而没有任何提示。
             remaining = _CONTEXT_TOTAL_LIMIT - used
-            if remaining > len(label) + 1:
+            if remaining >= _CONTEXT_TRUNCATE_MIN_ROOM:
                 sections.append(block[:remaining].rstrip() + "…")
                 used = _CONTEXT_TOTAL_LIMIT
             break

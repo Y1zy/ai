@@ -264,6 +264,116 @@ def test_realtime_modes_exclude_reasoning_tiers() -> None:
         assert slow not in ai_stream.THINKING_MODES_REALTIME
 
 
+# ---------------------------------------------------------------- 降级重试
+# 网关可能不认识思考相关字段，此时应去掉字段重试一次，而不是直接报错。
+# 推理档发的是 reasoning_effort，与 off 档的 thinking 是**两个不同字段**，
+# 降级逻辑必须同时覆盖，否则用户一切到推理档、换个网关就永久失败。
+
+
+def test_thinking_fields_detects_both() -> None:
+    """守卫要能认出两种思考字段（任一存在即应尝试降级）。"""
+    assert ai_stream.has_thinking_field({"thinking": {"type": "disabled"}}) is True
+    assert ai_stream.has_thinking_field({"reasoning_effort": "high"}) is True
+    assert ai_stream.has_thinking_field({"model": "m"}) is False
+
+
+def test_strip_thinking_fields_removes_both() -> None:
+    """降级时两个字段都要去掉，只去一个仍会被网关拒绝。"""
+    payload = {"model": "m", "thinking": {"type": "disabled"}, "reasoning_effort": "high"}
+    stripped = ai_stream.strip_thinking_fields(payload)
+    assert "thinking" not in stripped
+    assert "reasoning_effort" not in stripped
+    assert stripped["model"] == "m"
+
+
+def test_is_thinking_unsupported_recognises_openai_wording() -> None:
+    """OpenAI 官方拒未知参数的措辞是 Unrecognized request argument supplied。
+
+    此前只认 unknown/unsupported/invalid，导致这类网关连 off 档也不会降级 ——
+    降级机制形同虚设（这是既存缺陷，与推理档一起修）。
+    """
+    openai_style = b'{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}'
+    assert ai_stream.is_thinking_unsupported(400, openai_style) is True
+    assert ai_stream.is_thinking_unsupported(400, b"unexpected parameter: thinking") is True
+    assert ai_stream.is_thinking_unsupported(400, b"reasoning_effort is not supported") is True
+    # 与思考无关的 400 不能误判（否则会白重试一次）
+    assert ai_stream.is_thinking_unsupported(400, b"invalid api key") is False
+    # 非 400/422 一律不降级
+    assert ai_stream.is_thinking_unsupported(500, openai_style) is False
+
+
+@pytest.mark.parametrize("mode", ["off", "medium", "high"])
+def test_stream_downgrades_when_reasoning_field_rejected(monkeypatch, mode) -> None:
+    """网关照 unknown 参数拒掉时，三种档位都要能去掉字段重试成功。
+
+    这是端到端行为：拦截 httpx，第一次返回 400（unknown reasoning_effort /
+    unknown thinking），第二次成功 —— 断言最终拿到正文，而不是抛错。
+    """
+    import httpx
+
+    sent_payloads: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, status: int, body: bytes = b""):
+            self.status_code = status
+            self._body = body
+
+        def read(self) -> bytes:
+            return self._body
+
+        def iter_lines(self):
+            return iter(
+                [
+                    'data: {"choices":[{"delta":{"content":"OK"}}]}',
+                    "data: [DONE]",
+                ]
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stream(self, method, url, json=None, headers=None):
+            sent_payloads.append(dict(json or {}))
+            if len(sent_payloads) == 1:
+                # 第一次：网关拒掉思考字段
+                return FakeResponse(400, b'{"error":{"message":"Unrecognized request argument supplied"}}')
+            return FakeResponse(200)
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    # api.example 无法解析 DNS；校验本身由 test_settings 单独覆盖
+    monkeypatch.setattr(
+        "system_audio_asr.settings.validate_public_http_url", lambda url: url
+    )
+
+    chunks: list[str] = []
+    final = ai_stream.stream_chat_completion(
+        url="https://api.example/v1/chat/completions",
+        api_key="k",
+        model="m",
+        messages=[{"role": "user", "content": "q"}],
+        on_snapshot=lambda text, done: chunks.append(text),
+        thinking_mode=mode,
+    )
+
+    assert len(sent_payloads) == 2, f"{mode} 档没有重试（只发了 {len(sent_payloads)} 次）"
+    assert "thinking" not in sent_payloads[1], "重试时未去掉 thinking"
+    assert "reasoning_effort" not in sent_payloads[1], "重试时未去掉 reasoning_effort"
+    assert final == "OK", f"{mode} 档降级后未拿到正文"
+
+
 def test_thinking_mode_is_sent_in_stream_payload(monkeypatch) -> None:
     captured = _fake_stream(monkeypatch, [
         'data: {"choices":[{"delta":{"content":"X"}}]}',

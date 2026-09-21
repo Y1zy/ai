@@ -16,6 +16,7 @@ C# 侧行为由 tests/test_overlay_config_keys.py 的同族用例 + 本文件的
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -174,6 +175,81 @@ def _method_body(marker: str) -> str:
     # 方法体在其后的第一个「4 空格缩进的收尾大括号」结束
     end = text.index("\n        }\n", start) + len("\n        }\n")
     return text[start:end]
+
+
+def test_extreme_numbers_do_not_break_config_loading(tmp_path: Path) -> None:
+    """极端数值不得让配置加载失败（1e400 会被 JSON 解析成 inf）。
+
+    漏捕 OverflowError 的后果很重：异常穿透 load_settings（它只捕 ValueError/
+    TypeError，而 OverflowError 不属于这两者），服务启动、设置页、识别取热词
+    全部失败。涉及的字段都是档位类，回退到默认档即可。
+    """
+    from system_audio_asr import phone_share
+    from system_audio_asr.settings import DEFAULTS, load_settings
+
+    cases = [
+        ("recordImageCap", "1e400"),
+        ("recordImageCap", "-1e400"),
+        ("recordImageCap", "Infinity"),
+        ("recordImageCap", "NaN"),
+        ("visionMaxImages", "1e400"),
+        ("visionMaxImages", "-1e400"),
+        ("visionMaxImages", "Infinity"),
+    ]
+    for key, raw in cases:
+        config = tmp_path / f"{key}-{raw.replace('/', '_')}.json"
+        config.write_text('{"%s": %s}' % (key, raw), encoding="utf-8")
+        loaded = load_settings(config)  # 不得抛异常
+        assert isinstance(loaded[key], int), f"{key}={raw} 未回退成整数"
+        assert key in DEFAULTS, f"{key} 不在 DEFAULTS 里，用例已失效"
+
+    # 解题张数走 phone_share 的独立入口，同样不能崩
+    assert phone_share.normalize_max_solve_images(float("inf")) == 3
+    assert phone_share.normalize_max_solve_images(-float("inf")) == 3
+    assert phone_share.normalize_max_solve_images(float("nan")) == 3
+
+
+def test_load_vision_config_survives_extreme_image_count(tmp_path: Path, monkeypatch) -> None:
+    """解题链路的配置读取不能被极端值打断（手机配对/hello/解题都走它）。"""
+    from system_audio_asr import phone_share
+
+    config = tmp_path / "config.json"
+    config.write_text('{"visionMaxImages": 1e400}', encoding="utf-8")
+    monkeypatch.setattr(phone_share, "CONFIG_PATH", config)
+    vision = phone_share.load_vision_config()  # 不得抛异常
+    assert vision["maxImages"] == 3
+
+
+def test_csharp_prose_cleanup_preserves_code() -> None:
+    """C# 字幕窗：正文清理标记、代码段逐字保留（含 #include 的井号与缩进）。
+
+    改用 AppendAiText 后正文的 ** / # / 反引号不再被清理，会原样显示给用户；
+    但清理又不能伤到代码（`#include` 若被当标题前缀删掉，代码就废了）。
+    这条用例调用 tools/prose_clean_probe.py：抽真实方法体编译运行后断言，
+    而不是对源码做文本匹配。
+    """
+    import subprocess
+
+    compiler_found = any(
+        Path(candidate).exists()
+        for candidate in (
+            r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+            r"C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe",
+        )
+    )
+    if not compiler_found:
+        pytest.skip("未找到 .NET Framework C# 编译器")
+    root = Path(__file__).resolve().parents[1]
+    done = subprocess.run(
+        [sys.executable, str(root / "tools" / "prose_clean_probe.py")],
+        capture_output=True,
+        shell=False,
+        check=False,
+    )
+    output = done.stdout.decode("utf-8", errors="replace") + done.stderr.decode(
+        "utf-8", errors="replace"
+    )
+    assert done.returncode == 0, "C# 正文/代码分段检查失败：\n" + output
 
 
 def test_load_has_no_bare_conversions() -> None:
