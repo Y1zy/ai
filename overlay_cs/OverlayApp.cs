@@ -363,8 +363,39 @@ namespace WasapiParaformerOverlay
             }
         }
 
+        /// <summary>
+        /// NaN → 默认值；±Infinity 原样返回（交给后面的 Math.Max/Min 夹到边界）。
+        ///
+        /// 为什么必须处理 NaN：Math.Max/Min 遇 NaN 会原样返回 NaN（不是夹紧），
+        /// 非法值会一路写到磁盘（成为非法 JSON `{"opacity":NaN}`），之后 Python 侧
+        /// 渲染 /api/settings 直接 500，整个设置页不可用；C# 也会在
+        /// TimeSpan.FromSeconds(NaN) 抛 ArgumentException。
+        /// 为什么不处理 Infinity：Math.Min(0.98, +∞) = 0.98、Math.Max(0.45, -∞) = 0.45
+        /// 本来就正确，且与 Python 的 max/min 夹紧结果一致（那边同样把 ±∞ 夹到边界）。
+        /// </summary>
+        private static double Finite(double value, double fallback)
+        {
+            return double.IsNaN(value) ? fallback : value;
+        }
+
         internal void Normalize()
         {
+            // NaN / ±Infinity 必须先回落默认值，不能直接交给 Math.Max/Min：
+            // 它们遇到 NaN 会原样返回 NaN（不是夹紧），于是 C# 会把它继续写盘 ——
+            // JavaScriptSerializer 序列化出非法 JSON `{"opacity":NaN}`，
+            // 之后 Python 的 /api/settings 渲染响应时直接 500，整个设置页不可用；
+            // C# 自己也会在 TimeSpan.FromSeconds(NaN) 抛 ArgumentException。
+            // Python 侧 normalize_settings 的 float()+夹紧会把 NaN 吸附到默认档，
+            // 这里保持同一口径，两端对同一份配置得到相同结果。
+            // 第二个参数必须是「该字段的默认值」（与 Python DEFAULTS 一致），
+            // 不能随手填一个边界值：否则同一份含 NaN 的配置在两端会得到不同结果
+            // （Python 回默认 0.88，C# 回上界 0.98）。
+            Width = Finite(Width, 980.0);
+            Height = Finite(Height, 150.0);
+            FontSize = Finite(FontSize, 36.0);
+            Opacity = Finite(Opacity, 0.88);
+            FrameOpacity = Finite(FrameOpacity, 0.69);
+            AiSilenceSeconds = Finite(AiSilenceSeconds, 0.6);
             Width = Math.Max(280, Math.Min(2200, Width));
             Height = Math.Max(72, Math.Min(800, Height));
             FontSize = Math.Max(12, Math.Min(96, FontSize));
@@ -499,10 +530,35 @@ namespace WasapiParaformerOverlay
 
         internal static OverlayConfig Load()
         {
+            // 注意：本工程用 .NET Framework 自带的 csc.exe 编译（C# 5），
+            // 不能用 `out _` 弃元或内联 out 变量（那是 C# 7 特性）。
+            bool ignored;
+            return Load(out ignored);
+        }
+
+        /// <summary>
+        /// 读取配置；ok 表示「磁盘状态是否已知」。
+        ///
+        /// 为什么要这个出口：Load 的契约是永不失败（失败时返回全默认对象），
+        /// 而调用方把它当磁盘真值用 —— 于是「文件正被 Python 侧写入、读到半个」
+        /// 会被当成「配置本来就是空的」，随后的三方合并以全默认为基线，
+        /// 把内存里的简历/JD 覆盖成空值并写回磁盘。
+        /// 实测 Python 的 os.replace 与 .NET 的 File.ReadAllText 并发时，
+        /// 这种读失败 8 秒内出现 9 次，不是理论情况。
+        /// 因此读失败必须能被区分出来：调用方据此中止本次合并/保存（下次定时器再试）。
+        /// 文件不存在时 ok=true（确实是空配置，不是读不到）。
+        /// </summary>
+        internal static OverlayConfig Load(out bool ok)
+        {
             OverlayConfig result = new OverlayConfig();
+            ok = false;
             try
             {
-                if (!File.Exists(ConfigPath)) return result;
+                if (!File.Exists(ConfigPath))
+                {
+                    ok = true;   // 文件不存在 = 确实没有配置，按默认值处理是正确的
+                    return result;
+                }
                 JavaScriptSerializer serializer = new JavaScriptSerializer();
                 Dictionary<string, object> data = serializer.Deserialize<Dictionary<string, object>>(
                     File.ReadAllText(ConfigPath, Encoding.UTF8));
@@ -558,8 +614,14 @@ namespace WasapiParaformerOverlay
                 if (data.ContainsKey("recordImageCap")) result.RecordImageCap = SafeInt(data["recordImageCap"], result.RecordImageCap);
                 if (data.ContainsKey("hotwordEnabled")) result.HotwordEnabled = SafeBool(data["hotwordEnabled"], result.HotwordEnabled);
                 if (data.ContainsKey("hotwordExtra")) result.HotwordExtra = SafeString(data["hotwordExtra"], result.HotwordExtra);
+                ok = true;   // 全部字段都读完了才算是「磁盘状态已知」
             }
-            catch { }
+            catch
+            {
+                // 读失败（被占用 / 半个文件 / 解析失败）保持 ok=false。
+                // 注意此处不能 return：下面还要 Normalize，返回值本身仍是可用的
+                // 默认对象 —— 只是调用方必须知道它不代表磁盘内容。
+            }
             result.Normalize();
             return result;
         }
@@ -2468,12 +2530,12 @@ namespace WasapiParaformerOverlay
 
         private void ApplyAllSettings()
         {
-            string model = string.IsNullOrWhiteSpace(Convert.ToString(aiModelBox.SelectedItem))
-                && string.IsNullOrWhiteSpace(aiModelBox.Text)
+            // 模型名以可编辑下拉的 Text 为准（SelectedItem 只是预设之一）。
+            // 网页设置页允许任意模型名，读回时也只填 Text —— 两条路必须一致，
+            // 否则自定义模型名会在开关设置窗时被换成预设值。
+            string model = string.IsNullOrWhiteSpace(aiModelBox.Text)
                 ? "deepseek-v4-flash"
-                : (string.IsNullOrWhiteSpace(aiModelBox.Text)
-                    ? Convert.ToString(aiModelBox.SelectedItem)
-                    : aiModelBox.Text);
+                : aiModelBox.Text.Trim();
             string mode = aiModeBox.SelectedItem == null ? "auto" : ModeKey(Convert.ToString(aiModeBox.SelectedItem));
             string thinking = aiThinkingBox.SelectedIndex == 0 ? "off" : "auto";
             int maxTokens = aiMaxTokensBox.SelectedIndex >= 0 && aiMaxTokensBox.SelectedIndex < OverlayConfig.MaxTokenLevels.Length
@@ -2608,8 +2670,12 @@ namespace WasapiParaformerOverlay
                     screenBox.SelectedIndex = 0;
                 aiEnabledBox.IsChecked = config.AiEnabled;
                 apiKeyBox.Password = SecretStore.LoadApiKey();
-                aiModelBox.SelectedItem = config.AiModel;
-                if (aiModelBox.SelectedItem == null) aiModelBox.SelectedItem = "deepseek-v4-flash";
+                aiModelBox.Text = config.AiModel;
+                // 不在这里回落到预设：网页设置页的模型名是自由文本，用户可能填
+                // 任意模型（如 qwen-max）。此前写的是 SelectedItem + 找不到就选
+                // "deepseek-v4-flash"，于是开关一次设置窗就把自定义模型名改掉，
+                // 下次请求用错误的模型名发出。可编辑下拉的 Text 才是真值来源。
+                if (string.IsNullOrWhiteSpace(aiModelBox.Text)) aiModelBox.Text = "deepseek-v4-flash";
                 aiModeBox.SelectedItem = ModeDisplay(config.AiMode);
                 aiThinkingBox.SelectedIndex = config.AiThinkingMode == "off" ? 0 : 1;
                 // Normalize 已把值吸附到档位表，IndexOf 必命中；兜底再取一次防越界。
@@ -4800,12 +4866,17 @@ namespace WasapiParaformerOverlay
                 return;
             }
             OverlayConfig disk;
+            bool diskKnown;
             try
             {
                 if (!File.Exists(OverlayConfig.ConfigPath)) return;
                 DateTime stamp = File.GetLastWriteTimeUtc(OverlayConfig.ConfigPath);
                 if (stamp <= configLastWrite) return;
-                disk = OverlayConfig.Load();
+                disk = OverlayConfig.Load(out diskKnown);
+                // 读失败时不能用它做合并基线：Load 失败返回的是全默认对象，
+                // 以它为基线会把内存里的简历/JD 覆盖成空值，紧接着 Save 写回磁盘。
+                // 本次合并就此放弃；定时器 1 秒后再来，那时文件通常已可读。
+                if (!diskKnown) return;
             }
             catch { return; }
             OverlayConfig baseline = lastSyncedConfig;
@@ -4877,8 +4948,12 @@ namespace WasapiParaformerOverlay
                 if (!File.Exists(OverlayConfig.ConfigPath)) return;
                 DateTime stamp = File.GetLastWriteTimeUtc(OverlayConfig.ConfigPath);
                 if (stamp <= configLastWrite) return;
+                bool freshKnown;
+                OverlayConfig fresh = OverlayConfig.Load(out freshKnown);
+                // 读失败时不要 ApplyFrom：那会把内存里刚同步好的简历/JD 换成空值。
+                // 也不推进 configLastWrite（下面那行），否则这次改动会被永久跳过。
+                if (!freshKnown) return;
                 configLastWrite = stamp;
-                OverlayConfig fresh = OverlayConfig.Load();
                 string oldScreen = config.ScreenName;
                 bool oldLiveTranslate = config.LiveTranslateEnabled;
                 config.ApplyFrom(fresh);

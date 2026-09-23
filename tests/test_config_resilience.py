@@ -16,6 +16,7 @@ C# 侧行为由 tests/test_overlay_config_keys.py 的同族用例 + 本文件的
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -253,8 +254,12 @@ def test_csharp_prose_cleanup_preserves_code() -> None:
 
 
 def test_load_has_no_bare_conversions() -> None:
-    """Load() 内不得出现裸 Convert.To*：单个坏字段会整段中止、清空其后的简历。"""
-    body = _method_body("internal static OverlayConfig Load()")
+    """Load() 内不得出现裸 Convert.To*：单个坏字段会整段中止、清空其后的简历。
+
+    注意取的是带 out 参数的那个重载（真正的逐字段赋值体）；
+    无参 Load() 只是转发，检查它没有意义。
+    """
+    body = _method_body("internal static OverlayConfig Load(out bool ok)")
     assert "Convert.To" not in body, (
         "Load() 又用了裸 Convert.To*：任一字段类型不合法会清空其后的所有字段（含简历）"
     )
@@ -290,3 +295,140 @@ def test_sync_fills_user_data_before_other_controls() -> None:
         assert resume_at < body.index(later), (
             f"简历填充排在了 {later} 之后：前面控件出问题会让简历变空并写回磁盘"
         )
+
+
+def test_disk_state_is_unknown_when_file_unreadable(config_probe, tmp_path: Path) -> None:
+    """文件读不到时必须能区分出来（Load(out ok) 的 ok=false）。
+
+    这是「简历被写回默认值」的活路径：Load 契约是永不失败（失败返回全默认对象），
+    而调用方把它当磁盘真值用 —— 读不到时以全默认为合并基线，就会把内存里的
+    简历/JD 覆盖成空值并写回磁盘。实测 Python 的 os.replace 与 .NET 的
+    File.ReadAllText 并发时 8 秒内出现 9 次读失败，不是理论情况。
+    """
+    config_probe.write_config(
+        tmp_path, {"resumeContext": "项目一：某医疗设备公司", "aiEnabled": True}
+    )
+    target = config_probe.config_file(tmp_path)
+    assert config_probe.load_disk_known(tmp_path) is True, "可读时应对调用方报告「已知」"
+
+    # 独占打开模拟「Python 侧正在写入」：.NET 读会抛 IOException
+    handle = open(target, "r+b")
+    try:
+        assert config_probe.load_disk_known(tmp_path) is False, (
+            "文件被占用时仍报告「已读到」，调用方会拿全默认对象当合并基线"
+        )
+        # 被占用时返回的仍是可用的默认对象（不抛异常）——必须在释放之前读，
+        # 否则测的是「文件正常可读」这条路，等于没覆盖读失败分支。
+        fallback = config_probe.load(tmp_path)
+        assert fallback["resumeContext"] == "", "读失败时应返回默认对象而不是抛异常"
+    finally:
+        handle.close()
+
+    assert config_probe.load_disk_known(tmp_path) is True, "释放后应恢复为「已知」"
+
+
+def test_missing_file_counts_as_known(config_probe, tmp_path: Path) -> None:
+    """文件不存在 = 确实没有配置，算「已知」，不能和读失败混为一谈。
+
+    否则全新安装（还没写过 config.json）时三方合并会被无谓地跳过。
+    """
+    assert config_probe.load_disk_known(tmp_path) is True
+
+
+def test_source_aborts_when_disk_unreadable() -> None:
+    """两个消费点都必须在「磁盘状态未知」时中止，而不是继续用默认值合并。"""
+    source = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+
+    merge_start = source.index("private void MergeExternalChangesBeforeSave()")
+    merge_body = source[merge_start : merge_start + 1400]
+    assert "Load(out diskKnown)" in merge_body, "合并前未取「是否读到」标记"
+    assert "if (!diskKnown) return;" in merge_body, (
+        "读失败时没有中止：会把全默认对象当基线，简历被覆盖后写盘"
+    )
+
+    reload_start = source.index("private void ReloadConfigIfChanged()")
+    reload_body = source[reload_start : reload_start + 1400]
+    assert "Load(out freshKnown)" in reload_body, "热重载未取「是否读到」标记"
+    assert "if (!freshKnown) return;" in reload_body, (
+        "热重载读失败时没有中止：ApplyFrom(全默认) 会清空内存里的简历"
+    )
+
+
+def test_config_model_name_is_not_reset_to_preset() -> None:
+    """自定义模型名不能被设置窗换成预设值。
+
+    网页设置页允许任意模型名（自由文本），而 Sync() 此前写的是
+    SelectedItem + 找不到就选 "deepseek-v4-flash"，于是开关一次设置窗
+    就把 qwen-max 改成 deepseek-v4-flash，下次请求用错误的模型名发出。
+    """
+    body = _method_body("internal void Sync(OverlayConfig config)")
+    assert "aiModelBox.Text = config.AiModel;" in body, (
+        "Sync 未把模型名写进可编辑下拉的 Text（自定义值会丢）"
+    )
+    assert "aiModelBox.SelectedItem = config.AiModel;" not in body, (
+        "Sync 仍在用 SelectedItem 填模型名：不在预设列表里的值会被换成预设值"
+    )
+    apply_body = _method_body("private void ApplyAllSettings()")
+    assert "aiModelBox.Text" in apply_body, "ApplyAllSettings 未以 Text 为准"
+    assert "aiModelBox.SelectedItem" not in apply_body, (
+        "ApplyAllSettings 仍会回落到预设模型名"
+    )
+
+
+def test_nan_config_values_fall_back_to_defaults(config_probe, tmp_path: Path) -> None:
+    """NaN 必须回落默认值；±Infinity 按边界夹紧（与 Python 同口径）。
+
+    Math.Max/Min 遇 NaN 返回 NaN（不是夹紧），C# 会把它继续写盘成非法 JSON
+    `{"opacity":NaN}`；此后 Python 渲染 /api/settings 直接 500，整个设置页不可用，
+    C# 也会在 TimeSpan.FromSeconds(NaN) 抛 ArgumentException。
+    Infinity 则不同：Math.Min(0.98, +∞)=0.98 本来就对，且 Python 的 max/min
+    同样把 ±∞ 夹到边界，两端结果一致 —— 不要一律换成默认值。
+    """
+    config_probe.write_config(tmp_path, {"opacity": float("nan")})
+    loaded = config_probe.load(tmp_path)
+    assert loaded["opacityIsNaN"] is False, "opacity 仍是 NaN（会被写成非法 JSON）"
+    # 必须等于该字段的默认值（与 Python DEFAULTS 一致），不是随手取的边界值
+    assert loaded["opacityRaw"] == "0.88", f"实际={loaded['opacityRaw']}"
+
+    config_probe.write_config(
+        tmp_path, {"aiSilenceSeconds": float("inf"), "width": float("inf")}
+    )
+    loaded = config_probe.load(tmp_path)
+    assert loaded["silenceRaw"] == "8", f"+∞ 未夹到上限: {loaded['silenceRaw']}"
+    assert loaded["width"] == 2200.0, f"+∞ 未夹到上限: {loaded['width']}"
+
+    config_probe.write_config(tmp_path, {"opacity": float("-inf"), "width": float("-inf")})
+    loaded = config_probe.load(tmp_path)
+    assert loaded["opacityRaw"] == "0.45", f"-∞ 未夹到下限: {loaded['opacityRaw']}"
+    assert loaded["width"] == 280.0, f"-∞ 未夹到下限: {loaded['width']}"
+
+
+def test_nan_fallback_values_match_python_defaults() -> None:
+    """C# Normalize 里每个 Finite(x, fallback) 的 fallback 必须等于 Python DEFAULTS。
+
+    写错一个字面量就会让同一份含 NaN 的配置在两端得到不同结果
+    （Python 回默认 0.88、C# 回上界 0.98），表现为「设置页与悬浮窗显示不一致」。
+    这类跨端数值没有类型系统兜底，只能靠表驱动断言守住。
+    """
+    sys.path.insert(0, str(_ROOT))
+    from system_audio_asr.settings import DEFAULTS
+
+    source = _OVERLAY_CS.read_text(encoding="utf-8-sig")
+    mapping = {
+        "Width": "width",
+        "Height": "height",
+        "FontSize": "fontSize",
+        "Opacity": "opacity",
+        "FrameOpacity": "frameOpacity",
+        "AiSilenceSeconds": "aiSilenceSeconds",
+    }
+    found = re.findall(r"(\w+) = Finite\((\w+), ([0-9.]+)\);", source)
+    assert found, "未找到 Finite(...) 调用：NaN 兜底被移除了？"
+    for field, _, fallback in found:
+        key = mapping.get(field)
+        assert key, f"Finite 用在了未登记的字段 {field}，请同步本测试的两端映射表"
+        expected = float(DEFAULTS[key])
+        assert abs(float(fallback) - expected) < 1e-9, (
+            f"{field} 的 NaN 兜底是 {fallback}，Python DEFAULTS 是 {expected}（两端会不一致）"
+        )
+

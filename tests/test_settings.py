@@ -439,3 +439,65 @@ def test_save_accepts_settings_after_bad_field(tmp_path) -> None:
     saved = settings.update_from_web({"settings": {"aiEnabled": True}}, path=path)
     assert saved["aiEnabled"] is True
     assert saved["hotwordExtra"] == "Redis", "保存时把好字段弄丢了"
+
+
+def test_integer_field_survives_infinity(tmp_path) -> None:
+    """maxLines 写成 1e400（JSON 解析成 inf）不能让 load_settings 抛异常。
+
+    maxLines 是唯一走 normalize_settings.integer() 的字段：int(inf) 抛的是
+    OverflowError，它不是 ValueError 子类，漏捕会让 load_settings 整体失败
+    （服务起不来 / 设置页 500），与 normalize_max_tokens 是同一个坑。
+    """
+    path = tmp_path / "config.json"
+    path.write_text('{"maxLines": 1e400, "fontSize": 30}', encoding="utf-8")
+    loaded = settings.load_settings(path)
+    assert loaded["maxLines"] == settings.DEFAULTS["maxLines"]
+    assert loaded["fontSize"] == 30, "inf 字段不该牵连其他字段"
+
+
+def test_save_preserves_unknown_keys(tmp_path) -> None:
+    """磁盘上 Python 不认识的键必须原样保留。
+
+    normalize_settings 只保留 DEFAULTS 里的键，直接整体覆写会静默抹掉
+    C# Overlay 新增或旧版本遗留的键（C# 侧早有 MergeUnknownKeys 处理同一问题）。
+    """
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"resumeContext": "项目一", "futureKey": "keep-me", "anotherKey": {"a": 1}}),
+        encoding="utf-8",
+    )
+    settings.save_settings(settings.load_settings(path), path)
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk.get("futureKey") == "keep-me", "未知键被抹掉了"
+    assert on_disk.get("anotherKey") == {"a": 1}, "未知的复合类型键被抹掉了"
+    assert on_disk.get("resumeContext") == "项目一", "已知键仍在"
+
+
+def test_save_return_value_still_excludes_unknown_keys(tmp_path) -> None:
+    """返回值语义不变：仍只含 DEFAULTS 的键（未知键只补进磁盘）。"""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"futureKey": "x"}), encoding="utf-8")
+    returned = settings.save_settings(settings.load_settings(path), path)
+    assert "futureKey" not in returned
+
+
+def test_nan_and_infinity_normalize_like_csharp(tmp_path) -> None:
+    """NaN 回落默认档、±∞ 夹到边界 —— 与 C# Normalize 同口径。
+
+    两端口径不一致时同一份配置会得到不同结果：C# 的 Math.Max/Min 遇 NaN 原样
+    返回 NaN（会被写成非法 JSON，让 Python 侧 /api/settings 500），而 Python 侧
+    的 float()+夹紧把 ±∞ 夹到端点。这里锁定 Python 侧的行为。
+    """
+    path = tmp_path / "config.json"
+
+    def load(values: dict) -> dict:
+        path.write_text(json.dumps(values, allow_nan=True), encoding="utf-8")
+        return settings.load_settings(path)
+
+    assert load({"opacity": float("nan")})["opacity"] == settings.DEFAULTS["opacity"]
+    assert load({"aiSilenceSeconds": float("nan")})["aiSilenceSeconds"] == settings.DEFAULTS["aiSilenceSeconds"]
+    assert load({"opacity": float("inf")})["opacity"] == 0.98
+    assert load({"opacity": float("-inf")})["opacity"] == 0.45
+    assert load({"aiSilenceSeconds": float("inf")})["aiSilenceSeconds"] == 8.0
+    assert load({"width": float("-inf")})["width"] == 280.0
+

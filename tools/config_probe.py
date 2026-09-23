@@ -81,6 +81,15 @@ def _probe_source() -> str:
                 {
                     internal static void Main(string[] args)
                     {
+                        if (args.Length > 0 && args[0] == "load-ok")
+                        {
+                            // 暴露「磁盘状态是否已知」（Load(out ok)）：调用方据此
+                            // 决定能不能拿它当合并基线，读失败时必须中止本次保存。
+                            bool known;
+                            OverlayConfig probe = OverlayConfig.Load(out known);
+                            Console.Out.Write(known ? "1" : "0");
+                            return;
+                        }
                         OverlayConfig cfg = OverlayConfig.Load();
                         if (args.Length > 0 && args[0] == "save")
                         {
@@ -100,6 +109,11 @@ def _probe_source() -> str:
                         result["visionMaxTokens"] = cfg.VisionMaxTokens;
                         result["aiMaxTokens"] = cfg.AiMaxTokens;
                         result["width"] = cfg.Width;
+                        // NaN 场景要能观察到：用字符串输出而不是数值，
+                        // 否则 JavaScriptSerializer 会写成非法 JSON `NaN`，再也解析不回来。
+                        result["opacityRaw"] = cfg.Opacity.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+                        result["opacityIsNaN"] = double.IsNaN(cfg.Opacity);
+                        result["silenceRaw"] = cfg.AiSilenceSeconds.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
                         Console.Out.Write(new JavaScriptSerializer().Serialize(result));
                     }
                 }
@@ -160,7 +174,12 @@ def _run(config_root: Path, mode: str) -> str:
     exe = _build()
     env = dict(os.environ)
     env["PROBE_CONFIG_ROOT"] = str(config_root)
-    argv = [str(exe)] if mode == "load" else [str(exe), "save"]
+    if mode == "load":
+        argv = [str(exe)]
+    elif mode == "load-ok":
+        argv = [str(exe), "load-ok"]
+    else:
+        argv = [str(exe), "save"]
     # 探针用 Console.Out.Write 输出 JSON（含中文），Windows 下 .NET 控制台默认
     # 代码页不是 UTF-8，因此按字节读回再显式解码，避免 UnicodeDecodeError。
     done = subprocess.run(
@@ -183,6 +202,14 @@ def _run(config_root: Path, mode: str) -> str:
 
 def load(config_root: Path) -> dict:
     return json.loads(_run(config_root, "load"))
+
+
+def load_disk_known(config_root: Path) -> bool:
+    """磁盘状态是否已知：文件不存在或读成功都算已知，读失败为 False。
+
+    调用方（C# 的三方合并 / 配置热重载）据此决定能否拿 Load 的结果当基线。
+    """
+    return _run(config_root, "load-ok") == "1"
 
 
 def save(config_root: Path) -> None:

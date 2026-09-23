@@ -221,14 +221,23 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
 
     def numeric(key: str, low: float, high: float) -> None:
         try:
-            result[key] = max(low, min(high, float(result[key])))
+            number = float(result[key])
         except (TypeError, ValueError):
             result[key] = float(DEFAULTS[key])
+            return
+        # NaN 显式回落默认档，不依赖 min/max 的偶然行为：Python 的 min/max 会把
+        # NaN 判成「不小于任何值」，随参数顺序吸附到上界或下界，跨语言无法对齐；
+        # C# 侧 Math.Max/Min 则原样返回 NaN（写成非法 JSON → 设置页 500）。
+        # 两端统一成「NaN = 默认档」后，同一份配置在两边结果一致。
+        result[key] = float(DEFAULTS[key]) if number != number else max(low, min(high, number))
 
     def integer(key: str, low: int, high: int) -> None:
         try:
             result[key] = max(low, min(high, int(result[key])))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError：JSON 里的 1e400 解析成 inf，int(inf) 抛的不是 ValueError。
+            # maxLines 是唯一走这里、且没有独立 normalizer 兜底的字段，
+            # 漏掉它会让 load_settings 整体失败（与 normalize_max_tokens 同坑）。
             result[key] = int(DEFAULTS[key])
 
     def boolean(key: str) -> None:
@@ -308,10 +317,28 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def save_settings(value: dict[str, Any], path: Path = CONFIG_PATH) -> dict[str, Any]:
+    """写回配置；磁盘上「本函数不认识」的键原样保留。
+
+    normalize_settings 只保留 DEFAULTS 里的键（这是有意的：非法字段不该落盘）。
+    但直接整体覆写会带来另一个后果——C# Overlay 新增、或旧版本遗留的键会被
+    这一次保存静默抹掉（C# 侧早有 MergeUnknownKeys 处理同一问题，见
+    OverlayApp.cs）。故写盘前把磁盘上存在、而本次不写的键补回。
+    返回值仍是不含未知键的 normalized：接口语义不变，只有磁盘内容更完整。
+    """
     normalized = normalize_settings(value)
+    merged: dict[str, Any] = dict(normalized)
+    try:
+        if path.exists():
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+            if isinstance(raw, dict):
+                for key, item in raw.items():
+                    if key not in merged:
+                        merged[key] = item
+    except (OSError, ValueError):
+        pass
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, path)
     return normalized
 
