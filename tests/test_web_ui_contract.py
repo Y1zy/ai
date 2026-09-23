@@ -408,3 +408,28 @@ def test_context_total_limit_matches_python() -> None:
     assert "resume" not in vision and "jd" not in vision, (
         "解题链路又带上了简历/JD：题干在截图里已完整，带上只会拖慢首字"
     )
+
+
+def test_every_server_pushed_message_type_has_a_phone_case() -> None:
+    """服务端推给手机的每种消息，前端都必须有对应 case 分支。
+
+    这类「服务端发了、前端没接」的缺口是静默的：帧落进 switch 后什么都不做。
+    `auto_state` 就漏过一次 —— 连续失败自停后服务端推复位帧，手机上的勾选
+    却一直亮着，用户以为还在自动提交。
+    """
+    source = (_ROOT / "system_audio_asr" / "phone_share.py").read_text(encoding="utf-8")
+    script = _script(_PHONE)
+    handled = set(re.findall(r'case\s+"([a-z_]+)"\s*:', script))
+    assert handled, "未解析到 phone.html 的 switch 分支"
+
+    # phone_share 里出现的 "type" 字面量并非都是手机消息，排除三类：
+    # image_url / text = OpenAI 请求体里的内容分段（图片、文本），发往模型而非手机；
+    # solve_answer = 经 desktop_publisher 给桌面字幕窗的分发，手机端不消费。
+    NON_PHONE_TYPES = {"image_url", "text", "solve_answer"}
+    sent = {
+        match
+        for match in re.findall(r'"type":\s*"([a-z_]+)"', source)
+        if match not in NON_PHONE_TYPES
+    }
+    missing = sorted(sent - handled)
+    assert not missing, f"服务端会推这些消息，手机端没有处理分支: {missing}"

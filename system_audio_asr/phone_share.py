@@ -476,7 +476,13 @@ def normalize_max_solve_images(value: Any) -> int:
 
 
 def normalize_auto_interval_ms(value: Any) -> float:
-    """把任意输入规范到受支持的间隔档位，返回毫秒（供 asyncio.sleep 用）。
+    """把任意输入规范到受支持的间隔档位，返回**毫秒**。
+
+    单位陷阱（2026-09-23 实测）：这里返回的是毫秒，而 asyncio.sleep() 收的是
+    秒，调用处必须 ÷1000 —— 曾经直接把返回值喂给 asyncio.sleep，于是「每 5 秒」
+    实际睡 5000 秒（83 分钟），勾选后只在第一轮立即截屏一次，之后再无动静。
+    状态字段 `_auto_interval_ms` 与 hello 帧都按毫秒走，所以换算只应发生在
+    sleep 调用处，不要改成返回秒。
 
     非法值与越界值都吸附到最近档位：自动提交会真实消耗模型额度，
     不能让手机端传极小值（如 0.1 秒）把额度瞬间烧光。
@@ -763,9 +769,11 @@ class PhoneRelay:
         # 自动提交的降噪状态：连续失败计数 + 上一条已提示的失败文案。
         self._auto_failures = 0
         self._auto_last_failure = ""
-        # 本轮自动提交是否失败（由 _on_solve_delta 在收到失败消息时记录，
-        # auto_loop 每轮开始前清空）。用字符串而不是布尔：要把原因带给降噪逻辑。
-        self._auto_round_failure = ""
+        # 最近一次提交给解题引擎的请求是否来自自动循环（request_solve 里赋值）。
+        # 自动提交的成败要等模型返回（几秒后）才知道，届时 _auto_solve 可能已经
+        # 被停掉，靠它分不清「这轮失败是自动发的还是用户手点的」——手点失败必须
+        # 原文回气泡封口，自动失败必须走降噪，故按提交时的来源单独记一份。
+        self._auto_submitted = False
         # 待解截图缓冲：题干跨多屏时先「加一图」攒起来，再一次性提交（多图一题）。
         # 单独加锁：截屏走线程池、WebSocket 消息走事件循环，两个线程都会改它。
         self._pending_solve_images: list[bytes] = []
@@ -798,16 +806,13 @@ class PhoneRelay:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    def _on_solve_delta(self, text: str, done: bool) -> None:
-        # 「开始新一场」之后，上一场在途的解题流可能还在推快照。
-        # 丢弃属于旧场次的增量，避免它污染新一场的记录与手机聊天流；
-        # 但最后一条 done 仍要放行，否则旧气泡永远停在流式状态。
-        if self._solve_generation != self._session_generation and not done:
-            return
-        # 失败以「解题失败：xxx」的 done 消息形式回来；记下原因供自动循环降噪/自停。
-        # 只认失败前缀，避免把正常回答里出现的「失败」二字误判成失败。
-        if done and text.startswith(_SOLVE_FAILURE_PREFIX):
-            self._auto_round_failure = text[len(_SOLVE_FAILURE_PREFIX):].strip()
+    def _push_solve_message(self, text: str, done: bool) -> None:
+        """把一条解题消息推给手机与桌面字幕窗（不含任何自动循环的统计逻辑）。
+
+        单独拆出来是因为 _note_auto_failure 也要推消息：若它回头调
+        _on_solve_delta，就会在「自动模式下的失败」分支里再统计一次，
+        一次失败被算两次，3 次上限会提前触发。
+        """
         self.schedule_json({"type": "ai", "text": text, "done": done, "source": "solve"})
         publisher = self.desktop_publisher
         if publisher is not None:
@@ -815,6 +820,32 @@ class PhoneRelay:
                 publisher({"type": "solve_answer", "text": text, "done": done})
             except Exception:
                 pass
+
+    def _on_solve_delta(self, text: str, done: bool) -> None:
+        # 「开始新一场」之后，上一场在途的解题流可能还在推快照。
+        # 丢弃属于旧场次的增量，避免它污染新一场的记录与手机聊天流；
+        # 但最后一条 done 仍要放行，否则旧气泡永远停在流式状态。
+        if self._solve_generation != self._session_generation and not done:
+            return
+        if done and self._auto_submitted:
+            # 自动模式的本轮成败只有在这里（真正的结束点）才知道：
+            # solve_engine.solve() 只是起了个后台线程，模型类失败（未启用/无 key/
+            # 网关 400）要几秒后才经这条 done 帧回来。曾经把统计写在 auto_loop 的
+            # 提交点（if submitted），结果这类失败永远统计不到；抓屏失败则每轮推
+            # 一条同样的气泡却一次都不计数，连续失败自停形同虚设。
+            # 用 _auto_submitted（提交时的来源）而不是 _auto_solve（此刻的开关）：
+            # 在途的一轮失败时用户可能刚把开关关掉，靠开关会漏掉这次失败。
+            self._auto_submitted = False
+            if text.startswith(_SOLVE_FAILURE_PREFIX):
+                # 只认失败前缀，避免把正常回答里出现的「失败」二字误判成失败。
+                reason = text[len(_SOLVE_FAILURE_PREFIX):].strip()
+                self._note_auto_failure(reason)
+                # 原文不再单独推：失败已由 _note_auto_failure 以「自动提交失败：…」
+                # 的降噪文案推出（自动模式没有用户点出的待封口气泡），
+                # 再推一次原文只会让同一次失败出现两个气泡。
+                return
+            self._note_auto_success()
+        self._push_solve_message(text, done)
 
     def begin_new_session(self) -> None:
         """标记新一场开始：停自动截图、丢弃缓存帧，并让旧场次的在途流失效。"""
@@ -865,15 +896,28 @@ class PhoneRelay:
 
         task：solve = 解出题目；bug = 找 Bug（同一套截图与流式通道，换提示词）。
 
+        quiet_busy=True 表示本次调用来自自动循环（间隔到了）：此时本次提交的
+        结果交给 _on_solve_delta 在 done 帧上统计，用于降噪与连续失败自停。
+
         busy 时主动推一条 done 提示给手机：否则手机点了「截题+回答」后
         只会看到自己插入的"正在截屏解题…"气泡永远不封口，以为卡住了。
         quiet_busy=True（自动提交）时不推该提示：自动模式下用户没点任何按钮，
         每隔几秒就弹一条"请求还在进行中"只是噪音，且解题本来就可能比间隔慢。
         """
+        # 忙碌路径分两种，必须区别对待，否则会把在途那一轮的成败记错：
+        #  · 自动循环本轮没提交（间隔比解题快）：「还在进行中」不是失败，
+        #    跳过即可，也不能动在途那一轮的来源标记；
+        #  · 用户手点而引擎正忙：这是手动请求的失败，必须让用户看到并封口气泡。
+        #    若此时仍有自动轮在途，它的统计只能让位（该帧没有别的地方可标记），
+        #    最坏结果是漏记一次失败，比「把自动轮误判成成功」轻。
         if self.solve_engine.busy:
             if not quiet_busy:
+                self._auto_submitted = False
                 self._on_solve_delta("上一个解题请求还在进行中，请稍候", True)
             return False
+        # 走到这里说明本轮真的要提交了：先清掉上一轮的来源标记，
+        # 避免它泄漏到本轮（手动提交 + 上一轮自动标记 = 把手动结果算进自动统计）。
+        self._auto_submitted = False
         from .recorder import session_recorder
 
         with self._pending_lock:
@@ -892,6 +936,8 @@ class PhoneRelay:
             except Exception:
                 # 带上统一前缀，自动提交才能识别成本轮失败（否则会误判成成功、
                 # 永远不触发降噪与自停）。
+                if quiet_busy:
+                    self._auto_submitted = True
                 self._on_solve_delta(f"{_SOLVE_FAILURE_PREFIX}电脑端屏幕采集失败", True)
                 return False
         # 多张图共用同一个批次号，落盘时才能整批归到这一次解题上。
@@ -900,6 +946,10 @@ class PhoneRelay:
         self._drain_bytes_threadsafe(images[-1])
         # 记录本次解题属于哪一场，供 _on_solve_delta 判断增量是否已过期
         self._solve_generation = self._session_generation
+        # 标记本次提交来自自动循环，供 _on_solve_delta 在本轮结束时统计成败。
+        # 必须在 solve() 之前置位：模型可能返回得极快，晚置位会漏掉那一帧。
+        if quiet_busy:
+            self._auto_submitted = True
         self.solve_engine.solve(images, task)
         return True
 
@@ -1215,13 +1265,13 @@ class PhoneRelay:
         first_time = reason != self._auto_last_failure
         self._auto_last_failure = reason
         if first_time:
-            self._on_solve_delta(f"自动提交失败：{reason}", True)
+            self._push_solve_message(f"自动提交失败：{reason}", True)
         if self._auto_failures >= AUTO_FAILURE_LIMIT and self._auto_solve:
             # 只在仍在运行时停一次：已经停掉后若还收到失败（在途的一轮），
             # 不再重复喊「已停止」，否则又变成新的刷屏源。
             self._auto_generation += 1  # 让 auto_loop 退出
             self._auto_solve = False
-            self._on_solve_delta(
+            self._push_solve_message(
                 f"自动提交已停止（连续 {self._auto_failures} 次失败）：{reason}",
                 True,
             )
@@ -1251,6 +1301,11 @@ class PhoneRelay:
         interval = normalize_auto_interval_ms(interval_ms)
         self._auto_solve = bool(solve)
         self._auto_interval_ms = interval
+        # 每次开启都从零开始计数：自停时计数停在 AUTO_FAILURE_LIMIT，
+        # 不清零的话用户重新勾选后第一次失败就立刻又停（3+1 ≥ 3），
+        # 看起来像开关坏了、再也不敢用。
+        self._auto_failures = 0
+        self._auto_last_failure = ""
         if not on or self._running_loop() is None:
             self._auto_solve = False
             return
@@ -1259,21 +1314,16 @@ class PhoneRelay:
         async def auto_loop() -> None:
             while generation == self._auto_generation:
                 if solve:
-                    # quiet_busy：自动模式下不因「上一次还在跑」刷提示（见 request_solve）。
-                    # 用返回值与失败回调判断本轮结果，供降噪与连续失败自停使用。
-                    self._auto_round_failure = ""
-                    submitted = await asyncio.to_thread(
-                        self.request_solve, SOLVE_TASK_SOLVE, True
-                    )
-                    # 本轮没有提交（引擎忙）不算失败：跳过即可，不计入失败次数。
-                    if submitted:
-                        if self._auto_round_failure:
-                            self._note_auto_failure(self._auto_round_failure)
-                        else:
-                            self._note_auto_success()
+                    # 这里只负责「提交」：本轮成败要等模型返回（几秒到几十秒后）
+                    # 由 _on_solve_delta 在 done 帧上统计。此处读不到结果——solve()
+                    # 只起了后台线程，抓屏失败也会立刻 return False 而绕过统计，
+                    # 曾经因此让抓屏失败每轮推一条同样的气泡、却永远不自停。
+                    await asyncio.to_thread(self.request_solve, SOLVE_TASK_SOLVE, True)
                 else:
                     await self._capture_and_push()
-                await asyncio.sleep(interval)
+                # 单位换算必须在这里：interval 是毫秒（状态字段/hello 帧都用毫秒），
+                # asyncio.sleep 收的是秒。漏掉 /1000 会让「每 5 秒」睡 5000 秒。
+                await asyncio.sleep(interval / 1000.0)
 
         self._spawn(auto_loop())
 

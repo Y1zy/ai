@@ -454,6 +454,13 @@ function handleText(raw){
     case "solve_pending":
       applySolvePending(msg.count || 0, msg.limit || 3);
       break;
+    case "auto_state":
+      // 服务端自停（连续失败到上限）后推的复位帧：不接的话勾选还亮着、
+      // 实际循环已经退出，用户以为还在自动提交。
+      // 具体原因与次数已由服务端的气泡说明，这里只做一次轻提示。
+      applyAutoState(msg.on, msg.intervalSec);
+      if (!msg.on) showClipStatus("自动提交已停止");
+      break;
   }
 }
 

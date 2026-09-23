@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -21,6 +22,10 @@ from system_audio_asr.settings import (
     normalize_record_image_cap,
     normalize_settings,
 )
+
+
+class _StopAutoLoop(Exception):
+    """测试专用：让 auto_loop 在第一轮等待处退出，不必真的睡满间隔。"""
 
 
 class TestMaxSolveImagesConfig:
@@ -184,6 +189,86 @@ class TestAutoSubmitInterval:
         relay._set_auto(True, 10000, solve=True)
         assert relay._auto_solve is True
         assert relay._auto_interval_ms == 10000
+
+    def test_auto_loop_sleeps_in_seconds_not_milliseconds(self, monkeypatch) -> None:
+        """循环的等待时间必须换算成秒再交给 asyncio.sleep。
+
+        这是 P0 回归：asyncio.sleep 收的是秒，而状态字段是毫秒。曾经把
+        normalize_auto_interval_ms 的返回值（毫秒）直接喂进去，于是「每 5 秒」
+        实际睡 5000 秒 = 83 分钟 —— 用户勾选后只在第一轮立即截屏一次，
+        之后再无动静，看起来就是「定时功能不好使」。
+        """
+        import asyncio
+
+        waits: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            waits.append(seconds)
+            raise _StopAutoLoop  # 记下这一轮的等待时长后立刻退出，测试不真等
+
+        monkeypatch.setattr(phone_share.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(
+            phone_share.PhoneRelay,
+            "request_solve",
+            lambda self, task=None, quiet_busy=False: True,
+        )
+
+        async def scenario() -> None:
+            relay = phone_share.PhoneRelay()
+            relay._set_auto(True, 5000, solve=True)
+            task = next(iter(relay._tasks), None)
+            assert task is not None, "auto_loop 没有被创建"
+            with pytest.raises(_StopAutoLoop):
+                await task
+
+        asyncio.run(scenario())
+        assert waits == [5.0], (
+            f"传给 asyncio.sleep 的是 {waits}，应为 [5.0] 秒；"
+            "若是 [5000.0] 说明又漏了 /1000（每 5 秒会变成 83 分钟）"
+        )
+
+    def test_auto_loop_repeats_at_the_configured_cadence(self, monkeypatch) -> None:
+        """真实时钟端到端：3 秒档在 6 秒内必须发生第 2 次提交。
+
+        单位错误只有在真实等待里才暴露：把 3000 毫秒当秒睡，
+        第二次提交要等 50 分钟，本用例会直接超时失败。
+        """
+        import threading
+        import time
+
+        calls: list[float] = []
+        ready = threading.Event()
+        loop = asyncio.new_event_loop()
+
+        def record(self, task=None, quiet_busy=False) -> bool:
+            calls.append(time.monotonic())
+            if len(calls) >= 2:
+                ready.set()
+            return True
+
+        monkeypatch.setattr(phone_share.PhoneRelay, "request_solve", record)
+        relay = phone_share.PhoneRelay()
+
+        def run_loop() -> None:
+            asyncio.set_event_loop(loop)
+            relay._loop = loop  # 等价于生产里的 bind_loop()，此处线程里没有运行中的循环
+            relay._set_auto(True, 3000, solve=True)
+            loop.run_forever()
+
+        worker = threading.Thread(target=run_loop, daemon=True)
+        worker.start()
+        try:
+            assert ready.wait(timeout=8.0), (
+                f"3 秒档在 8 秒内只提交了 {len(calls)} 次；"
+                "若为 1 次说明间隔被当成了秒（3000 秒）"
+            )
+            # 两次提交的间隔应接近 3 秒，而不是 0（立即连发）
+            assert calls[1] - calls[0] >= 2.5, f"间隔过短: {calls[1] - calls[0]:.2f}s"
+        finally:
+            relay.stop_auto_capture()
+            loop.call_soon_threadsafe(loop.stop)
+            worker.join(timeout=3.0)
+
 
     def test_stop_auto_resets_solve_flag(self, monkeypatch) -> None:
         """停掉自动循环后必须复位标志，否则 hello 会让手机显示成仍在自动提交。"""
@@ -395,62 +480,164 @@ class TestAutoSubmitFailureNoise:
     背景：模型未启用 / 网关不通 / Key 失效时，每次间隔都会推一条同样的失败消息。
     聊天气泡上限是 50 条，按 3 秒间隔算约 2.5 分钟就把上限填满，之前真正的
     解题回答与追问会被整屏重复错误挤掉。
+
+    这些用例刻意走生产入口 `_on_solve_delta`（引擎回调）而不是直接调
+    `_note_auto_failure`：失败统计点曾经错放在 auto_loop 的提交处，直接调叶子
+    函数测不出「真实链路压根统计不到」这个 bug。断言也只看真正推给手机的消息
+    （schedule_json 的载荷），不看内部字段。
     """
 
-    def _relay(self) -> phone_share.PhoneRelay:
-        return phone_share.PhoneRelay()
+    def _relay(self, monkeypatch) -> tuple[phone_share.PhoneRelay, list[dict]]:
+        """建一个处在自动提交状态的中继，并捕获所有下发给手机的载荷。"""
+        relay = phone_share.PhoneRelay()
+        sent: list[dict] = []
+        monkeypatch.setattr(relay, "schedule_json", lambda payload: sent.append(payload))
+        relay._auto_solve = True
+        relay._auto_generation = 7
+        return relay, sent
 
-    def test_first_failure_is_reported(self) -> None:
-        """第一次失败要如实告诉用户原因（不能静默）。"""
-        relay = self._relay()
-        prompts: list[str] = []
-        relay._on_solve_delta = lambda text, done: prompts.append(text)
-        for _ in range(3):
-            relay._note_auto_failure("视觉模型未启用")
-        assert len(prompts) == 1, f"同一失败应只提示一次，实际 {len(prompts)} 次"
-        assert "视觉模型未启用" in prompts[0]
+    @staticmethod
+    def _round_failed(relay: phone_share.PhoneRelay, reason: str) -> None:
+        """模拟自动提交的一轮真实结束：引擎完成一次提交后回调失败。"""
+        relay._auto_submitted = True
+        relay._on_solve_delta(f"{phone_share._SOLVE_FAILURE_PREFIX}{reason}", True)
+
+    def test_first_failure_is_reported(self, monkeypatch) -> None:
+        """第一次失败要如实告诉用户原因（不能静默），后续重复的同一失败不再推送。"""
+        relay, sent = self._relay(monkeypatch)
+        # 只跑 2 轮（未到自停上限），单看降噪：同一文案只提示第一次
+        for _ in range(2):
+            self._round_failed(relay, "视觉模型未启用")
+        texts = [p["text"] for p in sent if p.get("type") == "ai"]
+        assert len(texts) == 1, f"同一失败应只提示一次，实际 {len(texts)} 次: {texts}"
+        assert "视觉模型未启用" in texts[0]
 
     def test_repeated_failure_stops_loop(self, monkeypatch) -> None:
         """连续失败到上限要停止循环，并推一条停止通知。"""
-        relay = self._relay()
-        prompts: list[str] = []
-        relay._on_solve_delta = lambda text, done: prompts.append(text)
-        relay._auto_generation = 7
-        relay._auto_solve = True  # 模拟自动提交正在运行（真实流程由 _set_auto 置位）
-
+        relay, sent = self._relay(monkeypatch)
         for _ in range(phone_share.AUTO_FAILURE_LIMIT + 2):
-            relay._note_auto_failure("电脑端屏幕采集失败")
+            self._round_failed(relay, "电脑端屏幕采集失败")
 
+        texts = [p["text"] for p in sent if p.get("type") == "ai"]
         # 首次失败 + 停止通知 = 2 条；中间的重复失败与停后的在途失败都不再刷屏
-        assert len(prompts) == 2, f"应只推 2 条（首次 + 停止），实际 {len(prompts)}: {prompts}"
-        assert "已停止" in prompts[-1]
+        assert len(texts) == 2, f"应只推 2 条（首次 + 停止），实际 {len(texts)}: {texts}"
+        assert "已停止" in texts[-1]
         assert relay._auto_generation != 7, "未停止自动循环（generation 未递增）"
         assert relay._auto_solve is False, "未复位自动提交标志"
+        # 自停必须复位手机上的勾选：auto_state 是唯一能让界面同步的帧
+        states = [p for p in sent if p.get("type") == "auto_state"]
+        assert states and states[-1]["on"] is False, "未推 auto_state 复位帧"
 
-    def test_success_resets_failure_streak(self) -> None:
+    def test_capture_failure_counts_toward_self_stop(self, monkeypatch) -> None:
+        """抓屏失败必须走同一条统计：曾经每轮推一条气泡却永不计数。
+
+        request_solve 在抓屏失败时推「解题失败：电脑端屏幕采集失败」并
+        return False；若统计只写在提交成功后的分支（if submitted），
+        这类失败每轮刷一条气泡、连续失败计数却永远是 0，永远不会自停。
+        """
+        relay, sent = self._relay(monkeypatch)
+        monkeypatch.setattr(
+            phone_share, "capture_screen_jpeg",
+            lambda: (_ for _ in ()).throw(RuntimeError("采集失败")),
+        )
+        for _ in range(phone_share.AUTO_FAILURE_LIMIT + 1):
+            relay.request_solve(phone_share.SOLVE_TASK_SOLVE, True)
+            relay._solve_generation = relay._session_generation  # 场次一致，增量不过期
+
+        texts = [p["text"] for p in sent if p.get("type") == "ai"]
+        assert len(texts) == 2, f"抓屏失败的降噪失效，推出 {len(texts)} 条: {texts}"
+        assert "已停止" in texts[-1], "抓屏失败没有触发连续失败自停"
+        assert relay._auto_solve is False
+
+    def test_success_resets_failure_streak(self, monkeypatch) -> None:
         """中途成功要清零计数，否则偶发失败累积几次就被误停。"""
-        relay = self._relay()
-        prompts: list[str] = []
-        relay._on_solve_delta = lambda text, done: prompts.append(text)
-        relay._auto_generation = 3
+        relay, sent = self._relay(monkeypatch)
 
-        relay._note_auto_failure("失败 A")
-        relay._note_auto_success()
-        relay._note_auto_failure("失败 B")
+        self._round_failed(relay, "失败 A")
+        relay._auto_submitted = True
+        relay._on_solve_delta("正常答案", True)  # 本轮成功
+        self._round_failed(relay, "失败 B")
 
         assert relay._auto_failures == 1, "成功后未清零失败计数"
-        assert relay._auto_generation == 3, "不应停止"
-        # 两次失败文案不同，各提示一次
-        assert len(prompts) == 2
+        assert relay._auto_generation == 7, "不应停止"
+        texts = [p["text"] for p in sent if p.get("type") == "ai"]
+        # 失败 A、正常答案、失败 B 各一条；两次失败文案不同，各提示一次
+        assert len(texts) == 3, f"实际 {len(texts)}: {texts}"
+        assert "正常答案" in texts[1]
 
-    def test_different_failure_message_is_reported(self) -> None:
+    def test_different_failure_message_is_reported(self, monkeypatch) -> None:
         """失败原因变化时要再提示一次，否则用户看不到新原因。"""
-        relay = self._relay()
-        prompts: list[str] = []
-        relay._on_solve_delta = lambda text, done: prompts.append(text)
-        relay._note_auto_failure("视觉模型未启用")
-        relay._note_auto_failure("电脑端屏幕采集失败")
-        assert len(prompts) == 2, "失败原因变化后未再提示"
+        relay, sent = self._relay(monkeypatch)
+        self._round_failed(relay, "视觉模型未启用")
+        self._round_failed(relay, "电脑端屏幕采集失败")
+        texts = [p["text"] for p in sent if p.get("type") == "ai"]
+        assert len(texts) == 2, "失败原因变化后未再提示"
+
+    def test_reenabled_after_self_stop_gets_full_quota(self, monkeypatch) -> None:
+        """自停后重新开启要清零计数，否则第一次失败就立刻又停。"""
+        relay = phone_share.PhoneRelay()
+        sent: list[dict] = []
+        monkeypatch.setattr(relay, "schedule_json", lambda payload: sent.append(payload))
+        monkeypatch.setattr(relay, "_spawn", lambda coro: coro.close())
+        monkeypatch.setattr(relay, "_running_loop", lambda: asyncio.new_event_loop())
+
+        relay._set_auto(True, 3000, solve=True)
+        assert relay._auto_failures == 0
+        for _ in range(phone_share.AUTO_FAILURE_LIMIT):
+            self._round_failed(relay, "视觉模型未启用")
+        assert relay._auto_solve is False, "连续失败未自停"
+
+        # 用户重新勾选：计数必须归零，否则下一次失败立刻又停
+        relay._set_auto(True, 3000, solve=True)
+        assert relay._auto_failures == 0, "重新开启未清零失败计数"
+        assert relay._auto_solve is True
+        self._round_failed(relay, "视觉模型未启用")
+        assert relay._auto_solve is True, "重新开启后第一次失败就停了（计数未清零）"
+
+    def test_manual_failure_still_reports_raw_text(self, monkeypatch) -> None:
+        """手动点「截题+回答」失败时必须推原文封口气泡，不能走自动降噪。"""
+        relay = phone_share.PhoneRelay()
+        sent: list[dict] = []
+        monkeypatch.setattr(relay, "schedule_json", lambda payload: sent.append(payload))
+        relay._auto_solve = True
+        relay._auto_submitted = False  # 这一轮是用户手点的
+        relay._on_solve_delta(f"{phone_share._SOLVE_FAILURE_PREFIX}视觉模型未启用", True)
+        texts = [p["text"] for p in sent if p.get("type") == "ai"]
+        assert texts == [f"{phone_share._SOLVE_FAILURE_PREFIX}视觉模型未启用"]
+        assert relay._auto_failures == 0, "手动失败被算进了自动提交的失败计数"
+
+    def test_busy_skip_is_not_a_failure(self, monkeypatch) -> None:
+        """间隔比解题快时的「还在进行中」不是失败，不能累积成自停。"""
+        relay, _ = self._relay(monkeypatch)
+        relay.solve_engine._busy.acquire()
+        try:
+            for _ in range(phone_share.AUTO_FAILURE_LIMIT + 2):
+                relay.request_solve(phone_share.SOLVE_TASK_SOLVE, True)
+        finally:
+            relay.solve_engine._busy.release()
+        assert relay._auto_failures == 0, "忙碌跳过被误计为失败"
+        assert relay._auto_solve is True, "忙碌跳过把自动循环停掉了"
+        assert relay._auto_submitted is False, "忙碌跳过后仍带着来源标记（下一帧会被错记）"
+
+    def test_manual_click_while_auto_round_running_still_reports(self, monkeypatch) -> None:
+        """自动轮在途时用户手点「截题+回答」：手动的忙碌提示必须照常推出并封口气泡。
+
+        且这条提示不能被当成在途自动轮的结果 —— 否则它的 done 会被
+        _on_solve_delta 记成「本轮成功」，把已经累积的失败计数清零，
+        连续失败自停就再也数不满（用户手点一下就能「续命」）。
+        """
+        relay, sent = self._relay(monkeypatch)
+        relay._auto_failures = 2  # 自动提交已经失败过两次
+        relay._auto_last_failure = "视觉模型未启用"
+        relay._auto_submitted = True  # 在途的自动轮还没返回
+        relay.solve_engine._busy.acquire()
+        try:
+            assert relay.request_solve() is False
+        finally:
+            relay.solve_engine._busy.release()
+        texts = [p["text"] for p in sent if p.get("type") == "ai"]
+        assert texts and "进行中" in texts[-1], f"手动忙碌提示没有推出: {texts}"
+        assert relay._auto_failures == 2, "手动的忙碌提示把自动提交的失败计数清零了"
 
 
 class TestRecordImageCapConfig:
