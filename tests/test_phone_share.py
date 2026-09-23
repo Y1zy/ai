@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1100,3 +1101,69 @@ def test_phone_status_ok_when_config_broken(tmp_path: Path, monkeypatch):
         create_app(AppConfig()), client=("127.0.0.1", 51000)
     )
     assert client.get("/api/phone/status").status_code == 200
+
+
+class TestSessionResetGuard:
+    """「开始新一场」必须只允许本机调用。
+
+    开启手机投屏时服务监听 0.0.0.0，这条路由此前是唯一漏了 require_local 的写操作：
+    同一 WiFi 下任何设备发一个 POST 就能清空字幕/AI 对话/解题记录/待解截图。
+    """
+
+    @pytest.fixture()
+    def app_and_relay(self, tmp_path: Path, monkeypatch):
+        """返回 (app, relay)：relay 是 server.create_app 内部真正在用的那个实例。
+
+        场次编号的自增是 session/reset 的副作用之一，必须看同一个实例才能验证
+        「被拒时没有副作用」，故在构造前把 sys.modules 里的 PhoneRelay 换成
+        记录实例的包装（create_app 里 `phone_relay = PhoneRelay()` 会命中它）。
+        """
+        pytest.importorskip("fastapi.testclient")
+        pytest.importorskip("soundcard")
+        from system_audio_asr import server as server_module
+        from system_audio_asr.config import AppConfig
+
+        monkeypatch.setattr(phone_share, "PHONE_CONFIG_PATH", tmp_path / "phone_share.json")
+        created: list[Any] = []
+        real_relay = phone_share.PhoneRelay
+
+        def tracking_relay() -> Any:
+            instance = real_relay()
+            created.append(instance)
+            return instance
+
+        monkeypatch.setattr(server_module, "PhoneRelay", tracking_relay)
+        app = server_module.create_app(AppConfig())
+        assert created, "create_app 未构造 PhoneRelay"
+        return app, created[-1]
+
+    def test_sets_session_generation_only_from_loopback(self, app_and_relay) -> None:
+        """回环地址可调用（桌面与设置页都走 127.0.0.1）。"""
+        fastapi_testclient = pytest.importorskip("fastapi.testclient")
+        app, _ = app_and_relay
+        client = fastapi_testclient.TestClient(app, client=("127.0.0.1", 51000))
+        assert client.post("/api/session/reset").status_code == 200
+
+    def test_rejects_lan_client(self, app_and_relay) -> None:
+        """来自局域网的调用必须 403：否则同 WiFi 的任意设备能清空当前场次。"""
+        fastapi_testclient = pytest.importorskip("fastapi.testclient")
+        app, _ = app_and_relay
+        client = fastapi_testclient.TestClient(app, client=("192.168.31.99", 51000))
+        response = client.post("/api/session/reset")
+        assert response.status_code == 403, (
+            f"局域网调用返回 {response.status_code}，应当被 require_local 拦下"
+        )
+
+    def test_lan_rejection_does_not_clear_records(self, app_and_relay) -> None:
+        """被拒时必须没有副作用：记录与场次编号都不能变。"""
+        fastapi_testclient = pytest.importorskip("fastapi.testclient")
+        from system_audio_asr import recorder
+
+        app, relay = app_and_relay
+        before_generation = relay._session_generation
+        before_entries = recorder.session_recorder.stats()
+        client = fastapi_testclient.TestClient(app, client=("192.168.31.99", 51000))
+        client.post("/api/session/reset")
+        assert relay._session_generation == before_generation, "被拒的请求仍推进了场次编号"
+        assert recorder.session_recorder.stats() == before_entries, "被拒的请求仍清了记录"
+

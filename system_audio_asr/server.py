@@ -565,7 +565,12 @@ def create_app(config: AppConfig) -> FastAPI:
         （否则新一场手机扫进来会先看到上一场截图，旧解题答案也会混进新一场）；
         再广播 reset_session 通知桌面 Overlay 清空对话历史/字幕/AI 输出，
         以及手机端清空聊天流。配置、知识库、简历等长期资料不受影响。
+
+        require_local：开启手机投屏时服务监听 0.0.0.0，缺了这道守卫，
+        同一 WiFi 下任何设备发一个 POST 就能清空正在进行的面试场次
+        （曾漏掉此守卫，与 records/clear 等写操作保持同一口径）。
         """
+        require_local(request)
         session_recorder.clear()
         with phone_relay._chat_lock:
             phone_relay.phone_chat_history.clear()
