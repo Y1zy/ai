@@ -80,7 +80,25 @@ internal static class OverlayCapture
     internal static int Main(string[] args)
     {
         if (args.Length < 1) return 2;
-        int delay = args.Length > 1 ? Convert.ToInt32(args[1]) : 0;
+        // 参数 0 是输出路径，但子命令（--xxx）也可以放在这个位置。
+        // 此前不区分会把 "--capture-affinity" 当成路径：走到默认分支执行截图，
+        // 在磁盘上留下一个名为 --capture-affinity 的 PNG（bin/ 下真出现过两个）。
+        if (args[0].StartsWith("--"))
+        {
+            Console.Error.WriteLine(
+                "用法: OverlayCapture.exe <输出.png> [延迟ms] [子命令]\n" +
+                "  或在 args[2] 位置给出子命令，例如: OverlayCapture.exe out.png 0 --hit-test\n" +
+                "  收到: " + string.Join(" ", args));
+            return 2;
+        }
+        // 非数字延迟不能抛异常（此前 Convert.ToInt32 会直接以 CLR 错误退出）：
+        // 按 0 处理，并把输入原样说明出来，便于排查脚本拼错参数。
+        int delay = 0;
+        if (args.Length > 1 && !int.TryParse(args[1], out delay))
+        {
+            Console.Error.WriteLine("延迟参数不是整数，按 0 处理: " + args[1]);
+            delay = 0;
+        }
         if (delay > 0) Thread.Sleep(delay);
         Process[] processes = Process.GetProcessesByName("SystemAudioOverlay");
         if (processes.Length == 0) return 3;
@@ -116,14 +134,6 @@ internal static class OverlayCapture
             if (!GetWindowDisplayAffinity(overlay, out affinity)) return 8;
             Console.WriteLine("affinity=" + affinity + " title=" + target);
             return affinity == 17 ? 0 : 7;
-        }
-        if (title == "--graceful-exit")
-        {
-            IntPtr overlay = FindWindow((uint)processes[0].Id, "系统声音实时字幕 Overlay");
-            if (overlay == IntPtr.Zero) return 6;
-            SendMessage(overlay, 0x8030, IntPtr.Zero, IntPtr.Zero);
-            Console.WriteLine("graceful exit requested");
-            return 0;
         }
         if (title == "--scroll-up" || title == "--scroll-down")
         {

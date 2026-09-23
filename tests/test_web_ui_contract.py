@@ -433,3 +433,119 @@ def test_every_server_pushed_message_type_has_a_phone_case() -> None:
     }
     missing = sorted(sent - handled)
     assert not missing, f"服务端会推这些消息，手机端没有处理分支: {missing}"
+
+
+def test_settings_save_is_locked_after_load_failure() -> None:
+    """设置页加载失败后必须禁止保存。
+
+    保存会把输入框的值整体提交，而空串是合法值：加载失败时输入框全空，
+    点一次「保存并应用」就等于清空简历/JD/附加背景。
+    """
+    script = _script(_SETTINGS)
+    assert "loadFailed" in script, "缺少加载失败标记"
+    # load() 的失败分支要锁保存
+    load_start = script.index("async function load()")
+    load_end = script.index("function renderMissingKeys")
+    load_body = script[load_start:load_end]
+    assert "setSaveLocked(true" in load_body, "load() 失败时没有锁住保存按钮"
+    assert "setSaveLocked(false)" in load_body, "load() 成功时没有解锁保存按钮"
+    # save() 入口要有守卫
+    save_start = script.index("async function save()")
+    save_body = script[save_start : save_start + 400]
+    assert "if(loadFailed)" in save_body, "save() 没有检查加载失败标记"
+
+
+def test_vision_prompt_not_submitted_when_templates_failed() -> None:
+    """内置提示词没加载成功时，保存不得提交该字段（否则会清空自定义指令）。"""
+    script = _script(_SETTINGS)
+    start = script.index("function customPromptPayload")
+    body = script[start : start + 600]
+    assert "return undefined" in body, (
+        "模板未加载时 customPromptPayload 应返回 undefined（=不提交），而不是空串（=清空）"
+    )
+    assert "customPromptLoaded" in body, "未按加载状态区分"
+    save_start = script.index("async function save()")
+    save_body = script[save_start : save_start + 900]
+    assert "custom!==undefined" in save_body, "save() 未跳过未加载的提示词字段"
+
+
+def test_vision_save_locked_when_vision_config_failed() -> None:
+    """视觉配置加载失败后必须禁止保存该区块。
+
+    否则空串会覆盖 solvePrompt / visionBaseUrl / visionModel，
+    而用户在界面上看不出「空」与「没加载到」的区别。
+    """
+    script = _script(_SETTINGS)
+    vision_start = script.index("async function loadVisionConfig")
+    vision_body = script[vision_start : vision_start + 900]
+    assert "visionLoadFailed=true" in vision_body, "失败时未置标记"
+    assert "btn.disabled=true" in vision_body, "失败时未禁用保存按钮"
+    save_start = script.index("$('saveVision').onclick")
+    save_body = script[save_start : save_start + 300]
+    assert "if(visionLoadFailed)" in save_body, "saveVision 入口没有守卫"
+
+
+def test_vision_enabled_is_restored_into_settings_page() -> None:
+    """「启用截图解题」勾选框必须回填。
+
+    此前 visionEnabled 只被读取（保存时）从不写入（加载时）：配置为 true 时
+    页面显示未勾选，用户改个模型点保存就把 false 写回，静默关闭截图解题。
+    """
+    script = _script(_SETTINGS)
+    ids_match = re.search(r"const ids=\[([^\]]+)\]", script)
+    assert ids_match, "未找到 ids 列表"
+    ids = re.findall(r"'([A-Za-z0-9_]+)'", ids_match.group(1))
+    assert "visionEnabled" in ids, "visionEnabled 不在回填列表里（勾选框永远是未勾选）"
+
+
+def test_empty_done_frame_closes_streaming_bubble() -> None:
+    """空文本 done 帧必须走封口逻辑（渲染正确性由 check_phone_render.py 深测）。
+
+    这里只锁「接线」：handleText 在空文本 + done 时要调 closeOpenBubble。
+    桌面端取消请求/重置会话发的就是这种帧，不封口气泡会永远停在流式态。
+    """
+    script = _script(_PHONE)
+    ai_case = script.index('case "ai":')
+    next_case = script.index('case "session_reset":', ai_case)
+    body = script[ai_case:next_case]
+    assert "closeOpenBubble()" in body, "空 done 帧没有调用 closeOpenBubble（气泡不会收尾）"
+    empty_at = body.index('if (!String(msg.text || "").trim())')
+    call_at = body.index("closeOpenBubble()")
+    assert call_at > empty_at, "closeOpenBubble 没有写在空文本分支里"
+    # 函数本身要存在且导出给检查工具
+    assert "function closeOpenBubble" in script, "缺少 closeOpenBubble 定义"
+
+
+def test_toast_is_outside_collapsed_details() -> None:
+    """短暂反馈必须在折叠区之外可见。
+
+    原先写进剪贴板卡片内部的 #clip-status，而那张卡片默认折叠 ——
+    剪贴板结果、模式切换确认、自动提交自停通知用户全都看不到。
+    """
+    markup = _markup(_PHONE)
+    assert 'id="toast"' in markup, "缺少顶层提示条 #toast"
+    toast_at = markup.index('id="toast"')
+    # 不得落在任何 <details> 里：检查它之前最近的 details 开合状态
+    before = markup[:toast_at]
+    assert before.count("<details") == before.count("</details>"), (
+        "#toast 落在了折叠的 <details> 内部，用户看不到"
+    )
+    script = _script(_PHONE)
+    toast_start = script.index("function showClipStatus")
+    toast_body = script[toast_start : toast_start + 700]
+    assert 'getElementById("toast")' in toast_body, "showClipStatus 仍写往旧位置"
+    assert "clip-status" not in toast_body, "showClipStatus 仍在写折叠区"
+
+
+def test_phone_localstorage_access_is_guarded() -> None:
+    """localStorage 读写必须兜底：它抛异常会让整页脚本中断在 connect() 之前。
+
+    顶层初始化 applyFs(fsIndex()) 在 connect() 之前，浏览器禁用存储时
+    直接抛出去 → 页面永远「未连接」且无任何提示。
+    """
+    script = _script(_PHONE)
+    for name in ("fsIndex", "applyFs"):
+        start = script.index("function " + name)
+        body = script[start : start + 700]
+        assert "try" in body, f"{name} 里的 localStorage 访问没有 try 兜底"
+

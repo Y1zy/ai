@@ -3520,11 +3520,9 @@ namespace WasapiParaformerOverlay
                 TogglePositionLock();
                 handled = true;
             }
-            else if (message == 0x8030)
-            {
-                RequestShutdown();
-                handled = true;
-            }
+            // 0x8030（外部请求退出）已移除：它没有任何真实调用方（OverlayCapture 的
+            // --graceful-exit 子命令同样无人调用），却让本机任意同用户进程只要
+            // FindWindow + PostMessage 就能在面试中途静默关掉悬浮窗。
             return IntPtr.Zero;
         }
 

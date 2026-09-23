@@ -114,6 +114,11 @@ main{padding-bottom:132px}
 .cursor::after{content:"▌";color:#60a5fa;animation:blink .8s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
 .hidden{display:none}
+/* 操作反馈条：位于折叠区之外，任何时刻都可见。
+   连续两条提示时重置计时器，避免第一条被提前吞掉。 */
+.toast{background:rgba(96,165,250,.14);border:1px solid rgba(96,165,250,.35);
+  color:#cbd5e1;border-radius:8px;padding:8px 10px;font-size:calc(var(--fs) - 3px);
+  line-height:1.5;animation:fadeIn .2s ease}
 </style>
 </head>
 <body>
@@ -126,6 +131,10 @@ main{padding-bottom:132px}
 </header>
 <main>
   <div id="banner" class="err hidden"></div>
+  <!-- 短暂的操作反馈（剪贴板结果 / 模式切换 / 自动提交自停等）。
+       必须放在折叠区之外：原先写在剪贴板卡片内部的 #clip-status 里，
+       而那张卡片默认折叠 —— 所有提示用户根本看不到。 -->
+  <div id="toast" class="toast hidden"></div>
   <!-- 截图放最上面：打开页面先看到「电脑现在是什么画面」，这是投屏最主要的信息。
        保存按钮紧跟其后（它保存的就是这张图），也让吸底栏只留高频动作。 -->
   <div id="img-wrap" class="img-wrap hidden"><img id="img" alt="电脑屏幕截图"></div>
@@ -179,7 +188,7 @@ main{padding-bottom:132px}
         <button id="clip-send" class="btn btn-primary">把手机剪贴板发到电脑</button>
       </div>
       <label class="switchline" style="margin-top:8px"><input id="clip-auto" type="checkbox">自动同步手机剪贴板到电脑（需浏览器授权，HTTP 局域网下多数手机不支持）</label>
-      <div id="clip-status" class="tip hidden"></div>
+      <!-- 提示统一走顶部的 #toast：卡片默认折叠，写在这里等于看不到。 -->
     </div>
   </details>
   <div id="feed"></div>
@@ -236,7 +245,17 @@ function setStatus(on){
   $status.className = "badge " + (on ? "b-on" : "b-off");
   $status.textContent = on ? "已连接 · 电脑在线" : "未连接";
 }
-function setErr(msg){ $err.innerHTML = msg ? '<div class="err">'+msg+'</div>' : ""; }
+// 错误提示：用 DOM 节点而不是 innerHTML。msg 目前都来自服务端常量，
+// 但整页其余部分（回答、字幕）一律不走 HTML 拼接，这里保持一致，
+// 免得以后某个调用点把非受信字符串接进来就变成注入面。
+function setErr(msg){
+  $err.textContent = "";
+  if (!msg) return;
+  var div = document.createElement("div");
+  div.className = "err";
+  div.textContent = msg;
+  $err.appendChild(div);
+}
 
 fetch("/api/phone/status").then(function(r){ return r.json(); }).then(function(data){
   if (!data.enabled) { $banner.textContent = "电脑端尚未启用手机投屏：请在电脑设置页勾选启用并重启 start.ps1。"; $banner.classList.remove("hidden"); }
@@ -363,6 +382,24 @@ function renderChatBody(el, text){
   }
 }
 
+// 封口最后一条仍在流式状态的气泡。
+// 用途：桌面端取消请求/重置会话时发的是 {text:"", done:true}（见 C# CancelAiRequest
+// 与 ResetConversation），此时没有正文可写，但那条气泡必须收尾 ——
+// 否则它永远带着 ▍ 光标停在「正在生成」，且因 dataset.open 仍是 "1"，
+// 同一轮后续的帧还会继续合并进这条旧气泡。
+function closeOpenBubble(){
+  var last = $chatFlow.lastChild;
+  if (!last || !last.dataset || last.dataset.open !== "1") return;
+  last.dataset.open = "0";
+  var kind = { "chat-me":"me", "chat-solve":"solve", "chat-desktop":"desktop", "chat-question":"question" }[last.dataset.kind] || "ai";
+  var body = last.querySelector("span:last-child");
+  // 流式期间 setChatContent 会在文本末尾附一个光标字符（见其实现），
+  // 封口时要把它去掉，否则气泡收起后仍带着 ▍ 看起来还在生成。
+  var text = body ? body.textContent : "";
+  text = text.replace(/\s*▍\s*$/, "");
+  setChatContent(last, chatPrefix(kind), text, false);
+}
+
 function handleText(raw){
   var msg; try { msg = JSON.parse(raw); } catch(_) { return; }
   switch (msg.type) {
@@ -397,6 +434,8 @@ function handleText(raw){
       }
       if (!String(msg.text || "").trim()) {
         if (msg.source === "ask") pendingAskText = "";
+        // 空文本 + done 是「收尾」信号（桌面取消/重置）：要把上一条气泡封口。
+        if (msg.done) closeOpenBubble();
         break;
       }
       if (msg.source === "ask") {
@@ -846,11 +885,21 @@ document.getElementById("clip-send").onclick = function(){
     if (text !== null) finish(text);
   }
 };
+// 短暂反馈：写在 #toast（折叠区之外，任何时刻可见）。
+// 剪贴板卡片里的 #clip-status 是折叠的，写在那里等于用户看不到
+// —— 剪贴板结果、模式切换确认、自动提交自停通知都曾因此静默。
+var toastTimer = null;
 function showClipStatus(message){
-  var clipStatus = document.getElementById("clip-status");
-  clipStatus.textContent = message;
-  clipStatus.classList.remove("hidden");
-  setTimeout(function(){ clipStatus.classList.add("hidden"); }, 3000);
+  var toast = document.getElementById("toast");
+  if (!toast) return;
+  toast.textContent = message;
+  toast.classList.remove("hidden");
+  // 重新计时而不是叠加：连续两条提示时，第一条不该被第二条的计时器提前隐藏。
+  if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+  toastTimer = setTimeout(function(){
+    toast.classList.add("hidden");
+    toastTimer = null;
+  }, 3000);
 }
 
 // ---------------------------------------------------------------- 诊断面板
@@ -973,10 +1022,15 @@ document.getElementById("debug-clear").onclick = function(){
 };
 
 // 字号档位：点「Aa」循环切换，记住选择。默认「大」——面试时手机常放在远处看。
+// localStorage 必须兜底：浏览器禁用存储 / 配额满 / WebView 策略拦截时它会抛异常，
+// 而顶层初始化（applyFs(fsIndex())）在 connect() 之前 —— 抛出去会让整页脚本中断，
+// 表现是永远「未连接」，且没有任何提示。
 var FS_STEPS = [{name:"小",px:15},{name:"中",px:17},{name:"大",px:19},{name:"特大",px:22}];
 var FS_DEFAULT = 2;
 function fsIndex(){
-  var saved = parseInt(localStorage.getItem("voxribbon.fs") || "", 10);
+  var raw = null;
+  try { raw = localStorage.getItem("voxribbon.fs"); } catch(_) { return FS_DEFAULT; }
+  var saved = parseInt(raw || "", 10);
   return (saved >= 0 && saved < FS_STEPS.length) ? saved : FS_DEFAULT;
 }
 function applyFs(index){
@@ -985,7 +1039,7 @@ function applyFs(index){
   var btn = document.getElementById("fs-btn");
   btn.textContent = "Aa " + step.name;
   btn.title = "字号：" + step.name + "（点击切换）";
-  localStorage.setItem("voxribbon.fs", String(index));
+  try { localStorage.setItem("voxribbon.fs", String(index)); } catch(_) { /* 存不下就算了，不影响本次会话 */ }
 }
 // 切换后在按钮上回显档位名，1.2 秒后收回 "Aa"，避免顶栏被撑宽。
 var fsResetTimer = null;

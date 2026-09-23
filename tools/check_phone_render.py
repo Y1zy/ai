@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PHONE = ROOT / "system_audio_asr" / "web" / "phone.html"
 
 # 需要抽出来一起跑的函数（顺序无关，均为 function 声明，靠 hoisting 互相可见）
-WANTED = ("stripMarkdown", "renderChatBody", "setChatContent")
+WANTED = ("stripMarkdown", "renderChatBody", "setChatContent", "chatPrefix", "closeOpenBubble")
 
 # 生产链路里各消息源都会先经过 stripMarkdown（见 phone.html 的 handleText）
 SAMPLE = """先用前缀和把区间查询降到 O(1)：
@@ -63,7 +63,7 @@ EXPECTED_CODE = (
 # 最小 DOM 桩：只覆盖被测函数用到的成员。作为独立模块被 require 进被测代码。
 DOM_STUB = """'use strict';
 function makeElement(tag){
-  return {
+  var el = {
     tagName: tag,
     className: '',
     _text: '',
@@ -81,6 +81,18 @@ function makeElement(tag){
       this.children.push(child);
       return child;
     },
+    // closeOpenBubble 用 lastChild 找最后一条气泡，并在其上 querySelector 取正文
+    get lastChild(){
+      return this.children.length ? this.children[this.children.length - 1] : null;
+    },
+    querySelector(selector){
+      // 只需支持 "span:last-child" 这一种（取最后一个 span 子节点）
+      if (selector === 'span:last-child') {
+        var spans = this.children.filter(function(c){ return c.tagName === 'span'; });
+        return spans.length ? spans[spans.length - 1] : null;
+      }
+      return null;
+    },
     querySelectorAll(selector){
       var byClass = selector.charAt(0) === '.';
       var want = byClass ? selector.slice(1) : selector;
@@ -97,25 +109,28 @@ function makeElement(tag){
       return out;
     }
   };
+  return el;
 }
 globalThis.makeElement = makeElement;
 globalThis.document = {
   createElement: makeElement,
   createTextNode: function(text){
-    return { textContent: String(text), children: [], className: '', style: {} };
+    return { tagName: '', textContent: String(text), children: [], className: '', style: {} };
   }
 };
+// closeOpenBubble 依赖全局 $chatFlow（真实页面里是 getElementById 的结果）
+globalThis.$chatFlow = makeElement('div');
 """
 
 # 以模块方式加载被测函数：把抽取出的函数体写成模块，导出后由 runner 调用。
 # 不使用 eval / new Function —— 被测内容是仓库源码，但仍按普通模块加载。
 MODULE_FOOTER = """
-module.exports = { stripMarkdown, renderChatBody, setChatContent };
+module.exports = { stripMarkdown, renderChatBody, setChatContent, chatPrefix, closeOpenBubble };
 """
 
 RUNNER = """'use strict';
 require('./dom_stub.js');
-const { stripMarkdown, setChatContent } = require('./under_test.js');
+const { stripMarkdown, setChatContent, chatPrefix, closeOpenBubble } = require('./under_test.js');
 // 必须 JSON.parse：argv 传进来的换行是字面量 \\n 转义，
 // 直接当字符串用会让整段样本变成「一行」，围栏检测与逐行清理全部失效。
 const sample = JSON.parse(process.argv[2]);
@@ -127,12 +142,31 @@ setChatContent(bubble, '\\u{1F4F8} ', stripped, false);
 
 const codeBlocks = bubble.querySelectorAll('.code-block');
 const inlineCode = bubble.querySelectorAll('.inline-code');
+
+// 空文本 done 帧的封口：模拟一条正在流式的桌面回答气泡，再调用 closeOpenBubble
+const flow = globalThis.$chatFlow;
+const liveBubble = makeElement('div');
+liveBubble.dataset.kind = 'chat-desktop';
+liveBubble.dataset.open = '1';
+liveBubble.dataset.turn = '7';
+setChatContent(liveBubble, chatPrefix('desktop'), '正在生成的回答', true);
+flow.appendChild(liveBubble);
+const beforeClose = { open: liveBubble.dataset.open, hasCursor: liveBubble.textContent.indexOf('\\u258D') >= 0 };
+closeOpenBubble();
+const afterClose = {
+  open: liveBubble.dataset.open,
+  hasCursor: liveBubble.textContent.indexOf('\\u258D') >= 0,
+  text: liveBubble.textContent
+};
+
 process.stdout.write(JSON.stringify({
   codeBlockCount: codeBlocks.length,
   inlineCodeCount: inlineCode.length,
   codeText: codeBlocks.length ? codeBlocks[0].textContent : null,
   proseHasBoldMarkers: bubble.textContent.indexOf('**') >= 0,
-  proseHasHeadingMarkers: bubble.textContent.indexOf('# 补充说明') >= 0
+  proseHasHeadingMarkers: bubble.textContent.indexOf('# 补充说明') >= 0,
+  beforeClose: beforeClose,
+  afterClose: afterClose
 }));
 """
 
@@ -216,6 +250,20 @@ def main() -> int:
         problems.append("正文里仍残留 ** 加粗标记")
     if result["proseHasHeadingMarkers"]:
         problems.append("正文里仍残留 # 标题标记")
+    # ⑤ 空文本 done 帧必须把在流式的那条气泡封口（去掉光标、置 open=0）。
+    #    桌面取消请求/重置会话时发的就是 {text:"", done:true}；不封口的话
+    #    气泡会永远停在「正在生成」，后续同轮帧还会继续往这条旧气泡里合并。
+    if not result["beforeClose"]["hasCursor"]:
+        problems.append("前置条件不成立：流式气泡里没找到光标字符（样本或桩有问题）")
+    if result["afterClose"]["open"] != "0":
+        problems.append(
+            f"空 done 帧后气泡仍为 open={result['afterClose']['open']!r}，"
+            "封口没有生效（气泡会永远停在流式状态）"
+        )
+    if result["afterClose"]["hasCursor"]:
+        problems.append("空 done 帧后光标 ▍ 仍在，气泡看起来还在生成")
+    if "正在生成的回答" not in result["afterClose"]["text"]:
+        problems.append("封口时把已有正文弄丢了：" + repr(result["afterClose"]["text"]))
 
     if problems:
         print("手机端代码块渲染检查未通过：")
@@ -225,6 +273,7 @@ def main() -> int:
 
     print("OK    手机端代码块渲染（stripMarkdown → renderChatBody 生产路径）")
     print(f"      代码块 1 个 · 行内代码 {result['inlineCodeCount']} 个 · 缩进逐字保留")
+    print("OK    空 done 帧封口（closeOpenBubble 去掉光标并保留正文）")
     return 0
 
 
