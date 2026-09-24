@@ -449,6 +449,59 @@ class TestHoverButtonAutoSubmitToggle:
             "计时器调用方式变了：必须走默认（自动）身份，否则守卫形同虚设"
         )
 
+    def test_manual_submit_refusals_reach_the_phone(self) -> None:
+        """手机点「问 AI」被桌面拒绝时，必须把原因告诉手机。
+
+        真实场景：手机上点按钮，而电脑端「没有待提交的新内容 / 未配 Key /
+        上一个请求正在进行中 / AI 未启用」—— 这些分支此前只调 ShowToast，
+        提示条在电脑屏幕上，用户在看手机，于是**完全看不到任何反馈**，
+        只会以为按钮坏了并反复点。
+
+        修法：这些分支统一经 RefuseManualSubmit 处理，它同时发桌面提示条
+        与手机提示（ManualSubmitFeed → /api/phone/notice → 手机 notice 帧）。
+        """
+        body = _method_body("internal void SubmitAiNow()")
+        assert "RefuseManualSubmit" in body, (
+            "拒绝分支只写了桌面提示条：手机点按钮被拒时收不到任何反馈"
+        )
+        # 四条拒绝理由都要走同一个出口（不能只给其中一两条加）
+        refusals = [
+            "AI 未启用",
+            "未配置 API Key",
+            "还在进行中",
+            "没有待提交的新内容",
+        ]
+        for reason in refusals:
+            assert reason in body, f"缺少拒绝理由「{reason}」"
+        # 出口本身要真的发给手机
+        refuse_body = _method_body("private void RefuseManualSubmit(string reason)")
+        assert "ShowToast(reason)" in refuse_body, "桌面提示条丢了"
+        assert "ManualSubmitFeed.Post(reason)" in refuse_body, (
+            "没有把拒绝原因发给手机"
+        )
+
+    def test_notice_channel_is_separate_from_answer_stream(self) -> None:
+        """提示要走独立端点，不能混进流式回答通道。
+
+        PhoneAiFeed 是节流合并 + 带 done/封口语义的通道（手机据此维护气泡状态），
+        把提示塞进去会干扰状态机（例如空文本被当成「封口」而什么都不显示）。
+        """
+        source = _overlay_source()
+        feed_start = source.index("internal static class ManualSubmitFeed")
+        feed_end = source.index("\n    internal ", feed_start + 10)
+        feed = source[feed_start:feed_end]
+        assert "/api/phone/notice" in feed, "提示端点不是独立的"
+        assert "PhoneAiFeed" not in feed, "提示复用了流式回答通道"
+        # 手机端要处理该帧
+        phone = _PHONE_HTML.read_text(encoding="utf-8")
+        assert 'case "notice"' in phone, "手机端没有处理 notice 帧"
+        # 服务端要有对应路由，且只允许本机调用
+        server = (_ROOT / "system_audio_asr" / "server.py").read_text(encoding="utf-8")
+        assert '"/api/phone/notice"' in server, "服务端缺少该路由"
+        route_at = server.index('"/api/phone/notice"')
+        route_block = server[route_at : route_at + 400]
+        assert "require_local(request)" in route_block, "该路由未限本机访问"
+
 
 class TestDesktopSettingsWindowWiring:
     """C# 桌面设置窗（Ctrl+Alt+O）的自动/手动开关必须两头接线。

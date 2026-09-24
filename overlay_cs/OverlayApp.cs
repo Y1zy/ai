@@ -1081,6 +1081,58 @@ namespace WasapiParaformerOverlay
         }
     }
 
+    /// <summary>
+    /// 把「手动提交被拒」的原因发给手机。
+    ///
+    /// 场景：手机上点「⚡ 问 AI」，而电脑端因为「没有待提交的新内容 / 未配 Key /
+    /// 上一个请求进行中 / AI 未启用」拒绝了 —— 这些分支此前只调 ShowToast，
+    /// 提示条在电脑屏幕上，而用户正看着手机，于是完全看不到任何反馈，
+    /// 只会以为按钮坏了并反复点。
+    ///
+    /// 用独立端点而不是 PhoneAiFeed：后者是流式回答的节流通道（会合并、
+    /// 且有 done/封口语义），把提示混进去会干扰气泡状态机。
+    /// </summary>
+    internal static class ManualSubmitFeed
+    {
+        private static readonly object Sync = new object();
+        private static string endpoint = "";
+
+        internal static void Configure(string webSocketUrl)
+        {
+            try
+            {
+                Uri uri = new Uri(webSocketUrl
+                    .Replace("wss://", "https://")
+                    .Replace("ws://", "http://"));
+                endpoint = uri.GetLeftPart(UriPartial.Authority) + "/api/phone/notice";
+            }
+            catch { endpoint = ""; }
+        }
+
+        /// <summary>把一条提示发给手机（失败静默：这只是反馈，不该影响主流程）。</summary>
+        internal static void Post(string message)
+        {
+            if (endpoint.Length == 0 || string.IsNullOrEmpty(message)) return;
+            string body = new JavaScriptSerializer().Serialize(
+                new Dictionary<string, object> { { "message", message } });
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    HttpWebRequest request = (HttpWebRequest)WebRequest.Create(endpoint);
+                    request.Method = "POST";
+                    request.ContentType = "application/json";
+                    request.Timeout = 2000;
+                    byte[] bytes = Encoding.UTF8.GetBytes(body);
+                    request.ContentLength = bytes.Length;
+                    using (Stream stream = request.GetRequestStream()) stream.Write(bytes, 0, bytes.Length);
+                    using (HttpWebResponse response = (HttpWebResponse)request.GetResponse()) { }
+                }
+                catch { }
+            });
+        }
+    }
+
     internal sealed class AiProbeResult
     {
         internal string Content;
@@ -3098,6 +3150,7 @@ namespace WasapiParaformerOverlay
             PhoneAiFeed.Configure(config.WebSocketUrl);
             SessionResetFeed.Configure(config.WebSocketUrl);
             PromptFeed.Configure(config.WebSocketUrl);
+            ManualSubmitFeed.Configure(config.WebSocketUrl);
             Title = "系统声音实时字幕 Overlay";
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
@@ -4683,20 +4736,21 @@ namespace WasapiParaformerOverlay
         /// </summary>
         internal void SubmitAiNow()
         {
+            // 每条拒绝理由都要同时给手机一条（用户在看手机，桌面提示条看不到）。
             if (!config.AiEnabled)
             {
-                ShowToast("AI 未启用（设置页勾选「启用 AI 助手」）");
+                RefuseManualSubmit("AI 未启用（设置页勾选「启用 AI 助手」）");
                 return;
             }
             if (!SecretStore.HasApiKey)
             {
-                ShowToast("未配置 API Key，无法提交");
+                RefuseManualSubmit("电脑端未配置 API Key，无法提交");
                 return;
             }
             if (aiBusy)
             {
                 // 正在回答时不排队：积压的请求会在面试结束后还在跑（与自动路径同一取舍）。
-                ShowToast("上一个请求还在进行中，请稍候");
+                RefuseManualSubmit("上一个请求还在进行中，请稍候");
                 return;
             }
             // 把「累积中但还没提交」的那批收尾：它在 newFinal 分支里已入队，
@@ -4709,7 +4763,7 @@ namespace WasapiParaformerOverlay
             if (aiQueue.Count == 0)
             {
                 // 没有新内容时明确告知，不静默失败（按钮看起来会像坏了）。
-                ShowToast("没有待提交的新内容");
+                RefuseManualSubmit("电脑端没有待提交的新内容");
                 return;
             }
             int batches = aiQueue.Count;
@@ -4717,6 +4771,14 @@ namespace WasapiParaformerOverlay
             ShowToast("正在问 AI…" + (batches > 1 ? "（含 " + batches + " 段）" : ""));
             AppLog.Write("ai manual_submit batches=" + batches);
             StartAiRequest(true);  // manual=true：手动模式下的唯一提交入口
+        }
+
+        /// <summary>拒绝一次手动提交：桌面提示条 + 手机提示（两边都能看到）。</summary>
+        private void RefuseManualSubmit(string reason)
+        {
+            ShowToast(reason);
+            ManualSubmitFeed.Post(reason);
+            AppLog.Write("ai manual_submit_refused reason=" + reason);
         }
 
         /// <param name="manual">

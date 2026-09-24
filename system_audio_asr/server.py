@@ -496,6 +496,19 @@ def create_app(config: AppConfig) -> FastAPI:
         last_ai_prompt["prompt"] = prompt
         return {"ok": True}
 
+    @app.post("/api/phone/notice")
+    async def phone_notice(request: Request, payload: dict) -> dict:
+        """桌面端发来的一条给手机的提示（如「手动提交被拒」的原因）。
+
+        与 /api/phone/ai 分开：后者是流式回答通道（有 done/封口语义、
+        会被节流合并），提示混进去会干扰手机的气泡状态机。
+        """
+        require_local(request)
+        message = str(payload.get("message", ""))[:500]
+        if message:
+            phone_relay.schedule_json({"type": "notice", "message": message})
+        return {"ok": True}
+
     @app.get("/api/ai/prompt")
     async def get_ai_prompt(request: Request) -> dict:
         require_local(request)

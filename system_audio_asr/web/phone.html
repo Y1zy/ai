@@ -516,6 +516,11 @@ function handleText(raw){
       // 必须如实告知，否则用户以为点了就有反应（只在有内容时才提示，避免噪音）。
       showClipStatus("⚠ " + (msg.message || "电脑端未连接，无法提交字幕"));
       break;
+    case "notice":
+      // 桌面端发来的提示（如「手动提交被拒」的原因）。
+      // 用户此时正看着手机，提示条是唯一能看到反馈的地方。
+      showClipStatus("⚠ " + (msg.message || "电脑端拒绝了本次提交"));
+      break;
   }
 }
 
