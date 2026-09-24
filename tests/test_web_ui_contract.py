@@ -422,10 +422,12 @@ def test_every_server_pushed_message_type_has_a_phone_case() -> None:
     handled = set(re.findall(r'case\s+"([a-z_]+)"\s*:', script))
     assert handled, "未解析到 phone.html 的 switch 分支"
 
-    # phone_share 里出现的 "type" 字面量并非都是手机消息，排除三类：
+    # phone_share 里出现的 "type" 字面量并非都是「发给手机」的消息，排除四类：
     # image_url / text = OpenAI 请求体里的内容分段（图片、文本），发往模型而非手机；
-    # solve_answer = 经 desktop_publisher 给桌面字幕窗的分发，手机端不消费。
-    NON_PHONE_TYPES = {"image_url", "text", "solve_answer"}
+    # solve_answer = 经 desktop_publisher 给桌面字幕窗的分发，手机端不消费；
+    # ask_now = 手机→桌面 的反向消息（手机发意图、由 C# 用本地字幕发起请求），
+    #           方向相反，手机端当然不需要 case（写这条时第一版断言就是这样误报的）。
+    NON_PHONE_TYPES = {"image_url", "text", "solve_answer", "ask_now"}
     sent = {
         match
         for match in re.findall(r'"type":\s*"([a-z_]+)"', source)

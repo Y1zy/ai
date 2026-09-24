@@ -307,6 +307,11 @@ namespace WasapiParaformerOverlay
         internal static readonly int[] MaxTokenLevels = { 256, 512, 1024, 2048, 4096, 8192 };
         internal const int DefaultMaxTokens = 2048;
         internal double AiSilenceSeconds = 0.6;
+        // 字幕 AI 是否在静音后自动提交。true = 历史行为（静音 AiSilenceSeconds 后自动问）；
+        // false = 完全手动：字幕照常累积显示，但只有点悬浮窗的「问 AI」按钮（或手机端
+        // 同名按钮）才提交。用于「面试官话没说完就被自动问出去」的场景。
+        // 必须纳入 Python DEFAULTS，否则网页保存时会把这个键抹掉。
+        internal bool AiAutoSubmit = true;
         internal string AiSystemPrompt = "";
         internal string AiBaseUrl = "https://api.deepseek.com";
         internal string AiOverridePrompt = "";
@@ -595,6 +600,7 @@ namespace WasapiParaformerOverlay
                 //   对大值不报错，会吸附到 8192，不能在这里回退 2048）。
                 if (data.ContainsKey("aiMaxTokens")) result.AiMaxTokens = SafeTokens(data["aiMaxTokens"], result.AiMaxTokens);
                 if (data.ContainsKey("aiSilenceSeconds")) result.AiSilenceSeconds = SafeDouble(data["aiSilenceSeconds"], result.AiSilenceSeconds);
+                if (data.ContainsKey("aiAutoSubmit")) result.AiAutoSubmit = SafeBool(data["aiAutoSubmit"], result.AiAutoSubmit);
                 if (data.ContainsKey("aiSystemPrompt")) result.AiSystemPrompt = SafeString(data["aiSystemPrompt"], result.AiSystemPrompt);
                 if (data.ContainsKey("aiBaseUrl")) result.AiBaseUrl = SafeString(data["aiBaseUrl"], result.AiBaseUrl);
                 if (data.ContainsKey("aiOverridePrompt")) result.AiOverridePrompt = SafeString(data["aiOverridePrompt"], result.AiOverridePrompt);
@@ -655,6 +661,7 @@ namespace WasapiParaformerOverlay
             data["aiThinkingMode"] = AiThinkingMode;
             data["aiMaxTokens"] = AiMaxTokens;
             data["aiSilenceSeconds"] = AiSilenceSeconds;
+            data["aiAutoSubmit"] = AiAutoSubmit;
             data["aiSystemPrompt"] = AiSystemPrompt;
             data["aiBaseUrl"] = AiBaseUrl;
             data["aiOverridePrompt"] = AiOverridePrompt;
@@ -736,6 +743,7 @@ namespace WasapiParaformerOverlay
             AiThinkingMode = other.AiThinkingMode;
             AiMaxTokens = other.AiMaxTokens;
             AiSilenceSeconds = other.AiSilenceSeconds;
+            AiAutoSubmit = other.AiAutoSubmit;
             AiSystemPrompt = other.AiSystemPrompt;
             AiBaseUrl = other.AiBaseUrl;
             AiOverridePrompt = other.AiOverridePrompt;
@@ -1835,6 +1843,8 @@ namespace WasapiParaformerOverlay
         private readonly CheckBox captureBox;
         private readonly CheckBox liveTranslateBox;
         private readonly CheckBox aiEnabledBox;
+        private readonly CheckBox aiAutoSubmitBox;
+        private readonly TextBlock aiAutoSubmitHint;
         private readonly PasswordBox apiKeyBox;
         private readonly ComboBox aiModelBox;
         private readonly ComboBox aiModeBox;
@@ -2015,6 +2025,18 @@ namespace WasapiParaformerOverlay
             aiEnabledBox.Foreground = new SolidColorBrush(Color.FromRgb(31, 41, 55));
             aiEnabledBox.Margin = new Thickness(0, 0, 0, 10);
             aiRoot.Children.Add(aiEnabledBox);
+            aiAutoSubmitBox = new CheckBox();
+            aiAutoSubmitBox.Content = "静音后自动提交（关闭后不自动提问，改用悬浮窗/手机的「问 AI」按钮手动提交）";
+            aiAutoSubmitBox.Foreground = new SolidColorBrush(Color.FromRgb(31, 41, 55));
+            aiAutoSubmitBox.Margin = new Thickness(0, 0, 0, 6);
+            // 立即生效：与「停顿触发」滑块同一模式（改完马上应用，不必等关闭窗口）。
+            aiAutoSubmitBox.Click += delegate { ApplyAllSettings(); };
+            aiRoot.Children.Add(aiAutoSubmitBox);
+            aiAutoSubmitHint = MakeText("", 12);
+            aiAutoSubmitHint.TextWrapping = TextWrapping.Wrap;
+            aiAutoSubmitHint.Foreground = new SolidColorBrush(Color.FromRgb(107, 114, 128));
+            aiAutoSubmitHint.Margin = new Thickness(0, 0, 0, 10);
+            aiRoot.Children.Add(aiAutoSubmitHint);
 
             aiRoot.Children.Add(MakeText("AI 接口 API Key", 13));
             apiKeyBox = new PasswordBox();
@@ -2432,6 +2454,22 @@ namespace WasapiParaformerOverlay
             return input;
         }
 
+        /// <summary>
+        /// 刷新「自动/手动」的说明文字，并把「停顿触发」滑块设为可用/置灰。
+        ///
+        /// 关掉自动提交后静音计时器不再启动，那个滑块调了也没有任何效果；
+        /// 置灰 + 说明可以避免用户以为「调了没生效是坏了」。
+        /// </summary>
+        private void UpdateAutoSubmitHint()
+        {
+            bool auto = aiAutoSubmitBox.IsChecked == true;
+            if (aiDelaySlider != null) aiDelaySlider.IsEnabled = auto;
+            if (aiAutoSubmitHint == null) return;
+            aiAutoSubmitHint.Text = auto
+                ? "当前：静音后自动提问。「停顿触发」滑块决定等多久（太短会在面试官话没说完时就把半句发出去）。"
+                : "当前：手动提问。字幕会照常显示与累积，但只有点悬浮窗的「问 AI」按钮（或手机端同名按钮）才提交 —— 适合面试官说话慢、常停顿的情况。";
+        }
+
         private Slider AddSecondsSlider(StackPanel root)
         {
             Grid grid = new Grid();
@@ -2530,6 +2568,9 @@ namespace WasapiParaformerOverlay
 
         private void ApplyAllSettings()
         {
+            // 先刷新「自动/手动」的联动状态：勾掉自动提交后要立刻把「停顿触发」
+            // 滑块置灰并换说明文字，否则用户会去调一个已经不起作用的滑块。
+            UpdateAutoSubmitHint();
             // 模型名以可编辑下拉的 Text 为准（SelectedItem 只是预设之一）。
             // 网页设置页允许任意模型名，读回时也只填 Text —— 两条路必须一致，
             // 否则自定义模型名会在开关设置窗时被换成预设值。
@@ -2584,7 +2625,8 @@ namespace WasapiParaformerOverlay
                 visionAnswerMode,
                 visionMaxImages,
                 recordImageCap,
-                solvePromptBox.Text);
+                solvePromptBox.Text,
+                aiAutoSubmitBox.IsChecked == true);
             aiPromptPreviewBox.Text = DeepSeekClient.PromptForMode(overlay.CurrentConfig);
         }
 
@@ -2669,6 +2711,13 @@ namespace WasapiParaformerOverlay
                 if (screenBox.SelectedItem == null && screenBox.Items.Count > 0)
                     screenBox.SelectedIndex = 0;
                 aiEnabledBox.IsChecked = config.AiEnabled;
+                // 自动/手动模式：与网页设置页、手机端共用 config.json 的 aiAutoSubmit，
+                // 三处必须显示同一个值。刷新联动状态（关自动时「停顿触发」滑块无意义）。
+                aiAutoSubmitBox.IsChecked = config.AiAutoSubmit;
+                UpdateAutoSubmitHint();
+                // 悬浮窗悬停按钮上的模式图标也要同步（四个入口改的是同一份配置）。
+                // 设置窗不持有 lockIndicator，经 overlay 转发。
+                overlay.RefreshAutoSubmitButton();
                 apiKeyBox.Password = SecretStore.LoadApiKey();
                 aiModelBox.Text = config.AiModel;
                 // 不在这里回落到预设：网页设置页的模型名是自由文本，用户可能填
@@ -2739,6 +2788,13 @@ namespace WasapiParaformerOverlay
     internal sealed class LockIndicatorWindow : Window
     {
         private readonly OverlayWindow overlay;
+        // 悬停按钮：下标顺序必须与 UpdateHoverFromCursor / ActivateControl 一致。
+        // 宽度与命中检测都由这个数量推导（此前是写死的 136 与 Math.Min(3,…)，
+        // 加按钮时容易漏改其中一处，表现为点不准或最后一个按钮点不到）。
+        private const int ControlCount = 6;
+        private const int ControlSize = 34;
+        private readonly Border askControl;
+        private readonly Border autoSubmitControl;
         private readonly Border resetControl;
         private readonly Border pauseControl;
         private readonly Border lockControl;
@@ -2750,8 +2806,8 @@ namespace WasapiParaformerOverlay
         {
             this.overlay = overlay;
             Title = "字幕位置锁";
-            Width = 136;
-            Height = 34;
+            Width = ControlCount * ControlSize;
+            Height = ControlSize;
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
             Background = Brushes.Transparent;
@@ -2762,6 +2818,16 @@ namespace WasapiParaformerOverlay
             Focusable = false;
             StackPanel controls = new StackPanel();
             controls.Orientation = Orientation.Horizontal;
+            // 「问 AI」放最前：面试中要问 AI 时手最快能找到的位置。
+            // 它右侧紧跟「自动/手动」切换：两者都是 AI 提问相关的操作，聚在一起好找。
+            askControl = MakeIconControl(
+                "\uE945",
+                "立即把当前字幕发给 AI（不等静音；手动模式下这是唯一提交方式）",
+                Color.FromRgb(74, 222, 128));
+            autoSubmitControl = MakeIconControl(
+                "\uE815",
+                "切换字幕 AI 的自动/手动提交",
+                Color.FromRgb(74, 222, 128));
             resetControl = MakeIconControl(
                 "\uE72C",
                 "清空对话上下文（保留 system 提示词）",
@@ -2778,6 +2844,8 @@ namespace WasapiParaformerOverlay
                 "\uE8BB",
                 "隐藏字幕（使用老板键恢复）",
                 Color.FromRgb(248, 113, 113));
+            controls.Children.Add(askControl);
+            controls.Children.Add(autoSubmitControl);
             controls.Children.Add(resetControl);
             controls.Children.Add(pauseControl);
             controls.Children.Add(lockControl);
@@ -2795,26 +2863,60 @@ namespace WasapiParaformerOverlay
         {
             if (index == 0)
             {
+                AppLog.Write("control_ask_click");
+                overlay.SubmitAiNow();
+            }
+            else if (index == 1)
+            {
+                AppLog.Write("control_auto_submit_click");
+                overlay.ToggleAutoSubmit();
+            }
+            else if (index == 2)
+            {
                 AppLog.Write("control_reset_click");
                 overlay.ResetConversation();
                 // 同时清服务端内存记录与手机端聊天流，避免桌面干净而手机上还留着上一场内容。
                 SessionResetFeed.Notify(false);
             }
-            else if (index == 1)
+            else if (index == 3)
             {
                 AppLog.Write("control_pause_click paused=" + !capturePaused);
                 ToggleCapturePause();
             }
-            else if (index == 2)
+            else if (index == 4)
             {
                 AppLog.Write("control_lock_click");
                 overlay.TogglePositionLock();
             }
-            else if (index == 3)
+            else if (index == 5)
             {
                 AppLog.Write("control_hide_click");
                 overlay.ToggleBossVisibility();
             }
+        }
+
+        /// <summary>
+        /// 刷新「自动/手动」按钮的图标、颜色与提示文字。
+        ///
+        /// 这是个**状态型**按钮（像「锁定」那样），不是一次性动作按钮：
+        /// 自动时显示秒表 + 绿色（表示会等静音后自己发），手动时显示手指点击 + 灰白
+        /// （表示需要你点旁边的「问 AI」）。颜色与图标必须随状态变，否则用户无法从
+        /// 那排纯图标按钮上看出当前处于哪种模式。
+        ///
+        /// 图标选择有讲究：手动态**不能**用 E7E8（电源开关）—— 那看起来像
+        /// 「AI 被关掉了」，而实际只是「改成手动提交」。用 E815（手指点击）才准确。
+        /// </summary>
+        internal void UpdateAutoSubmitState(bool auto)
+        {
+            TextBlock icon = autoSubmitControl.Child as TextBlock;
+            if (icon != null) icon.Text = auto ? "\uE916" : "\uE815";
+            autoSubmitControl.ToolTip = auto
+                ? "当前：静音后自动提交。点击改为手动（只有点「问 AI」才提交）"
+                : "当前：手动提交（只有点「问 AI」才提交）。点击改回自动";
+            SolidColorBrush stateBrush = new SolidColorBrush(
+                auto ? Color.FromRgb(74, 222, 128) : Color.FromRgb(225, 235, 247));
+            autoSubmitControl.Tag = stateBrush;
+            if (icon != null && !autoSubmitControl.IsMouseOver) icon.Foreground = stateBrush;
         }
 
         internal void ToggleCapturePause()
@@ -2844,11 +2946,13 @@ namespace WasapiParaformerOverlay
                 && NativeMethods.GetWindowRect(NativeHandle, out rect)
                 && point.X >= rect.Left && point.X <= rect.Right
                 && point.Y >= rect.Top && point.Y <= rect.Bottom)
-                hovered = Math.Max(0, Math.Min(3, (point.X - rect.Left) / 34));
-            ApplyHover(resetControl, hovered == 0, Color.FromRgb(96, 165, 250));
-            ApplyHover(pauseControl, hovered == 1, Color.FromRgb(250, 204, 21));
-            ApplyHover(lockControl, hovered == 2, Color.FromRgb(96, 165, 250));
-            ApplyHover(closeControl, hovered == 3, Color.FromRgb(248, 113, 113));
+                hovered = Math.Max(0, Math.Min(ControlCount - 1, (point.X - rect.Left) / ControlSize));
+            ApplyHover(askControl, hovered == 0, Color.FromRgb(74, 222, 128));
+            ApplyHover(autoSubmitControl, hovered == 1, Color.FromRgb(74, 222, 128));
+            ApplyHover(resetControl, hovered == 2, Color.FromRgb(96, 165, 250));
+            ApplyHover(pauseControl, hovered == 3, Color.FromRgb(250, 204, 21));
+            ApplyHover(lockControl, hovered == 4, Color.FromRgb(96, 165, 250));
+            ApplyHover(closeControl, hovered == 5, Color.FromRgb(248, 113, 113));
             return hovered;
         }
 
@@ -3176,6 +3280,11 @@ namespace WasapiParaformerOverlay
                     ? File.GetLastWriteTimeUtc(OverlayConfig.ConfigPath)
                     : DateTime.MinValue;
                 lastSyncedConfig = config.Clone();
+                // 按配置刷新一次悬停按钮的状态。
+                // 必须有这一步：构造函数里的初始字形是固定的，而热重载的第一道判断是
+                // 「配置文件没被改过就直接返回」—— 启动时不会有人来纠正它，
+                // 结果就是配置为「自动」却显示「手动」图标，直到用户点一下才变。
+                lockIndicator.UpdateAutoSubmitState(config.AiAutoSubmit);
                 configTimer.Start();
                 hoverTimer.Start();
             };
@@ -3601,12 +3710,24 @@ namespace WasapiParaformerOverlay
                     if (useAi && !aiBusy)
                     {
                         aiTimer.Stop();
-                        aiTimer.Interval = TimeSpan.FromSeconds(config.AiSilenceSeconds);
-                        aiTimer.Start();
-                        AppLog.Write("ai batch queued_batches=" + aiQueue.Count
-                            + " current_segments="
-                            + (collectingSpeechBatch == null ? 0 : collectingSpeechBatch.Segments.Count)
-                            + " delay_seconds=" + config.AiSilenceSeconds);
+                        if (config.AiAutoSubmit)
+                        {
+                            aiTimer.Interval = TimeSpan.FromSeconds(config.AiSilenceSeconds);
+                            aiTimer.Start();
+                            AppLog.Write("ai batch queued_batches=" + aiQueue.Count
+                                + " current_segments="
+                                + (collectingSpeechBatch == null ? 0 : collectingSpeechBatch.Segments.Count)
+                                + " delay_seconds=" + config.AiSilenceSeconds);
+                        }
+                        else
+                        {
+                            // 手动模式：只把内容累积起来（上面已入队），不启动静音计时器。
+                            // 用户点「问 AI」按钮时才由 SubmitAiNow 提交，
+                            // 避免面试官话说到一半（停顿/换气）就把半句话发出去。
+                            AppLog.Write("ai manual_mode_pending queued_batches=" + aiQueue.Count
+                                + " current_segments="
+                                + (collectingSpeechBatch == null ? 0 : collectingSpeechBatch.Segments.Count));
+                        }
                     }
                 }
                 if (changed || newFinal)
@@ -3627,6 +3748,13 @@ namespace WasapiParaformerOverlay
                 string solveText = message.ContainsKey("text") ? Convert.ToString(message["text"]) : "";
                 bool solveDone = message.ContainsKey("done") && Convert.ToBoolean(message["done"]);
                 ShowSolveAnswer(solveText, solveDone);
+            }
+            else if (type == "ask_now")
+            {
+                // 手机端「问 AI」按钮：字幕文本只存在于本进程（服务端不保存转写），
+                // 所以必须由手机→Python relay→这里转发，再走与悬浮窗按钮同一条路径。
+                AppLog.Write("ai manual_submit from_phone=True");
+                SubmitAiNow();
             }
         }
 
@@ -4197,6 +4325,44 @@ namespace WasapiParaformerOverlay
         internal void TogglePositionLock() { SetPositionLocked(!config.Locked); }
         internal OverlayConfig CurrentConfig { get { return config; } }
 
+        internal void ToggleAutoSubmit() { SetAutoSubmit(!config.AiAutoSubmit); }
+
+        /// <summary>
+        /// 按当前 config 刷新悬停按钮的自动/手动图标。
+        /// 给设置窗用（它不持有 lockIndicator，只能经 overlay 转发）。
+        /// </summary>
+        internal void RefreshAutoSubmitButton()
+        {
+            lockIndicator.UpdateAutoSubmitState(config.AiAutoSubmit);
+        }
+
+        /// <summary>
+        /// 切换「静音后自动提交」（悬浮窗悬停按钮的自动/手动开关）。
+        ///
+        /// 与设置窗的复选框、网页设置页、手机端改的是**同一个** config.AiAutoSubmit：
+        /// 四处都写盘、桌面端每秒重载配置，因此任一处改完其余几处约 1 秒内同步。
+        /// 关掉后不启动静音计时器（见 HandleMessage 的两处判断），字幕照常累积，
+        /// 只有点「问 AI」才提交。
+        /// </summary>
+        internal void SetAutoSubmit(bool auto)
+        {
+            if (config.AiAutoSubmit == auto) return;
+            config.AiAutoSubmit = auto;
+            // 立刻让按钮图标/颜色反映新状态，不必等下一次 hover 刷新。
+            lockIndicator.UpdateAutoSubmitState(auto);
+            SaveConfig();
+            AppLog.Write("ai_auto_submit=" + auto);
+            ShowToast(auto
+                ? "字幕 AI：静音后自动提交"
+                : "字幕 AI：改为手动 · 点左侧「问 AI」按钮提交");
+            // 切到手动时把已排队的自动提交取消，避免刚关掉又被自动发一次。
+            if (!auto)
+            {
+                aiTimer.Stop();
+                AppLog.Write("ai manual_mode auto_timer_stopped queued_batches=" + aiQueue.Count);
+            }
+        }
+
         internal void SetPositionLocked(bool locked)
         {
             config.Locked = locked;
@@ -4253,6 +4419,9 @@ namespace WasapiParaformerOverlay
                 hoverMisses = 0;
                 SetResizeFrame(!config.Locked);
                 lockIndicator.UpdateState(config.Locked);
+                // 「自动/手动」按钮也是状态型（像锁定那样），悬停显示时一并刷新：
+                // 否则显示出来的可能是过期状态（配置被网页端/手机端改过时尤其明显）。
+                lockIndicator.UpdateAutoSubmitState(config.AiAutoSubmit);
                 PositionLockIndicator();
                 if (!lockIndicator.IsVisible)
                 {
@@ -4378,9 +4547,11 @@ namespace WasapiParaformerOverlay
             string overridePrompt, string resumeContext, string jdContext, string targetCompany, string extraContext,
             bool visionEnabled, string visionBaseUrl, string visionModel,
             string visionThinkingMode, int visionMaxTokens, string visionAnswerMode,
-            int visionMaxImages, int recordImageCap, string solvePrompt)
+            int visionMaxImages, int recordImageCap, string solvePrompt,
+            bool autoSubmit)
         {
             config.AiEnabled = enabled;
+            config.AiAutoSubmit = autoSubmit;
             config.AiModel = model;
             config.AiMode = mode;
             config.AiThinkingMode = thinkingMode;
@@ -4404,6 +4575,8 @@ namespace WasapiParaformerOverlay
             config.SolvePrompt = solvePrompt ?? "";
             config.Normalize();
             aiTimer.Interval = TimeSpan.FromSeconds(config.AiSilenceSeconds);
+            // 悬停按钮显示的模式要跟着变（设置窗、网页设置页、手机端三处都可能改它）。
+            lockIndicator.UpdateAutoSubmitState(config.AiAutoSubmit);
             if (!enabled)
             {
                 aiTimer.Stop();
@@ -4417,6 +4590,14 @@ namespace WasapiParaformerOverlay
                     chatEntries.Remove(streamingAiEntry);
                 streamingAiEntry = null;
                 RefreshText();
+            }
+            else if (!config.AiAutoSubmit)
+            {
+                // 切到手动：停掉可能已在计的静音计时器，否则它会照发一次。
+                // （StartAiRequest 里也有同样的守卫兜底，这里停掉是为了不留
+                // 一个「到点被丢弃」的多余计时器，日志更干净。）
+                aiTimer.Stop();
+                AppLog.Write("ai manual_mode auto_timer_stopped by_settings queued_batches=" + aiQueue.Count);
             }
             SaveConfig();
             AppLog.Write(string.Format(
@@ -4489,9 +4670,74 @@ namespace WasapiParaformerOverlay
             aiStreamDirty = false;
         }
 
-        private async void StartAiRequest()
+        /// <summary>
+        /// 立即把「当前累积的字幕」提交给 AI，不等静音计时器。
+        ///
+        /// 用途：手动模式（aiAutoSubmit=false）下由悬浮窗/手机上的「问 AI」按钮触发，
+        /// 也用于自动模式下「不等静音、现在就想问」的场景。解决的核心问题是：
+        /// 静音 0.6 秒就自动提交时，面试官话说到一半（停顿、换气、想措辞）
+        /// 只说了半句就把问题发出去，答案自然不对。
+        ///
+        /// 与自动路径共用 StartAiRequest()：同一条提示词、档位、流式链路，
+        /// 唯一区别是「谁决定何时发」。
+        /// </summary>
+        internal void SubmitAiNow()
+        {
+            if (!config.AiEnabled)
+            {
+                ShowToast("AI 未启用（设置页勾选「启用 AI 助手」）");
+                return;
+            }
+            if (!SecretStore.HasApiKey)
+            {
+                ShowToast("未配置 API Key，无法提交");
+                return;
+            }
+            if (aiBusy)
+            {
+                // 正在回答时不排队：积压的请求会在面试结束后还在跑（与自动路径同一取舍）。
+                ShowToast("上一个请求还在进行中，请稍候");
+                return;
+            }
+            // 把「累积中但还没提交」的那批收尾：它在 newFinal 分支里已入队，
+            // 这里只需断开收集指针，避免下一句 final 继续并进同一批
+            // （那会让本次提交的内容在回答生成期间又被改写）。
+            if (collectingSpeechBatch != null)
+            {
+                collectingSpeechBatch = null;
+            }
+            if (aiQueue.Count == 0)
+            {
+                // 没有新内容时明确告知，不静默失败（按钮看起来会像坏了）。
+                ShowToast("没有待提交的新内容");
+                return;
+            }
+            int batches = aiQueue.Count;
+            aiTimer.Stop();  // 手动提交优先：取消可能已排队的静音自动提交
+            ShowToast("正在问 AI…" + (batches > 1 ? "（含 " + batches + " 段）" : ""));
+            AppLog.Write("ai manual_submit batches=" + batches);
+            StartAiRequest(true);  // manual=true：手动模式下的唯一提交入口
+        }
+
+        /// <param name="manual">
+        /// true = 用户主动点「问 AI」触发的提交（手动模式下唯一的提交方式）。
+        /// false（默认）= 静音计时器触发的自动提交，受 aiAutoSubmit 开关约束。
+        ///
+        /// 为什么守卫放在这里而不是逐个调用点补 Stop：切模式有三条路径
+        /// （悬浮窗按钮 / 设置窗 / 手机与网页改配置），其中后两条只在「AI 被整体
+        /// 关闭」时才停计时器，切模式并不停它。若只靠调用点清理，一个已经在途的
+        /// 静音计时器到点仍会把内容发出去 —— 用户刚关掉自动又被自动提交一次。
+        /// 把判断收到这个唯一出口，任何调用来源都绕不过去。
+        /// </param>
+        private async void StartAiRequest(bool manual = false)
         {
             if (!config.AiEnabled || aiBusy || aiQueue.Count == 0) return;
+            if (!manual && !config.AiAutoSubmit)
+            {
+                // 已切到手动：丢弃这次自动提交（内容仍在队列里，等用户点「问 AI」）。
+                AppLog.Write("ai auto_submit_skipped manual_mode queued_batches=" + aiQueue.Count);
+                return;
+            }
             string key = SecretStore.LoadApiKey();
             if (key.Length == 0)
             {
@@ -4607,7 +4853,7 @@ namespace WasapiParaformerOverlay
                     aiRequestCancellation = null;
                 }
                 requestCancellation.Dispose();
-                if (config.AiEnabled && aiQueue.Count > 0)
+                if (config.AiEnabled && config.AiAutoSubmit && aiQueue.Count > 0)
                 {
                     aiTimer.Stop();
                     aiTimer.Interval = TimeSpan.FromSeconds(config.AiSilenceSeconds);
@@ -4896,6 +5142,7 @@ namespace WasapiParaformerOverlay
             if (local.AiEnabled != baseline.AiEnabled) merged.AiEnabled = local.AiEnabled;
             if (local.VisionEnabled != baseline.VisionEnabled) merged.VisionEnabled = local.VisionEnabled;
             if (!Same(local.AiSilenceSeconds, baseline.AiSilenceSeconds)) merged.AiSilenceSeconds = local.AiSilenceSeconds;
+            if (local.AiAutoSubmit != baseline.AiAutoSubmit) merged.AiAutoSubmit = local.AiAutoSubmit;
             if (!Same(local.FontFamilyName, baseline.FontFamilyName)) merged.FontFamilyName = local.FontFamilyName;
             if (!Same(local.TextColor, baseline.TextColor)) merged.TextColor = local.TextColor;
             if (!Same(local.FrameMode, baseline.FrameMode)) merged.FrameMode = local.FrameMode;
@@ -4959,6 +5206,9 @@ namespace WasapiParaformerOverlay
                 if (!editMode && hwnd != IntPtr.Zero)
                     NativeMethods.SetNormalInteraction(hwnd, config.Locked);
                 lockIndicator.UpdateState(config.Locked);
+                // 配置可能被网页设置页/手机端改过（例如切了自动/手动），
+                // 重载时把悬停按钮的状态一并刷新，否则按钮显示的模式与实际不符。
+                lockIndicator.UpdateAutoSubmitState(config.AiAutoSubmit);
                 aiTimer.Interval = TimeSpan.FromSeconds(config.AiSilenceSeconds);
                 if (oldLiveTranslate && !config.LiveTranslateEnabled)
                     CancelLocalTranslation(true);
@@ -4974,6 +5224,14 @@ namespace WasapiParaformerOverlay
                     if (streamingAiEntry != null && streamingAiEntry.Streaming)
                         chatEntries.Remove(streamingAiEntry);
                     streamingAiEntry = null;
+                }
+                else if (!config.AiAutoSubmit)
+                {
+                    // 手机端/网页设置页把模式切成了手动：停掉在计的静音计时器。
+                    // （StartAiRequest 里也有同样守卫兜底；这里停掉是为了不留一个
+                    // 到点被丢弃的多余计时器。）
+                    aiTimer.Stop();
+                    AppLog.Write("ai manual_mode auto_timer_stopped by_reload queued_batches=" + aiQueue.Count);
                 }
                 ApplySize(true);
                 SetResizeFrame(false);

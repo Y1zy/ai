@@ -96,6 +96,17 @@ def _probe_source() -> str:
                             cfg.Save();
                             return;
                         }
+                        if (args.Length > 0 && args[0] == "save-manual")
+                        {
+                            // 模拟「用户在设置窗取消勾选自动提交后关闭窗口」：
+                            // ApplyAiSettings 改内存值 → Save() 落盘。
+                            // 用它可以验证 Save 是否真的写出了这个键 —— 只做
+                            // Load→Save 的往返是测不出来的（MergeUnknownKeys 会把
+                            // 磁盘上的旧值补回去，掩盖「改动没写出去」这个缺陷）。
+                            cfg.AiAutoSubmit = false;
+                            cfg.Save();
+                            return;
+                        }
                         Dictionary<string, object> result = new Dictionary<string, object>();
                         result["resumeContext"] = cfg.ResumeContext;
                         result["jdContext"] = cfg.JdContext;
@@ -109,6 +120,9 @@ def _probe_source() -> str:
                         result["visionMaxTokens"] = cfg.VisionMaxTokens;
                         result["aiMaxTokens"] = cfg.AiMaxTokens;
                         result["width"] = cfg.Width;
+                        // 自动/手动模式：设置窗、网页设置页、手机端三处共用这个键，
+                        // 必须能验证「保存后再读回还是同一个值」。
+                        result["aiAutoSubmit"] = cfg.AiAutoSubmit;
                         // NaN 场景要能观察到：用字符串输出而不是数值，
                         // 否则 JavaScriptSerializer 会写成非法 JSON `NaN`，再也解析不回来。
                         result["opacityRaw"] = cfg.Opacity.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
@@ -178,6 +192,8 @@ def _run(config_root: Path, mode: str) -> str:
         argv = [str(exe)]
     elif mode == "load-ok":
         argv = [str(exe), "load-ok"]
+    elif mode == "save-manual":
+        argv = [str(exe), "save-manual"]
     else:
         argv = [str(exe), "save"]
     # 探针用 Console.Out.Write 输出 JSON（含中文），Windows 下 .NET 控制台默认
@@ -214,6 +230,11 @@ def load_disk_known(config_root: Path) -> bool:
 
 def save(config_root: Path) -> None:
     _run(config_root, "save")
+
+
+def save_with_manual_mode(config_root: Path) -> None:
+    """把内存里的 AiAutoSubmit 置为 false 后保存（模拟设置窗取消勾选）。"""
+    _run(config_root, "save-manual")
 
 
 def real_config_path() -> pathlib.Path:

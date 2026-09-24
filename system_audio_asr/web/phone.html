@@ -169,6 +169,9 @@ main{padding-bottom:132px}
         <option value="60">每 60 秒</option>
       </select>
     </div>
+    <div class="auto-row" style="margin-top:6px">
+      <label class="switchline" style="flex:1 1 auto;min-width:0" title="开启：电脑静音后自动把字幕发给 AI（默认）。关闭：只累积字幕，点「⚡ 问 AI」才提交"><input id="ai-auto-submit" type="checkbox">字幕 AI 自动提交</label>
+    </div>
     <div class="tip" style="padding:0;text-align:left;line-height:1.5">开启后按设定间隔自动截屏并交给 AI 解题（等同自动点「截题+回答」）。会持续调用模型、消耗额度；上一题还在解时本轮自动跳过。</div>
     <div class="solve-opts">
       <button id="mode-toggle" class="btn btn-secondary" type="button" title="切换截图解题的作答模式">🧩 核心代码</button>
@@ -220,6 +223,7 @@ main{padding-bottom:132px}
   <button id="clear-img-btn" class="btn btn-secondary hidden" title="丢弃已攒的截图，重新截">✕ 清空</button>
   <button id="solve-btn" class="btn btn-primary">🧠 截题+回答</button>
   <button id="bug-btn" class="btn btn-secondary" title="把当前屏幕的代码/报错交给模型找问题">🐛 找 Bug</button>
+  <button id="ask-now-btn" class="btn btn-primary" title="立刻把电脑刚识别到的字幕内容交给 AI（不等静音；手动模式下这是唯一的提交方式）">⚡ 问 AI</button>
 </div>
 <script>
 var frag = new URLSearchParams(location.hash.replace(/^#/, ""));
@@ -412,6 +416,8 @@ function handleText(raw){
       // 自动提交的勾选与间隔也要回填：状态只活在服务端循环里，
       // 不恢复的话界面显示未勾选、后台其实还在按间隔提交。
       applyAutoState(msg.autoSolve, msg.autoIntervalSec);
+      // 字幕 AI 的自动/手动模式（电脑 config.json）：刷新后要显示实际值。
+      if (msg.aiAutoSubmit !== undefined) applyAiAutoSubmit(msg.aiAutoSubmit);
       break;
     case "partial":
       if (msg.text) { $partial.textContent = "🎙 " + msg.text; $partial.classList.remove("hidden"); }
@@ -499,6 +505,16 @@ function handleText(raw){
       // 具体原因与次数已由服务端的气泡说明，这里只做一次轻提示。
       applyAutoState(msg.on, msg.intervalSec);
       if (!msg.on) showClipStatus("自动提交已停止");
+      break;
+    case "auto_submit":
+      // 字幕 AI 的自动/手动模式回执（多台手机保持一致，与 vision_mode 同一模式）。
+      applyAiAutoSubmit(msg.on);
+      showClipStatus(msg.on ? "字幕 AI：静音后自动提交" : "字幕 AI：改为手动（点「⚡ 问 AI」提交）");
+      break;
+    case "manual_ai_unavailable":
+      // 桌面不在线：字幕文本只存在于电脑端进程，这条请求必然无人处理。
+      // 必须如实告知，否则用户以为点了就有反应（只在有内容时才提示，避免噪音）。
+      showClipStatus("⚠ " + (msg.message || "电脑端未连接，无法提交字幕"));
       break;
   }
 }
@@ -713,8 +729,7 @@ document.getElementById("solve-btn").onclick = function(){
   appendChat("solve", tip, true);
   if (send({ type:"solve" })) setErr("");
 };
-document.getElementById("bug-btn").onclick = function(){
-  // 找 Bug：与解题共用截图与流式通道，只是换成查错的提示词。
+document.getElementById("bug-btn").onclick = function(){  // 找 Bug：与解题共用截图与流式通道，只是换成查错的提示词。
   var tip = pendingSolveCount > 0
     ? "正在提交 " + pendingSolveCount + " 张截图找 Bug…"
     : "正在截屏找 Bug…";
@@ -727,6 +742,14 @@ document.getElementById("add-img-btn").onclick = function(){
 };
 document.getElementById("clear-img-btn").onclick = function(){
   if (send({ type:"solve_clear" })) setErr("");
+};
+// 问 AI：把电脑刚识别到的字幕立刻交给 AI，不等静音。
+// 字幕文本只存在电脑端，所以这里只发意图，由桌面执行并用同一条流式通道回答案。
+document.getElementById("ask-now-btn").onclick = function(){
+  if (send({ type:"ask_now" })) {
+    setErr("");
+    showClipStatus("已请求电脑提交当前字幕给 AI");
+  }
 };
 // 待解张数：服务端通过 solve_pending 广播，按钮上显示 n/上限。
 var pendingSolveCount = 0;
@@ -794,6 +817,23 @@ document.getElementById("auto-interval").onchange = function(){
   if (document.getElementById("auto").checked) {
     sendAutoState();
     showClipStatus("自动提交间隔已改为每 " + currentAutoIntervalMs()/1000 + " 秒");
+  }
+};
+// 字幕 AI 的自动/手动模式：写的是电脑 config.json 的 aiAutoSubmit（与桌面共用），
+// 桌面每秒重载一次配置，约 1 秒生效。服务端会回一帧 auto_submit 确认。
+// 与上面的「自动提交问题」（定时截图解题）是两件不同的事，不要混淆。
+function applyAiAutoSubmit(on){
+  var box = document.getElementById("ai-auto-submit");
+  if (box) box.checked = !!on;
+}
+document.getElementById("ai-auto-submit").onchange = function(){
+  var on = this.checked;
+  if (send({ type:"auto_submit", on: on })) {
+    setErr("");
+  } else {
+    // 发送失败要把界面改回去，否则显示的状态与电脑实际行为相反。
+    this.checked = !on;
+    showClipStatus("连接未就绪，未改动");
   }
 };
 document.getElementById("copy-btn").onclick = function(){

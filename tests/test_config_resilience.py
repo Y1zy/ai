@@ -432,3 +432,36 @@ def test_nan_fallback_values_match_python_defaults() -> None:
             f"{field} 的 NaN 兜底是 {fallback}，Python DEFAULTS 是 {expected}（两端会不一致）"
         )
 
+
+def test_auto_submit_survives_csharp_save_roundtrip(config_probe, tmp_path: Path) -> None:
+    """C# 的 Save() 必须真的写出 aiAutoSubmit 这个键。
+
+    这是三处 UI（桌面设置窗 / 网页设置页 / 手机端）共用的配置键：
+    C# 的 Save() 是「固定字段列表整体重写」，若漏掉这个键，
+    用户在设置窗里取消勾选后关闭窗口 → 改动不会被写出去。
+
+    注意不能只用 Load→Save 往返来测：Save 里的 MergeUnknownKeys 会把磁盘上的
+    旧值补回来，从而掩盖「改动没写出去」这个缺陷（第一版断言就是这样漏报的）。
+    必须像设置窗那样先改内存值再存。
+    """
+    from system_audio_asr.settings import DEFAULTS
+
+    assert "aiAutoSubmit" in DEFAULTS, "Python 侧没有这个键，两端会不一致"
+
+    config_probe.write_config(
+        tmp_path, {"aiAutoSubmit": True, "aiModel": "qwen-max", "resumeContext": "项目一"}
+    )
+    assert config_probe.load(tmp_path)["aiAutoSubmit"] is True
+
+    # 模拟设置窗：用户取消勾选 → ApplyAiSettings 改内存值 → Save 落盘
+    config_probe.save_with_manual_mode(tmp_path)
+    after = config_probe.load(tmp_path)
+    assert after["aiAutoSubmit"] is False, (
+        "在设置窗关掉自动后保存，配置里仍是自动：改动被静默丢弃"
+    )
+    # C# 写盘带 UTF-8 BOM（两端读取都用 utf-8-sig），这里按同一编码读
+    on_disk = json.loads(config_probe.config_file(tmp_path).read_text(encoding="utf-8-sig"))
+    assert on_disk["aiAutoSubmit"] is False, "磁盘上该键的值不对"
+    assert on_disk["aiModel"] == "qwen-max", "保存时把自定义模型名弄丢了"
+    assert on_disk["resumeContext"] == "项目一", "保存时把简历弄丢了"
+

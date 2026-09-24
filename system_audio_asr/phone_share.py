@@ -549,6 +549,25 @@ def set_vision_thinking_mode(mode: Any) -> str:
     )
 
 
+def load_auto_submit() -> bool:
+    """字幕 AI 是否静音后自动提交（config.json 的 aiAutoSubmit）。
+
+    默认 True = 历史行为。读不到时也回 True，避免配置损坏导致「突然不自动问了」
+    而用户不知道原因。
+    """
+    value = _read_config_value("aiAutoSubmit")
+    return True if value is None else bool(value)
+
+
+def set_auto_submit(on: Any) -> bool:
+    """手机端切换「自动提交」：只写 aiAutoSubmit 这一个键。
+
+    桌面端每秒重载一次 config（configTimer → ReloadConfigIfChanged），
+    因此手机改完约 1 秒内生效，无需重启。
+    """
+    return bool(_write_single_config_key("aiAutoSubmit", bool(on)))
+
+
 class SolveEngine:
     """OpenAI 兼容视觉模型截图解题：流式 SSE，delta 经节流回调推送。"""
 
@@ -1034,6 +1053,9 @@ class PhoneRelay:
                 # （勾选状态只存在于服务端循环里，刷新页面不会自己恢复）。
                 "autoSolve": self._auto_solve,
                 "autoIntervalSec": int(self._auto_interval_ms / 1000),
+                # 字幕 AI 的自动/手动模式（桌面 config.json 的 aiAutoSubmit）：
+                # 刷新页面后开关要显示实际值，否则界面与真实行为相反。
+                "aiAutoSubmit": load_auto_submit(),
             })
             latest = self._latest_jpeg
             if latest:
@@ -1096,6 +1118,16 @@ class PhoneRelay:
                     # 三态 "" = 跟随字幕 AI / off / auto。
                     applied = set_vision_thinking_mode(payload.get("mode"))
                     self.schedule_json({"type": "vision_thinking", "mode": applied})
+                elif kind == "ask_now":
+                    # 手机端「问 AI」按钮：把「立即提交当前字幕」的意图转给桌面。
+                    # 字幕文本只存在于 C# 进程（服务端只做识别与转发、不保存转写），
+                    # 所以这里不能自己发请求，只能经 hub 广播给 C# 由它执行。
+                    self._request_manual_ai_submit()
+                elif kind == "auto_submit":
+                    # 手机端切换「自动提交」：与桌面共用 config.json 的 aiAutoSubmit，
+                    # 桌面每秒重载一次配置，约 1 秒生效。
+                    applied = set_auto_submit(payload.get("on"))
+                    self.schedule_json({"type": "auto_submit", "on": applied})
                 elif kind == "ping":
                     # 手机端测 RTT：原样回带时间戳，不做任何计算。
                     self.schedule_json({"type": "pong", "t": payload.get("t")})
@@ -1114,6 +1146,51 @@ class PhoneRelay:
 
     async def _handle_solve(self, task: str = SOLVE_TASK_SOLVE) -> None:
         await asyncio.to_thread(self.request_solve, task)
+
+    def _desktop_online(self) -> bool:
+        """桌面（C# Overlay）是否连着。判断依据是 hub 的 WS 客户端数。
+
+        经 debug_snapshot_provider 间接取（server.create_app 注入），
+        与手机诊断面板用的是同一个来源，不额外引入依赖。
+        """
+        provider = self.debug_snapshot_provider
+        if provider is None:
+            return True  # 取不到就当作在线：宁可多转一次，也不要误报「电脑不在线」
+        try:
+            snapshot = provider()
+            if isinstance(snapshot, dict) and "wsClients" in snapshot:
+                return int(snapshot["wsClients"]) > 0
+        except Exception:
+            pass
+        return True
+
+    def _request_manual_ai_submit(self) -> None:
+        """手机端「问 AI」→ 经 hub 广播给桌面，由 C# 用当前字幕发起请求。
+
+        用 desktop_publisher（= hub.publish，广播给所有 WS 客户端、含 C#）
+        而不是 schedule_json（只发手机）：这条消息的消费者是桌面，不是手机。
+
+        桌面没连上时必须如实回一条提示：字幕文本只存在于 C# 进程，
+        没有桌面这条消息必然无人处理 —— 若手机照样显示「已请求电脑提交」，
+        用户会反复点按钮并以为功能坏了（点一次提示一次，比静默无反应更清楚）。
+        """
+        if not self._desktop_online():
+            self.schedule_json({
+                "type": "manual_ai_unavailable",
+                "message": "电脑端字幕程序未运行（或已断开），无法提交字幕",
+            })
+            return
+        publisher = self.desktop_publisher
+        if publisher is None:
+            self.schedule_json({
+                "type": "manual_ai_unavailable",
+                "message": "电脑端字幕程序未就绪，无法提交字幕",
+            })
+            return
+        try:
+            publisher({"type": "ask_now"})
+        except Exception:
+            pass
 
     async def _handle_solve_add(self) -> None:
         """追加一张待解截图；失败/已满时回一条提示，避免手机端无声无息。"""

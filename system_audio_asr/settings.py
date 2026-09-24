@@ -53,6 +53,10 @@ DEFAULTS: dict[str, Any] = {
     # 默认 2048 即历史行为。同样必须纳入 DEFAULTS 否则网页保存会抹掉。
     "aiMaxTokens": 2048,
     "aiSilenceSeconds": 0.6,
+    # 字幕 AI 是否静音后自动提交。true = 历史行为；false = 完全手动
+    # （字幕照常累积，只有点悬浮窗/手机端的「问 AI」按钮才提交）。
+    # 必须纳入 DEFAULTS，否则网页保存时该键会被抹掉。
+    "aiAutoSubmit": True,
     "aiSystemPrompt": "",
     "aiOverridePrompt": "",
     "aiBuiltInPrompt": "",
@@ -260,6 +264,7 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
     numeric("frameOpacity", 0.0, 1.0)
     numeric("aiSilenceSeconds", 0.5, 8.0)
     boolean("aiEnabled")
+    boolean("aiAutoSubmit")
     boolean("liveTranslateEnabled")
     boolean("locked")
     if result["asrLanguage"] not in {"zh", "en"}:
