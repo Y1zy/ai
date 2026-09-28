@@ -1133,6 +1133,56 @@ namespace WasapiParaformerOverlay
         }
     }
 
+    /// <summary>
+    /// 把桌面端刚改的「自动/手动」状态同步给已连接的手机。
+    ///
+    /// 为什么需要：桌面切模式（悬停按钮 / 设置窗 / 网页设置页）只写 config.json，
+    /// 手机端只在 hello 帧与「自己操作后的回执」里回填复选框，于是那段窗口里
+    /// 手机显示的是旧状态；用户按旧状态一操作，就会把桌面刚改的值悄悄改回去。
+    ///
+    /// 与 ManualSubmitFeed 分开：那个通道只发提示文字，手机端只当提示条用；
+    /// 这里发的是状态，服务端会转成手机端既有的 auto_submit 帧。
+    /// </summary>
+    internal static class AutoSubmitFeed
+    {
+        private static string endpoint = "";
+
+        internal static void Configure(string webSocketUrl)
+        {
+            try
+            {
+                Uri uri = new Uri(webSocketUrl
+                    .Replace("wss://", "https://")
+                    .Replace("ws://", "http://"));
+                endpoint = uri.GetLeftPart(UriPartial.Authority) + "/api/phone/auto_submit_state";
+            }
+            catch { endpoint = ""; }
+        }
+
+        /// <summary>广播一次状态（失败静默：同步失败下次重连 hello 帧仍能纠正）。</summary>
+        internal static void Post(bool auto)
+        {
+            if (endpoint.Length == 0) return;
+            string body = new JavaScriptSerializer().Serialize(
+                new Dictionary<string, object> { { "on", auto } });
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    HttpWebRequest request = (HttpWebRequest)WebRequest.Create(endpoint);
+                    request.Method = "POST";
+                    request.ContentType = "application/json";
+                    request.Timeout = 2000;
+                    byte[] bytes = Encoding.UTF8.GetBytes(body);
+                    request.ContentLength = bytes.Length;
+                    using (Stream stream = request.GetRequestStream()) stream.Write(bytes, 0, bytes.Length);
+                    using (HttpWebResponse response = (HttpWebResponse)request.GetResponse()) { }
+                }
+                catch { }
+            });
+        }
+    }
+
     internal sealed class AiProbeResult
     {
         internal string Content;
@@ -3151,6 +3201,7 @@ namespace WasapiParaformerOverlay
             SessionResetFeed.Configure(config.WebSocketUrl);
             PromptFeed.Configure(config.WebSocketUrl);
             ManualSubmitFeed.Configure(config.WebSocketUrl);
+            AutoSubmitFeed.Configure(config.WebSocketUrl);
             Title = "系统声音实时字幕 Overlay";
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
@@ -4408,12 +4459,39 @@ namespace WasapiParaformerOverlay
             ShowToast(auto
                 ? "字幕 AI：静音后自动提交"
                 : "字幕 AI：改为手动 · 点左侧「问 AI」按钮提交");
+            // 手机端只在 hello 帧与自己操作的回执里回填复选框，桌面改完必须主动
+            // 同步一次；否则手机停在旧值，用户按旧状态一操作就把刚改的值改回去。
+            AutoSubmitFeed.Post(auto);
             // 切到手动时把已排队的自动提交取消，避免刚关掉又被自动发一次。
             if (!auto)
             {
                 aiTimer.Stop();
                 AppLog.Write("ai manual_mode auto_timer_stopped queued_batches=" + aiQueue.Count);
             }
+            else
+            {
+                // 切回自动：把手动模式下积压的批次接着发（见方法注释）。
+                RearmAutoSubmitIfPending();
+            }
+        }
+
+        /// <summary>
+        /// 切回自动模式后，把手动模式下积压的批次接着发出去。
+        ///
+        /// 不补这一步会漏内容：手动模式只累积、不启动计时器，切回自动也不启动
+        /// —— 计时器只在「收到新的 final」或「请求结束收尾」时才装。若切回后
+        /// 不再有新语音（面试正好结束），积压批次就一直躺着，直到用户手点
+        /// 「问 AI」才会被发出。与 StartAiRequest 收尾处的重挂判断同款。
+        /// </summary>
+        private void RearmAutoSubmitIfPending()
+        {
+            if (!config.AiEnabled || !config.AiAutoSubmit) return;
+            if (aiBusy || aiQueue.Count == 0) return;
+            aiTimer.Stop();
+            aiTimer.Interval = TimeSpan.FromSeconds(config.AiSilenceSeconds);
+            aiTimer.Start();
+            AppLog.Write("ai auto_mode_requeued queued_batches=" + aiQueue.Count
+                + " delay_seconds=" + config.AiSilenceSeconds);
         }
 
         internal void SetPositionLocked(bool locked)
@@ -4603,6 +4681,7 @@ namespace WasapiParaformerOverlay
             int visionMaxImages, int recordImageCap, string solvePrompt,
             bool autoSubmit)
         {
+            bool wasAutoSubmit = config.AiAutoSubmit;
             config.AiEnabled = enabled;
             config.AiAutoSubmit = autoSubmit;
             config.AiModel = model;
@@ -4651,6 +4730,19 @@ namespace WasapiParaformerOverlay
                 // 一个「到点被丢弃」的多余计时器，日志更干净。）
                 aiTimer.Stop();
                 AppLog.Write("ai manual_mode auto_timer_stopped by_settings queued_batches=" + aiQueue.Count);
+            }
+            else if (!wasAutoSubmit)
+            {
+                // 只在「手动 → 自动」这次真实切换上补装计时器。设置窗每次关闭都会
+                // 调到这里，若无条件重挂，会把「讲话中暂停去抖」的计时器重新启动，
+                // 半句话被发出去 —— 正是这个功能要解决的问题。
+                RearmAutoSubmitIfPending();
+            }
+            if (wasAutoSubmit != config.AiAutoSubmit)
+            {
+                // 设置窗改了模式才同步给手机；无条件发会让手机每次关闭设置窗
+                // 都弹一条「字幕 AI：…」的提示（手机端该分支带 toast）。
+                AutoSubmitFeed.Post(config.AiAutoSubmit);
             }
             SaveConfig();
             AppLog.Write(string.Format(
@@ -5263,6 +5355,9 @@ namespace WasapiParaformerOverlay
                 configLastWrite = stamp;
                 string oldScreen = config.ScreenName;
                 bool oldLiveTranslate = config.LiveTranslateEnabled;
+                // 必须在 ApplyFrom 之前取：下面据此判断「这次重载是否改变了模式」，
+                // 只有真实的手动↔自动切换才补装计时器 / 同步手机。
+                bool oldAiAutoSubmit = config.AiAutoSubmit;
                 config.ApplyFrom(fresh);
                 lastSyncedConfig = config.Clone();
                 if (!editMode && hwnd != IntPtr.Zero)
@@ -5294,6 +5389,20 @@ namespace WasapiParaformerOverlay
                     // 到点被丢弃的多余计时器。）
                     aiTimer.Stop();
                     AppLog.Write("ai manual_mode auto_timer_stopped by_reload queued_batches=" + aiQueue.Count);
+                }
+                else if (!oldAiAutoSubmit)
+                {
+                    // 网页设置页/手机把模式切回了自动：积压批次接着发。
+                    // （手机切回时它只写配置文件，这里是桌面侧唯一能补装计时器的点。）
+                    RearmAutoSubmitIfPending();
+                }
+                if (oldAiAutoSubmit != config.AiAutoSubmit)
+                {
+                    // 模式被网页设置页改过：手机端同步一份，否则它停在旧值，
+                    // 用户按旧状态一操作就把刚改的值改回去。
+                    // （手机自己改的那条路会先收到回执，手机端按「值有变化才提示」
+                    // 去重，不会因为这里再广播一次而重复弹提示。）
+                    AutoSubmitFeed.Post(config.AiAutoSubmit);
                 }
                 ApplySize(true);
                 SetResizeFrame(false);

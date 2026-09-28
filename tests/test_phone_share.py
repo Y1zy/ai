@@ -832,6 +832,133 @@ class TestRelayEndpoints:
         saved = json.loads(config_path.read_text(encoding="utf-8-sig"))
         assert saved["visionThinkingMode"] == "high"
 
+    # ---------------------------------------------- 单键写入失败（不丢配置）
+    # 手机切开关时 config.json 可能被杀软/备份/索引器瞬时独占。这条链路曾是
+    # 读-改-写且「读失败当空配置」，于是整份配置被覆写成单键文件（44 个键消失）。
+    # 这里走真实的 relay 通道，验证失败时：不写盘 + 如实回真实值 + 提示手机。
+
+    def _locked_config(self, tmp_path: Path, monkeypatch, original: dict):
+        """准备一份「读会失败、写没问题」的 config.json，返回 (路径, 解除锁)。"""
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+
+        real_read = Path.read_text
+
+        def locked_read(self, *args, **kwargs):
+            if self == config_path:
+                raise PermissionError(13, "文件被占用（模拟杀软瞬时锁定）")
+            return real_read(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", locked_read)
+        return config_path, real_read
+
+    @staticmethod
+    def _frames_until_pong(websocket) -> list[dict]:
+        """收帧直到 pong —— 用一条 ping 当结束哨兵。
+
+        不能对着「预期帧」逐条 receive：一旦实现少发一帧，receive 会永久阻塞，
+        测试表现为挂死而不是失败（第一版就是这样，跑满超时才被 killed）。
+        ping/pong 是既有且必然应答的通道，用它把「收帧」变成有界操作。
+        """
+        websocket.send_text(json.dumps({"type": "ping", "t": 1}))
+        frames: list[dict] = []
+        while True:
+            frame = websocket.receive_json()
+            if frame.get("type") == "pong":
+                return frames
+            frames.append(frame)
+
+    def test_relay_auto_submit_failure_keeps_config_and_reports(
+        self, client, phone_path: Path, monkeypatch, tmp_path
+    ) -> None:
+        original = {
+            "aiAutoSubmit": True,
+            "resumeContext": "项目一：某医疗设备公司",
+            "jdContext": "目标职位 JD 文本",
+            "targetCompany": "某互联网公司",
+        }
+        config_path, real_read = self._locked_config(tmp_path, monkeypatch, original)
+        config = phone_share.load_phone_config(phone_path)
+
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            websocket.receive_json()          # hello
+            websocket.send_text(json.dumps({"type": "auto_submit", "on": False}))
+            frames = self._frames_until_pong(websocket)
+
+        # 磁盘必须一个字节都没变：这是本次修复的核心
+        on_disk = json.loads(real_read(config_path, encoding="utf-8"))
+        assert on_disk == original, "读失败仍写了盘：整份 config.json 被覆写"
+        assert on_disk["resumeContext"] == "项目一：某医疗设备公司"
+
+        # 回给手机的只应有一条带 revert 的 notice。
+        # 不能回状态帧：服务端此刻读不出文件，回的任何值都是猜的 —— 真机验证
+        # 踩过这一下（磁盘上是 False，回退默认值 True，手机显示「已开启」）。
+        assert [frame["type"] for frame in frames] == ["notice"], f"帧不对：{frames}"
+        notice = frames[0]
+        assert "配置写入失败" in notice["message"], "失败原因没告诉手机"
+        assert notice.get("revert") == "auto_submit", (
+            "没告诉手机把误翻的复选框退回去：界面状态会与实际相反"
+        )
+
+    def test_relay_auto_submit_success_still_echoes(
+        self, client, phone_path: Path, monkeypatch, tmp_path
+    ) -> None:
+        """正常路径不能被上面的失败处理连累：成功时照常回执并落盘。"""
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps({"aiAutoSubmit": True, "resumeContext": "项目一"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+        config = phone_share.load_phone_config(phone_path)
+
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            websocket.receive_json()
+            websocket.send_text(json.dumps({"type": "auto_submit", "on": False}))
+            frames = self._frames_until_pong(websocket)
+            assert frames == [{"type": "auto_submit", "on": False}], (
+                f"成功路径的帧不对：{frames}"
+            )
+
+        saved = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        assert saved["aiAutoSubmit"] is False
+        assert saved["resumeContext"] == "项目一", "成功路径也不许丢其它键"
+
+    def test_relay_vision_mode_failure_keeps_config_and_reports(
+        self, client, phone_path: Path, monkeypatch, tmp_path
+    ) -> None:
+        """作答模式切换同样受保护（三个 setter 走的是同一个写入口）。
+
+        与 auto_submit 的差别：手机端的模式按钮不是乐观更新（只有收到回执才改
+        文字），所以失败时不必像复选框那样回拨，只发一条失败提示即可 ——
+        按钮自然停在旧值，与磁盘一致。
+        """
+        original = {"visionAnswerMode": "core_code", "resumeContext": "项目一"}
+        config_path, real_read = self._locked_config(tmp_path, monkeypatch, original)
+        config = phone_share.load_phone_config(phone_path)
+
+        with client.websocket_connect(
+            "/relay?role=phone&sid=" + config["sid"] + "&t=" + config["token"]
+        ) as websocket:
+            websocket.receive_json()          # hello
+            websocket.send_text(json.dumps({"type": "vision_mode", "mode": "acm"}))
+            frames = self._frames_until_pong(websocket)
+
+        assert json.loads(real_read(config_path, encoding="utf-8")) == original
+        assert [frame["type"] for frame in frames] == ["notice"], (
+            f"写盘失败时回的帧不对：{frames}"
+        )
+        assert "配置写入失败" in frames[0]["message"], "失败原因没告诉手机"
+        # 模式按钮不是乐观更新（收到回执才改文字），无需 revert
+        assert "revert" not in frames[0], (
+            "vision_mode 按钮本就不乐观更新，多带 revert 会让以后误解契约"
+        )
+
     def test_relay_clipboard_message_writes_pc_clipboard(
         self, client, phone_path: Path, monkeypatch
     ):
@@ -1166,4 +1293,76 @@ class TestSessionResetGuard:
         client.post("/api/session/reset")
         assert relay._session_generation == before_generation, "被拒的请求仍推进了场次编号"
         assert recorder.session_recorder.stats() == before_entries, "被拒的请求仍清了记录"
+
+
+class TestAutoSubmitStateBroadcast:
+    """桌面端切模式后主动推送状态给手机的那条通道。
+
+    手机端只在 hello 帧与自己操作的回执里回填复选框，桌面改完不主动推的话，
+    手机停在旧值；用户按旧值一操作就把桌面刚改的值改回去。
+    """
+
+    @pytest.fixture()
+    def app_and_relay(self, tmp_path: Path, monkeypatch):
+        pytest.importorskip("fastapi.testclient")
+        pytest.importorskip("soundcard")
+        from system_audio_asr import server as server_module
+        from system_audio_asr.config import AppConfig
+
+        monkeypatch.setattr(phone_share, "PHONE_CONFIG_PATH", tmp_path / "phone_share.json")
+        created: list[Any] = []
+        real_relay = phone_share.PhoneRelay
+
+        def tracking_relay() -> Any:
+            instance = real_relay()
+            created.append(instance)
+            return instance
+
+        monkeypatch.setattr(server_module, "PhoneRelay", tracking_relay)
+        app = server_module.create_app(AppConfig())
+        return app, created[-1]
+
+    def test_broadcasts_state_to_phones(self, app_and_relay, monkeypatch) -> None:
+        """本机调用后，手机侧应收到 auto_submit 帧（手机端既有分支处理它）。"""
+        fastapi_testclient = pytest.importorskip("fastapi.testclient")
+        app, relay = app_and_relay
+        sent: list[dict] = []
+        monkeypatch.setattr(relay, "schedule_json", lambda payload: sent.append(payload))
+
+        client = fastapi_testclient.TestClient(app, client=("127.0.0.1", 51000))
+        assert client.post("/api/phone/auto_submit_state", json={"on": True}).status_code == 200
+        assert sent == [{"type": "auto_submit", "on": True}], f"帧不对：{sent}"
+
+        sent.clear()
+        client.post("/api/phone/auto_submit_state", json={"on": False})
+        assert sent == [{"type": "auto_submit", "on": False}]
+
+    def test_does_not_write_config(self, app_and_relay, tmp_path, monkeypatch) -> None:
+        """这条通道只广播状态，绝不写配置。
+
+        写盘由桌面端负责（它才是配置的主人）；这里若顺手写一次，
+        桌面稍后再写就会互相覆盖，而两端都不知道对方改过。
+        """
+        fastapi_testclient = pytest.importorskip("fastapi.testclient")
+        app, relay = app_and_relay
+        monkeypatch.setattr(relay, "schedule_json", lambda payload: None)
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"aiAutoSubmit": False}), encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+
+        client = fastapi_testclient.TestClient(app, client=("127.0.0.1", 51000))
+        client.post("/api/phone/auto_submit_state", json={"on": True})
+        on_disk = json.loads(config_path.read_text(encoding="utf-8"))
+        assert on_disk["aiAutoSubmit"] is False, "广播端点擅自改了配置"
+
+    def test_rejects_lan_client(self, app_and_relay) -> None:
+        """局域网设备不能借这条通道给手机下状态（与其它管理接口同口径）。"""
+        fastapi_testclient = pytest.importorskip("fastapi.testclient")
+        app, _ = app_and_relay
+        client = fastapi_testclient.TestClient(app, client=("192.168.31.99", 51000))
+        response = client.post("/api/phone/auto_submit_state", json={"on": True})
+        assert response.status_code == 403, (
+            f"局域网调用返回 {response.status_code}，应当被 require_local 拦下"
+        )
 

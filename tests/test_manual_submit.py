@@ -50,6 +50,41 @@ def _method_body(signature: str) -> str:
     return text[start : index + 1]
 
 
+def _enclosing_condition(body: str, call: str, *, radius: int = 700) -> str:
+    """取调用点之前那一小段里最后一个 if/else 分支的条件，作为「守卫」。
+
+    用途：区分「这行代码在」与「这行代码真的由某个状态决定」。
+    只查字符串存在性的断言，对 `else if (true)` / `else if (false)` 这类
+    常量条件完全无感 —— 代码还在，行为已经反了。
+    """
+    at = body.index(call)
+    window = body[max(0, at - radius) : at]
+    # 取窗口内最后一个分支关键字的位置（最近的那个才是它的守卫）
+    candidates = [
+        pos
+        for keyword in ("if (", "else if (")
+        for pos in [window.rfind(keyword)]
+        if pos != -1
+    ]
+    assert candidates, f"{call} 前找不到 if/else 分支，无法确认它受状态控制"
+    start = max(candidates)
+    tail = window[start:]
+    return tail[: tail.index(")") + 1] if ")" in tail else tail
+
+
+def _assert_branch_condition_depends_on(body: str, call: str, variables: tuple) -> None:
+    """断言 call 所在的 if/else 分支条件里真的引用了给定变量。
+
+    拒绝常量条件（true/false）与「变量只出现在别处」两种情况：
+    前者是过度修复/不修复，后者是判断写了但没管住这次调用。
+    """
+    condition = _enclosing_condition(body, call)
+    assert any(variable in condition for variable in variables), (
+        f"{call} 的守卫条件是 {condition!r}，没有引用 {variables} —— "
+        "无条件执行会把不该发的发出去（或把该发的漏掉）"
+    )
+
+
 class TestManualSubmitSourceContract:
     """C# 手动画提交必须与自动路径共用一条链路，并在各种边界给出反馈。"""
 
@@ -578,3 +613,115 @@ class TestHelloFrameCarriesAutoSubmit:
         start = source.index('"type": "hello"')
         block = source[start : start + 1600]
         assert "aiAutoSubmit" in block, "hello 帧未下发 aiAutoSubmit"
+
+
+class TestDesktopSwitchSyncsPhone:
+    """桌面端切模式后，已连接的手机必须同步到新状态。
+
+    缺这条同步时的真实表现：桌面把「自动」切成「手动」，手机复选框还停在
+    「自动」；用户以为手机上显示的就是当前状态，一操作就把桌面刚改的值改回去
+    （手机端的复选框是本地 DOM 状态，onchange 时直接把这个值发上去）。
+
+    覆盖三段：桌面端要发（三个入口）、服务端要转成手机认识的帧、手机端要能收。
+    """
+
+    def test_desktop_broadcasts_on_all_three_switch_entries(self) -> None:
+        """三个入口都要广播：悬停按钮、设置窗、配置热重载。
+
+        漏掉任一处，那条路径切完后手机就停在旧值上。
+        """
+        source = _overlay_source()
+
+        toggle = _method_body("internal void SetAutoSubmit(bool auto)")
+        assert "AutoSubmitFeed.Post" in toggle, "悬停按钮切模式后没同步手机"
+
+        settings = _method_body("internal void ApplyAiSettings(")
+        assert "AutoSubmitFeed.Post" in settings, "设置窗切模式后没同步手机"
+
+        reload_start = source.index("private void ReloadConfigIfChanged()")
+        reload_body = source[reload_start : reload_start + 4200]
+        assert "AutoSubmitFeed.Post" in reload_body, (
+            "网页设置页改完模式、桌面热重载后没同步手机"
+        )
+
+    def test_feed_configured_at_startup(self) -> None:
+        """通道要真的被初始化，否则 endpoint 为空、Post 静默什么都不发。"""
+        source = _overlay_source()
+        assert "AutoSubmitFeed.Configure(config.WebSocketUrl);" in source, "未初始化"
+
+    def test_server_turns_it_into_a_phone_frame(self) -> None:
+        """服务端要把它转成手机端认识的 auto_submit 帧，并只允许本机调用。"""
+        server = (_ROOT / "system_audio_asr" / "server.py").read_text(encoding="utf-8")
+        assert '"/api/phone/auto_submit_state"' in server, "服务端缺少该路由"
+        route_at = server.index('"/api/phone/auto_submit_state"')
+        route_block = server[route_at : route_at + 1200]
+        assert "require_local(request)" in route_block, "该路由未限本机访问"
+        assert '"type": "auto_submit"' in route_block, (
+            "没有转成手机端认识的帧：手机端 case 分支收不到"
+        )
+
+    def test_phone_endpoint_and_dedup_wired(self) -> None:
+        """手机端分支要存在，且同一改动只提示一次。"""
+        phone = _PHONE_HTML.read_text(encoding="utf-8")
+        assert 'case "auto_submit"' in phone, "手机端没有处理该帧"
+        start = phone.index('case "auto_submit"')
+        block = phone[start : start + 700]
+        assert "aiAutoSubmitState" in block, (
+            "没有记录已知状态：桌面重载配置后的同一值回执会再弹一次提示"
+        )
+
+    def test_rearm_only_on_real_switch_back(self) -> None:
+        """切回自动时补装计时器，但只在「真实的手动→自动切换」这一下。
+
+        两个方向都要防：
+          · 漏了补装 → 手动模式积压的批次没人发（面试结束时永远躺在队列里）；
+          · 无条件补装 → 设置窗每次关闭都会重挂计时器，把「讲话中暂停去抖」的
+            计时器重新启动，半句话被发出去（正是这个功能要解决的痛点）。
+
+        断言的是**分支条件**而不是「有没有这行代码」：把条件改成 `else if (true)`
+        或 `else if (false)` 时，`RearmAutoSubmitIfPending()` 这行字还在原地，
+        只查字符串的测试照样通过 —— 而行为已经错了（恒真 = 每次都重挂，
+        恒假 = 永远不补装）。第一版断言就是这样两个方向都漏报的。
+        """
+        toggle = _method_body("internal void SetAutoSubmit(bool auto)")
+        _assert_branch_condition_depends_on(toggle, "RearmAutoSubmitIfPending()", ("auto",))
+
+        for signature, variable in (
+            ("private void ReloadConfigIfChanged()", "oldAiAutoSubmit"),
+            ("internal void ApplyAiSettings(", "wasAutoSubmit"),
+        ):
+            body = _method_body(signature)
+            _assert_branch_condition_depends_on(
+                body, "RearmAutoSubmitIfPending()", (variable,)
+            )
+
+    def test_phone_sync_only_on_real_change(self) -> None:
+        """同步手机的广播同样要判「值真的变了」，理由与补装计时器相同。"""
+        settings = _method_body("internal void ApplyAiSettings(")
+        _assert_branch_condition_depends_on(
+            settings, "AutoSubmitFeed.Post", ("wasAutoSubmit",)
+        )
+
+        reload_body = _method_body("private void ReloadConfigIfChanged()")
+        _assert_branch_condition_depends_on(
+            reload_body, "AutoSubmitFeed.Post", ("oldAiAutoSubmit",)
+        )
+
+    def test_rearm_respects_busy_and_empty_queue(self) -> None:
+        """补装要判「AI 启用 + 队列非空 + 不在请求中」，与请求结束处的重挂同款。
+
+        否则会在没有内容时启动计时器，到点被守卫丢弃（日志噪音，白等一轮）。
+        """
+        body = _method_body("private void RearmAutoSubmitIfPending()")
+        for guard in ("config.AiEnabled", "config.AiAutoSubmit", "aiBusy", "aiQueue.Count"):
+            assert guard in body, f"补装缺少守卫 {guard}"
+
+    def test_rearm_starts_timer_with_current_interval(self) -> None:
+        """补装必须真的启动计时器，并按当前「停顿触发」间隔 —— 与请求结束处同款。
+
+        只判「调用了 RearmAutoSubmitIfPending」是不够的：那个方法内部如果把
+        aiTimer.Start() 删掉，调用点还在、方法名还在，功能却没了。
+        """
+        body = _method_body("private void RearmAutoSubmitIfPending()")
+        assert "aiTimer.Start()" in body, "补装方法没有真的启动计时器"
+        assert "config.AiSilenceSeconds" in body, "补装没按当前停顿间隔设置"

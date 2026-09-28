@@ -50,6 +50,13 @@ CLIPBOARD_POLL_SECONDS = 0.2
 # 轮询间隔 25ms、最多 8 次，覆盖住浏览器/输入法锁定剪贴板的瞬时窗口。
 CLIPBOARD_WRITE_ATTEMPTS = 8
 CLIPBOARD_WRITE_RETRY_SECONDS = 0.025
+# config.json 读取重试：C# Overlay 的 Save()（tmp + File.Replace）与网页设置页的
+# 保存随时可能发生，手机在这两个进程之外读同一份文件。实测 Python 的 os.replace
+# 与 .NET 的 File.ReadAllText 并发时，读失败 8 秒内出现 9 次（见
+# settings.load_settings 的同款重试与 tests/test_config_resilience.py），
+# 因此单次读失败不代表文件损坏，只有重试后仍失败才当「读不到」。
+CONFIG_READ_ATTEMPTS = 4
+CONFIG_READ_RETRY_SECONDS = 0.04
 
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
@@ -426,9 +433,15 @@ def save_vision_key(value: str, path: Path | None = None) -> None:
 
 
 def load_vision_config() -> dict[str, Any]:
-    try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
-    except (OSError, ValueError):
+    """读取解题链路的配置（只读，不写盘，读不出来时一律走默认值）。
+
+    走 _read_config_raw 而不是自己读：单次读失败（撞上 C# Overlay 或网页设置页
+    的「tmp + 原子替换」窗口）会让这几个档位静默回默认值，而它喂给手机配对、
+    hello 帧与解题链路 —— 表现是手机重连后模式显示错，用户看不出原因。
+    这里只读不写，所以「读不出来」按空配置处理是安全的（与写路径的取舍相反）。
+    """
+    raw = _read_config_raw()
+    if raw is None:
         raw = {}
     from .ai_stream import THINKING_MODES, normalize_max_tokens, normalize_thinking_mode
 
@@ -495,12 +508,46 @@ def normalize_auto_interval_ms(value: Any) -> float:
     return snapped * 1000.0
 
 
+def _read_config_raw() -> dict[str, Any] | None:
+    """读取整份 config.json；返回 None = 「读不出来」，与「空配置」是两回事。
+
+    三种结果对应三种不同的事实，调用方必须分开对待：
+      · {}   文件不存在（全新安装）—— 确实没有配置可保留，允许写盘；
+      · dict 读到了内容；
+      · None 文件存在但读不出来（被独占占用 / 半个文件 / 顶层不是对象）——
+             磁盘上有什么我们一无所知，此时任何写盘都可能抹掉用户资料。
+
+    重试的理由见 CONFIG_READ_ATTEMPTS：单次失败多半只是撞上了 C# Overlay 或
+    网页设置页「tmp + 原子替换」的窗口（实测 8 秒内 9 次），重试三次基本都能读到。
+    最坏情况阻塞约 120ms，且只在文件真的读不出来时发生。
+
+    注意不要用 CONFIG_PATH.exists() 先判断：Path.exists() 内部吞掉 OSError
+    返回 False，文件被独占锁定时会得到「不存在」这个错误结论，于是又回到
+    「按空配置处理」的老路。这里以 read_text 的 FileNotFoundError 为准。
+    """
+    for attempt in range(CONFIG_READ_ATTEMPTS):
+        try:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            # 必须在 OSError 之前捕获：它正是「文件不存在」这一确定的结论。
+            return {}
+        except (OSError, ValueError):
+            if attempt < CONFIG_READ_ATTEMPTS - 1:
+                time.sleep(CONFIG_READ_RETRY_SECONDS)
+            continue
+        # 顶层不是对象（被别的程序写成了数组/字符串）：内容已不是配置，
+        # 读路径按空处理，写路径则必须拒绝 —— 见上面的第 3 种情况。
+        return raw if isinstance(raw, dict) else None
+    return None
+
+
 def _read_config_value(key: str) -> Any:
-    """只读 config.json 的单个键；文件缺失/损坏时返回 None（不抛异常）。"""
-    try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
-    except (OSError, ValueError):
-        return None
+    """只读 config.json 的单个键；文件缺失/损坏/读不出时返回 None（不抛异常）。
+
+    读路径把「读不出来」也当空处理：这里只需要各字段的默认值，不写盘所以
+    没有丢数据的风险；区分读写两种语义的是 _read_config_raw。
+    """
+    raw = _read_config_raw()
     return raw.get(key) if isinstance(raw, dict) else None
 
 
@@ -510,23 +557,34 @@ def _write_single_config_key(key: str, normalized: Any) -> Any:
     手机在局域网，调不到 /api/settings（require_local 只放行回环地址），所以
     切换必须走 relay。为避免手机端越权改配置，这里刻意只接受键名与已白名单
     规范化的值，其余字段一律不碰、原样保留。
+
+    返回 None = 写入失败（读不出原文件或写盘失败），调用方**必须**显式处理：
+    这是读-改-写，读不到原文件时若照写，整份 config.json 会被覆写成
+    「只剩这一个键」的单键文件（2026-09-25 实测：杀软瞬时锁定 config.json 时，
+    切一次开关就把 resumeContext/jdContext/targetCompany 等 44 个键全部清空）。
+
+    写失败（磁盘满 / 文件被锁）同样返回 None 而不是抛异常：用户资料此时完好，
+    失败必须能被调用方如实告知手机，而不是变成一次静默的空操作。
     """
-    try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
-    except (OSError, ValueError):
-        raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
+    raw = _read_config_raw()
+    if raw is None:
+        return None
     raw[key] = normalized
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = CONFIG_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, CONFIG_PATH)
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = CONFIG_PATH.with_suffix(".tmp")
+        temporary.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, CONFIG_PATH)
+    except OSError:
+        return None
     return normalized
 
 
-def set_vision_answer_mode(mode: Any) -> str:
-    """手机端切换作答模式：**只写 visionAnswerMode 这一个键**。"""
+def set_vision_answer_mode(mode: Any) -> str | None:
+    """手机端切换作答模式：**只写 visionAnswerMode 这一个键**。
+
+    返回 None = 写入失败（原因见 _write_single_config_key），调用方需提示手机。
+    """
     return _write_single_config_key("visionAnswerMode", normalize_answer_mode(mode))
 
 
@@ -542,8 +600,11 @@ def normalize_vision_thinking_mode(value: Any) -> str:
     return mode if mode in THINKING_MODES else ""
 
 
-def set_vision_thinking_mode(mode: Any) -> str:
-    """手机端切换解题思考模式：**只写 visionThinkingMode 这一个键**。"""
+def set_vision_thinking_mode(mode: Any) -> str | None:
+    """手机端切换解题思考模式：**只写 visionThinkingMode 这一个键**。
+
+    返回 None = 写入失败（原因见 _write_single_config_key），调用方需提示手机。
+    """
     return _write_single_config_key(
         "visionThinkingMode", normalize_vision_thinking_mode(mode)
     )
@@ -559,13 +620,18 @@ def load_auto_submit() -> bool:
     return True if value is None else bool(value)
 
 
-def set_auto_submit(on: Any) -> bool:
+def set_auto_submit(on: Any) -> bool | None:
     """手机端切换「自动提交」：只写 aiAutoSubmit 这一个键。
 
     桌面端每秒重载一次 config（configTimer → ReloadConfigIfChanged），
     因此手机改完约 1 秒内生效，无需重启。
+
+    返回 None = 写入失败，**不是 False**。这里不能写 bool(...)：bool(None) 是
+    False，调用方会把一次写盘失败当成「已成功切到手动」广播给手机与桌面，
+    而磁盘上什么都没变 —— 界面显示的状态与真实行为相反。
     """
-    return bool(_write_single_config_key("aiAutoSubmit", bool(on)))
+    result = _write_single_config_key("aiAutoSubmit", bool(on))
+    return None if result is None else bool(result)
 
 
 class SolveEngine:
@@ -1112,12 +1178,18 @@ class PhoneRelay:
                     # 手机端切写作答模式：只写 visionAnswerMode 一个键，白名单校验后
                     # 向所有手机广播当前值（多台手机时保持一致）。
                     applied = set_vision_answer_mode(payload.get("mode"))
-                    self.schedule_json({"type": "vision_mode", "mode": applied})
+                    if applied is None:
+                        self._notify_config_write_failed()
+                    else:
+                        self.schedule_json({"type": "vision_mode", "mode": applied})
                 elif kind == "vision_thinking":
                     # 手机端切换解题思考模式：同样只写 visionThinkingMode 一个键。
                     # 三态 "" = 跟随字幕 AI / off / auto。
                     applied = set_vision_thinking_mode(payload.get("mode"))
-                    self.schedule_json({"type": "vision_thinking", "mode": applied})
+                    if applied is None:
+                        self._notify_config_write_failed()
+                    else:
+                        self.schedule_json({"type": "vision_thinking", "mode": applied})
                 elif kind == "ask_now":
                     # 手机端「问 AI」按钮：把「立即提交当前字幕」的意图转给桌面。
                     # 字幕文本只存在于 C# 进程（服务端只做识别与转发、不保存转写），
@@ -1126,8 +1198,19 @@ class PhoneRelay:
                 elif kind == "auto_submit":
                     # 手机端切换「自动提交」：与桌面共用 config.json 的 aiAutoSubmit，
                     # 桌面每秒重载一次配置，约 1 秒生效。
+                    #
+                    # applied 为 None 时绝不能回一帧 on:false：那等于告诉手机与桌面
+                    # 「已成功切到手动」，而磁盘根本没动，界面显示与实际行为相反。
                     applied = set_auto_submit(payload.get("on"))
-                    self.schedule_json({"type": "auto_submit", "on": applied})
+                    if applied is None:
+                        # 复选框是浏览器原生翻过去的（乐观更新），写盘失败必须让它
+                        # 退回原值，否则手机显示的状态与实际相反。回退基准交给手机
+                        # 自己（它知道自己最后一次确认过的值）—— 服务端此刻读不到
+                        # 文件，回任何值都是猜的（真机验证：原值 False 时回退默认
+                        # True，手机显示「已开启」，磁盘上却是关的）。
+                        self._notify_config_write_failed(revert="auto_submit")
+                    else:
+                        self.schedule_json({"type": "auto_submit", "on": applied})
                 elif kind == "ping":
                     # 手机端测 RTT：原样回带时间戳，不做任何计算。
                     self.schedule_json({"type": "pong", "t": payload.get("t")})
@@ -1146,6 +1229,28 @@ class PhoneRelay:
 
     async def _handle_solve(self, task: str = SOLVE_TASK_SOLVE) -> None:
         await asyncio.to_thread(self.request_solve, task)
+
+    def _notify_config_write_failed(self, revert: str = "") -> None:
+        """配置写盘失败时如实回一条提示（手机端 case "notice" 已存在）。
+
+        必须让用户知道「这次切换没有生效」：静默失败会让手机上的开关停在
+        用户刚点的位置，而电脑端行为没变 —— 用户以为切了，实际没切。
+        写盘失败通常是 config.json 被杀软/备份/索引器瞬时占用，稍后重试即可，
+        所以文案要给出可执行的下一步，而不是只说失败。
+
+        revert：需要手机把自己那个「乐观更新」的控件退回原值的，填控件对应的键名。
+        服务端**不能**在这里回一个「磁盘真实值」——写失败正是因为读不出这个文件，
+        任何取值都是猜的（真机验证踩到：原值是 False，回退默认值 True，
+        手机显示「已开启自动提交」而磁盘上是关的）。唯一可靠的参照是手机侧
+        最后一次从服务端确认过的值，所以由手机自己退回去。
+        """
+        payload = {
+            "type": "notice",
+            "message": "配置写入失败（config.json 被占用？），请稍后重试",
+        }
+        if revert:
+            payload["revert"] = revert
+        self.schedule_json(payload)
 
     def _desktop_online(self) -> bool:
         """桌面（C# Overlay）是否连着。判断依据是 hub 的 WS 客户端数。

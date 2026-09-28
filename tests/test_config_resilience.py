@@ -465,3 +465,155 @@ def test_auto_submit_survives_csharp_save_roundtrip(config_probe, tmp_path: Path
     assert on_disk["aiModel"] == "qwen-max", "保存时把自定义模型名弄丢了"
     assert on_disk["resumeContext"] == "项目一", "保存时把简历弄丢了"
 
+
+class TestSingleKeyWriterLosesNothing:
+    """手机端单键写入（_write_single_config_key）在读盘失败时不得抹掉整份配置。
+
+    真实事故（2026-09-25 实测复现）：该函数是读-改-写，读盘失败时把 raw 当空字典，
+    然后无条件写盘 —— 于是 config.json 被覆写成「只剩刚改的那一个键」的单键文件，
+    resumeContext/jdContext/targetCompany 等 44 个键全部消失。
+    触发条件不是理论情况：手机切开关时 config.json 恰被杀软/备份/索引器瞬时独占。
+
+    这是上一轮「堵丢资料路径」（5d9fad3）的漏网之鱼：那条加固覆盖了
+    settings.load_settings 与 C# 的 Load(out ok)，没有覆盖这个函数。
+    本文件此前也完全没有它的用例 —— 这正是它漏网的原因。
+    """
+
+    @staticmethod
+    def _write(path: Path, data: dict) -> None:
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def test_read_failure_does_not_wipe_config(self, tmp_path: Path, monkeypatch) -> None:
+        """读盘失败时三个 setter 都必须返回 None，且一个字节都不许写。"""
+        from system_audio_asr import phone_share
+
+        config = tmp_path / "config.json"
+        original = {
+            "aiAutoSubmit": True,
+            "resumeContext": "项目一：某医疗设备公司 | 医学影像软件",
+            "jdContext": "目标职位 JD 文本",
+            "targetCompany": "某互联网公司",
+            "visionAnswerMode": "core_code",
+        }
+        self._write(config, original)
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config)
+
+        # 模拟杀软/备份/索引器的瞬时独占：真实 OSError，不是替身。
+        # 只在「读」上失败（写没问题），这样才能单独验证「读失败不写盘」这条规则。
+        real_read = Path.read_text
+
+        def locked_read(self, *args, **kwargs):
+            if self == config:
+                raise PermissionError(13, "文件被占用（模拟杀软瞬时锁定）")
+            return real_read(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", locked_read)
+        try:
+            assert phone_share.set_auto_submit(False) is None, "读失败时未报告失败"
+            assert phone_share.set_vision_answer_mode("acm") is None
+            assert phone_share.set_vision_thinking_mode("auto") is None
+        finally:
+            monkeypatch.undo()
+
+        after = json.loads(config.read_text(encoding="utf-8"))
+        assert after == original, (
+            "读盘失败仍写了盘：整份 config.json 被覆写，面试资料丢失"
+        )
+
+    def test_top_level_garbage_is_not_overwritten(self, tmp_path: Path, monkeypatch) -> None:
+        """顶层不是对象（被别的程序写坏）时同样拒绝写，而不是当成空配置。
+
+        「读到的东西不是配置」与「没有配置」是两回事：前者说明磁盘上有我们
+        不认识的字节，照写就是拿一份全新配置覆盖它。
+        """
+        from system_audio_asr import phone_share
+
+        config = tmp_path / "config.json"
+        config.write_text("[1, 2, 3]", encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config)
+
+        assert phone_share.set_auto_submit(False) is None
+        assert config.read_text(encoding="utf-8") == "[1, 2, 3]", "被覆写了"
+
+    def test_missing_file_still_writes(self, tmp_path: Path, monkeypatch) -> None:
+        """文件不存在 = 全新安装，确实没有配置要保，必须能正常写入。
+
+        把「读不到」一律当失败会让全新安装的手机切开关永远失败 ——
+        这与「读失败」是不同的事实，不能一起挡掉。
+        """
+        from system_audio_asr import phone_share
+
+        config = tmp_path / "config.json"
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config)
+        assert phone_share.set_auto_submit(False) is False, "全新安装时写入失败"
+        assert json.loads(config.read_text(encoding="utf-8")) == {"aiAutoSubmit": False}
+
+    def test_key_absent_but_file_readable_keeps_other_keys(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """文件可读、目标键不存在时，写盘必须保留其余键。"""
+        from system_audio_asr import phone_share
+
+        config = tmp_path / "config.json"
+        self._write(config, {"resumeContext": "项目一", "futureKey": "未来版本的键"})
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config)
+
+        assert phone_share.set_auto_submit(False) is False
+        after = json.loads(config.read_text(encoding="utf-8"))
+        assert after == {"resumeContext": "项目一", "futureKey": "未来版本的键", "aiAutoSubmit": False}
+
+    def test_transient_lock_is_retried_before_giving_up(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """读失败要像 load_settings 那样重试：撞上「原子替换」窗口不是真损坏。
+
+        C# Overlay 的 Save() 与网页设置页的保存随时可能发生，实测 Python 的
+        os.replace 与 .NET 的 File.ReadAllText 并发时读失败 8 秒内出现 9 次。
+        不重试就等于「只要有别的进程刚好在写，手机切开关就失败」。
+        """
+        from system_audio_asr import phone_share
+
+        config = tmp_path / "config.json"
+        self._write(config, {"resumeContext": "项目一", "aiAutoSubmit": True})
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config)
+
+        real_read = Path.read_text
+        calls = {"n": 0}
+
+        def flaky_read(self, *args, **kwargs):
+            if self == config:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise PermissionError(13, "第一次读被占用")
+            return real_read(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", flaky_read)
+        try:
+            assert phone_share.set_auto_submit(False) is False, "重试后仍报失败"
+        finally:
+            monkeypatch.undo()
+
+        assert calls["n"] >= 2, "没有重试，第一次读失败就直接放弃了"
+        after = json.loads(config.read_text(encoding="utf-8"))
+        assert after["resumeContext"] == "项目一", "重试成功但仍丢了其它键"
+
+    def test_setter_return_contract_is_not_bool_swallowed(self) -> None:
+        """三个 setter 的返回类型必须区分「失败」与「成功设为 False」。
+
+        set_auto_submit 曾经写 bool(_write_single_config_key(...))：bool(None) 是
+        False，一次写盘失败被当成「已成功切到手动」广播出去（手机与桌面都收到
+        on:false），而磁盘上什么都没变 —— 界面与真实行为相反。
+        """
+        from system_audio_asr import phone_share
+
+        for name, annotation in (
+            ("set_auto_submit", "bool | None"),
+            ("set_vision_answer_mode", "str | None"),
+            ("set_vision_thinking_mode", "str | None"),
+        ):
+            function = getattr(phone_share, name)
+            assert annotation in str(function.__annotations__.get("return", "")), (
+                f"{name} 的返回类型未区分失败：{function.__annotations__.get('return')}"
+            )
+
+

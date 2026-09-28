@@ -509,6 +509,22 @@ def create_app(config: AppConfig) -> FastAPI:
             phone_relay.schedule_json({"type": "notice", "message": message})
         return {"ok": True}
 
+    @app.post("/api/phone/auto_submit_state")
+    async def phone_auto_submit_state(request: Request, payload: dict) -> dict:
+        """桌面端改完「自动/手动」后，把新状态广播给已连接的手机。
+
+        场景：桌面端切模式（悬停按钮/设置窗/网页设置页）只写 config.json，
+        手机要等自己再操作一次或重连才会看到新值；那段窗口里手机复选框停在
+        旧状态，用户按旧状态一操作就把桌面刚改的值悄悄改回去。
+
+        与 /api/phone/notice 分开：notice 只是提示文字（手机端不做状态解析），
+        这里下发的是可确定的布尔状态，复用手机端既有的 auto_submit 分支
+        （与手机自己切换后收到的回执是同一帧格式）。
+        """
+        require_local(request)
+        phone_relay.schedule_json({"type": "auto_submit", "on": bool(payload.get("on"))})
+        return {"ok": True}
+
     @app.get("/api/ai/prompt")
     async def get_ai_prompt(request: Request) -> dict:
         require_local(request)

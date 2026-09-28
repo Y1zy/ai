@@ -508,8 +508,14 @@ function handleText(raw){
       break;
     case "auto_submit":
       // 字幕 AI 的自动/手动模式回执（多台手机保持一致，与 vision_mode 同一模式）。
+      // 桌面切模式后也会推这一帧（它写盘后主动广播，不再只等手机自己操作或重连），
+      // 所以这里要提示「是谁改的」都能看到：值没变就不提示，避免同一改动弹两次
+      // （手机自己切换 → 回执一条；桌面重载配置后又广播同一个值 → 第二条）。
+      var changed = aiAutoSubmitState !== msg.on;
       applyAiAutoSubmit(msg.on);
-      showClipStatus(msg.on ? "字幕 AI：静音后自动提交" : "字幕 AI：改为手动（点「⚡ 问 AI」提交）");
+      if (changed) {
+        showClipStatus(msg.on ? "字幕 AI：静音后自动提交" : "字幕 AI：改为手动（点「⚡ 问 AI」提交）");
+      }
       break;
     case "manual_ai_unavailable":
       // 桌面不在线：字幕文本只存在于电脑端进程，这条请求必然无人处理。
@@ -519,6 +525,11 @@ function handleText(raw){
     case "notice":
       // 桌面端发来的提示（如「手动提交被拒」的原因）。
       // 用户此时正看着手机，提示条是唯一能看到反馈的地方。
+      // revert：写盘失败时把误翻的控件退回原值。服务端此刻读不出配置文件，
+      // 回任何值都是猜的，所以基准由手机自己提供（最后一次确认过的值）。
+      if (msg.revert === "auto_submit" && aiAutoSubmitState !== null) {
+        applyAiAutoSubmit(aiAutoSubmitState);
+      }
       showClipStatus("⚠ " + (msg.message || "电脑端拒绝了本次提交"));
       break;
   }
@@ -827,9 +838,14 @@ document.getElementById("auto-interval").onchange = function(){
 // 字幕 AI 的自动/手动模式：写的是电脑 config.json 的 aiAutoSubmit（与桌面共用），
 // 桌面每秒重载一次配置，约 1 秒生效。服务端会回一帧 auto_submit 确认。
 // 与上面的「自动提交问题」（定时截图解题）是两件不同的事，不要混淆。
+// 已知状态：null = 还没从服务端得知过。用来判断收到的一帧是否带来了新信息 ——
+// 桌面切模式后会主动广播，手机自己切换后桌面重载配置又会广播一次同一个值，
+// 不做去重会连弹两条一样的提示。
+var aiAutoSubmitState = null;
 function applyAiAutoSubmit(on){
   var box = document.getElementById("ai-auto-submit");
   if (box) box.checked = !!on;
+  aiAutoSubmitState = !!on;
 }
 document.getElementById("ai-auto-submit").onchange = function(){
   var on = this.checked;
