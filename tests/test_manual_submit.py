@@ -281,6 +281,9 @@ class TestAutoSubmitConfigPlumbing:
         target = tmp_path / "config.json"
         target.write_text(json.dumps({"aiAutoSubmit": True}), encoding="utf-8")
         monkeypatch.setattr(phone_share, "CONFIG_PATH", target)
+        # 「最后一次读到的值」是模块级缓存，必须在用例之间清掉：
+        # 否则上一个用例写进去的 False 会泄漏过来（第一次跑就抓到了）。
+        monkeypatch.setattr(phone_share, "_last_auto_submit", None)
         return target
 
     def test_default_is_auto_on(self) -> None:
@@ -302,7 +305,28 @@ class TestAutoSubmitConfigPlumbing:
         isolated_config.write_text(json.dumps({}), encoding="utf-8")
         assert phone_share.load_auto_submit() is True
 
-    def test_broken_config_defaults_to_auto_on(self, isolated_config) -> None:
+    def test_unreadable_config_keeps_last_known_value(self, isolated_config, monkeypatch) -> None:
+        """文件读不出来时，必须回「最后一次读到的值」，而不是默认 True。
+
+        真机踩过（2026-09-26）：磁盘上是 False（用户切了手动），config.json 被
+        杀软占用时 hello 帧报 True —— 手机复选框显示「已开启自动提交」，
+        而电脑实际是关的，界面与真实行为相反。自动提交真实消耗模型额度，
+        把「关」显示成「开」比显示成未知更糟。
+
+        「顶层不是对象」（内容坏了）也走这条：磁盘上有字节，我们只是读不懂，
+        同样不该拿默认值去猜。
+        """
+        isolated_config.write_text(json.dumps({"aiAutoSubmit": False}), encoding="utf-8")
+        assert phone_share.load_auto_submit() is False, "先读到一次，建立已知值"
+
+        isolated_config.write_text("[1,2,3]", encoding="utf-8")   # 内容坏掉
+        assert phone_share.load_auto_submit() is False, (
+            "读不出来时回退默认 True：手机显示「已开启」，磁盘上却是关的"
+        )
+
+    def test_unreadable_config_without_history_falls_back_to_auto(self, isolated_config, monkeypatch) -> None:
+        """从未读到过任何值时仍回 True：保持历史行为，不能凭空变手动。"""
+        monkeypatch.setattr(phone_share, "_last_auto_submit", None)
         isolated_config.write_text("[1,2,3]", encoding="utf-8")
         assert phone_share.load_auto_submit() is True
 

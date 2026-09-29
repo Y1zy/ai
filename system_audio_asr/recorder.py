@@ -112,12 +112,16 @@ class SessionRecorder:
             answers = sum(1 for e in self._entries if _base_kind(e["kind"]) == "ai")
             solves = sum(1 for e in self._entries if _base_kind(e["kind"]) == "solve")
             oldest = self._entries[0]["ts"] if self._entries else None
+            # images 计数也在锁内取：add_solve_images / clear 会改这个列表，
+            # 锁外读到的长度可能与其他几个计数不是同一时刻的快照。
+            images = len(self._images)
+            has_content = bool(self._entries or self._images)
         return {
             "finals": finals,
             "answers": answers,
             "solves": solves,
-            "images": len(self._images),
-            "has_content": bool(self._entries or self._images),
+            "images": images,
+            "has_content": has_content,
             "since": datetime.fromtimestamp(oldest).strftime("%H:%M:%S") if oldest else None,
         }
 

@@ -57,14 +57,17 @@ def _normalize_entry(raw: Any) -> dict[str, Any] | None:
     }
 
 
-def load_entries(path: Path | None = None) -> list[dict[str, Any]]:
-    """读取全部知识库条目；文件缺失或损坏时返回空列表（不抛异常，避免拖垮服务启动）。"""
-    target = path or KNOWLEDGE_PATH
-    with _store_lock:
-        try:
-            raw = json.loads(target.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            return []
+def _load_entries_locked(target: Path) -> list[dict[str, Any]]:
+    """读取全部条目的**无锁**实现；调用方必须已持有 _store_lock。
+
+    拆出来是为了让「读-改-写」能在同一把锁内完成（见 upsert_entry）：
+    直接调 load_entries 会在读完后释放锁，另一个线程就能在这中间写入，
+    后写的把前写的整份覆盖 —— 实测两线程各存 6 条，最终只剩 6 条，且无任何报错。
+    """
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return []
     items = raw.get("entries") if isinstance(raw, dict) else raw
     if not isinstance(items, list):
         return []
@@ -76,23 +79,40 @@ def load_entries(path: Path | None = None) -> list[dict[str, Any]]:
     return entries
 
 
-def save_entries(entries: list[dict[str, Any]], path: Path | None = None) -> list[dict[str, Any]]:
-    """原子写入：先写 .tmp 再 os.replace，避免并发读时读到半截文件。"""
+def load_entries(path: Path | None = None) -> list[dict[str, Any]]:
+    """读取全部知识库条目；文件缺失或损坏时返回空列表（不抛异常，避免拖垮服务启动）。"""
     target = path or KNOWLEDGE_PATH
+    with _store_lock:
+        return _load_entries_locked(target)
+
+
+def _save_entries_locked(
+    entries: list[dict[str, Any]], target: Path
+) -> list[dict[str, Any]]:
+    """写入条目的**无锁**实现；调用方必须已持有 _store_lock。
+
+    原子写入：先写 .tmp 再 os.replace，避免并发读时读到半截文件。
+    """
     normalized: list[dict[str, Any]] = []
     for item in (entries or [])[:MAX_ENTRIES]:
         entry = _normalize_entry(item)
         if entry:
             normalized.append(entry)
-    with _store_lock:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps({"entries": normalized}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(temporary, target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"entries": normalized}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, target)
     return normalized
+
+
+def save_entries(entries: list[dict[str, Any]], path: Path | None = None) -> list[dict[str, Any]]:
+    """整体覆盖写入（无并发语义：调用方提供的就是要落盘的完整集合）。"""
+    target = path or KNOWLEDGE_PATH
+    with _store_lock:
+        return _save_entries_locked(entries, target)
 
 
 def upsert_entry(
@@ -111,19 +131,26 @@ def upsert_entry(
     if not str(raw_content or "").strip():
         raise ValueError("条目内容不能为空（如需删除请使用删除操作）")
 
-    entries = load_entries(path)
-    entry_id = str(candidate.get("id") or "").strip()
-    candidate["id"] = entry_id or secrets.token_hex(8)
-    if entry_id:
-        for index, existing in enumerate(entries):
-            if existing["id"] == entry_id:
-                entries[index] = {**existing, **candidate}
-                break
+    target = path or KNOWLEDGE_PATH
+    # 读-改-写必须在**同一把锁**内完成。此前是 load_entries() 与 save_entries()
+    # 各取一次锁，两者之间文件处于无保护状态：另一个并发调用（如两个设置页标签，
+    # 或「保存」未返回时又点了「停用/启用」）会在这中间写入自己那份完整列表，
+    # 随后被本函数的写入整份覆盖 —— 表现为刚存进去的条目凭空消失，且无任何报错。
+    # 实测两线程各 upsert 6 次，最终只剩 6 条。
+    with _store_lock:
+        entries = _load_entries_locked(target)
+        entry_id = str(candidate.get("id") or "").strip()
+        candidate["id"] = entry_id or secrets.token_hex(8)
+        if entry_id:
+            for index, existing in enumerate(entries):
+                if existing["id"] == entry_id:
+                    entries[index] = {**existing, **candidate}
+                    break
+            else:
+                entries.append(candidate)
         else:
             entries.append(candidate)
-    else:
-        entries.append(candidate)
-    saved = save_entries(entries, path)
+        saved = _save_entries_locked(entries, target)
     target_id = candidate["id"]
     for item in saved:
         if item["id"] == target_id:
@@ -133,8 +160,11 @@ def upsert_entry(
 
 
 def delete_entry(entry_id: str, path: Path | None = None) -> list[dict[str, Any]]:
-    entries = [item for item in load_entries(path) if item["id"] != entry_id]
-    return save_entries(entries, path)
+    """删除一条；读-改-写同样在同一把锁内（理由见 upsert_entry）。"""
+    target = path or KNOWLEDGE_PATH
+    with _store_lock:
+        entries = [item for item in _load_entries_locked(target) if item["id"] != entry_id]
+        return _save_entries_locked(entries, target)
 
 
 def clear_entries(path: Path | None = None) -> list[dict[str, Any]]:

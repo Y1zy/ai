@@ -16,6 +16,7 @@ C# 侧行为由 tests/test_overlay_config_keys.py 的同族用例 + 本文件的
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -615,5 +616,119 @@ class TestSingleKeyWriterLosesNothing:
             assert annotation in str(function.__annotations__.get("return", "")), (
                 f"{name} 的返回类型未区分失败：{function.__annotations__.get('return')}"
             )
+
+
+class TestAtomicWriteTempFiles:
+    """原子替换写盘的临时文件：必须每个写者独占一个名字。
+
+    config.json 有多个写者（手机端单键切换、网页设置页保存、桌面 C# Overlay）。
+    此前 Python 这两处都用固定的 ``config.tmp``，两者现在都可能真正并发
+    （各自跑在线程池里）：A 写完 tmp → B 覆写 tmp → A 再 replace，
+    就会把 B 的内容当成 A 的结果发布 —— A 的改动静默丢失，两边都以为成功。
+    """
+
+    def test_concurrent_writers_do_not_clobber_each_other(self, tmp_path: Path, monkeypatch) -> None:
+        """两个写者并发：最终磁盘内容必须是「某一次完整写入」，不能是混合体。"""
+        import threading
+
+        from system_audio_asr import phone_share, settings
+
+        config = tmp_path / "config.json"
+        config.write_text(
+            json.dumps({"aiAutoSubmit": True, "resumeContext": "初始"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config)
+
+        # 放大竞态窗口：在每个写者落下临时文件之后、replace 之前插入等待，
+        # 让两个写者必然交叠（不注入则窗口太窄、测不出来）。
+        real_replace = os.replace
+        barrier = threading.Barrier(2, timeout=5)
+
+        def slow_replace(source, target):
+            if str(target).endswith("config.json"):
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            return real_replace(source, target)
+
+        monkeypatch.setattr(os, "replace", slow_replace)
+        monkeypatch.setattr(phone_share.os, "replace", slow_replace)
+
+        errors: list[BaseException] = []
+
+        def write_from_phone() -> None:
+            try:
+                phone_share.set_auto_submit(False)
+            except BaseException as exc:      # noqa: BLE001 - 记录后由断言呈现
+                errors.append(exc)
+
+        def write_from_web() -> None:
+            try:
+                settings.save_settings({"resumeContext": "网页写入"}, config)
+            except BaseException as exc:      # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write_from_phone),
+                   threading.Thread(target=write_from_web)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        monkeypatch.undo()
+        assert not errors, f"并发写入抛异常：{errors}"
+
+        on_disk = json.loads(config.read_text(encoding="utf-8"))
+        # 无论谁最后落盘，文件都必须是**一份完整有效的配置**。
+        # 用固定临时名时，这里会出现「文案来自 A、开关来自 B」的错乱，
+        # 或者干脆是半截内容（JSON 都解析不了）。
+        assert set(on_disk) >= {"aiAutoSubmit", "resumeContext"}, (
+            f"并发写入产生了不完整的配置：{sorted(on_disk)}"
+        )
+        assert on_disk["resumeContext"] in {"初始", "网页写入"}, on_disk
+        assert on_disk["aiAutoSubmit"] in {True, False}, on_disk
+
+        leftovers = [item.name for item in tmp_path.iterdir() if item.name.endswith(".tmp")]
+        assert leftovers == [], f"落盘后残留临时文件：{leftovers}"
+
+    def test_write_failure_leaves_no_temp_file(self, tmp_path: Path, monkeypatch) -> None:
+        """写盘失败（磁盘满/被锁）不能把半成品临时文件留在用户配置目录里。"""
+        from system_audio_asr import phone_share
+
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"aiAutoSubmit": True}), encoding="utf-8")
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config)
+
+        real_replace = os.replace
+
+        def failing_replace(source, target):
+            if str(target).endswith("config.json"):
+                raise OSError(28, "磁盘空间不足")
+            return real_replace(source, target)
+
+        monkeypatch.setattr(phone_share.os, "replace", failing_replace)
+        try:
+            assert phone_share.set_auto_submit(False) is None, "写失败未报告失败"
+        finally:
+            monkeypatch.undo()
+
+        leftovers = [item.name for item in tmp_path.iterdir() if item.name.endswith(".tmp")]
+        assert leftovers == [], f"写失败后残留临时文件：{leftovers}"
+        assert json.loads(config.read_text(encoding="utf-8"))["aiAutoSubmit"] is True, "原文件被破坏"
+
+    def test_temp_names_are_not_shared_between_writers(self) -> None:
+        """源码契约：两个写者不得再用同一个固定临时名。"""
+        import inspect
+
+        from system_audio_asr import phone_share, settings
+
+        for function in (phone_share._write_single_config_key, settings.save_settings):
+            source = inspect.getsource(function)
+            assert "_unique_tmp" in source, (
+                f"{function.__qualname__} 又用回了固定临时名：两个写者会互相覆盖"
+            )
+
 
 

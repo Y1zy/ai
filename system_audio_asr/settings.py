@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import socket
 import time
 from ctypes import wintypes
@@ -321,6 +322,18 @@ def normalize_settings(value: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _unique_tmp(target: Path) -> Path:
+    """原子替换写盘用的唯一临时文件名（与目标同目录，保证 os.replace 同卷）。
+
+    不能用固定的 ``target.with_suffix(".tmp")``：网页保存（本函数）与手机端单键
+    切换（phone_share._write_single_config_key）写的是同一个 config.json，两者
+    可能真正并发（各自跑在线程池里）。共用临时名时会出现「A 写 tmp → B 覆写
+    tmp → A replace」的交错，把 B 的内容当成 A 的结果发布（A 的改动静默丢失，
+    两边都以为成功）。带 pid + 随机数即可让每个写者独占自己的临时文件。
+    """
+    return target.with_name(f"{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+
+
 def save_settings(value: dict[str, Any], path: Path = CONFIG_PATH) -> dict[str, Any]:
     """写回配置；磁盘上「本函数不认识」的键原样保留。
 
@@ -342,9 +355,16 @@ def save_settings(value: dict[str, Any], path: Path = CONFIG_PATH) -> dict[str, 
     except (OSError, ValueError):
         pass
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    temporary = _unique_tmp(path)
+    try:
+        temporary.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return normalized
 
 

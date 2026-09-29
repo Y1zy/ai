@@ -508,6 +508,18 @@ def normalize_auto_interval_ms(value: Any) -> float:
     return snapped * 1000.0
 
 
+def _unique_tmp(target: Path) -> Path:
+    """给原子替换写盘用的唯一临时文件名（同目录，保证 os.replace 仍在同卷）。
+
+    不能用固定的 ``target.with_suffix(".tmp")``：手机端切换（本模块）与网页设置页
+    保存（settings.save_settings）会写同一个 config.json，两者都跑在线程里、
+    可能真正并发。共用一个临时名时，A 写完 tmp → B 覆写 tmp → A 再 replace，
+    就会把 B 的内容当成 A 的结果发布出去（内容没损坏，但 A 的改动已经丢了，
+    且两者都以为成功）。名字里带 pid + 随机数即可让每个写者独占自己的临时文件。
+    """
+    return target.with_name(f"{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+
+
 def _read_config_raw() -> dict[str, Any] | None:
     """读取整份 config.json；返回 None = 「读不出来」，与「空配置」是两回事。
 
@@ -570,12 +582,19 @@ def _write_single_config_key(key: str, normalized: Any) -> Any:
     if raw is None:
         return None
     raw[key] = normalized
+    temporary = _unique_tmp(CONFIG_PATH)
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temporary = CONFIG_PATH.with_suffix(".tmp")
         temporary.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(temporary, CONFIG_PATH)
     except OSError:
+        # 写失败（磁盘满 / 目标被锁）时清掉半成品的临时文件：否则它会一直躺在
+        # 用户配置目录里（与真实配置并排）。下次写入用的是新名字、不会复用，
+        # 不清就真的成了永久垃圾。
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
     return normalized
 
@@ -610,14 +629,33 @@ def set_vision_thinking_mode(mode: Any) -> str | None:
     )
 
 
+# aiAutoSubmit 的最后一次成功读取值。读盘失败时用它兜底，而不是回退默认值：
+# 默认 True 是「键不存在」的历史行为，不该被拿来回答「文件此刻读不出来」。
+# 真机实测（2026-09-26）：磁盘上是 False（用户手动模式），config.json 被占用时
+# hello 帧报 True，手机复选框显示「已开启自动提交」而电脑实际是关的。
+_last_auto_submit: bool | None = None
+
+
 def load_auto_submit() -> bool:
     """字幕 AI 是否静音后自动提交（config.json 的 aiAutoSubmit）。
 
-    默认 True = 历史行为。读不到时也回 True，避免配置损坏导致「突然不自动问了」
-    而用户不知道原因。
+    三种事实要分开处理，不能像以前那样一律回 True：
+      · 键不存在（老配置）→ True，保持历史行为，用户不会「突然不自动问了」；
+      · 读到值            → 用它，并记进 _last_auto_submit；
+      · 文件读不出来      → 用最后一次成功读到的值（没有则 True）。
+        以前直接回默认 True，会把用户关掉的自动提交显示成开着，
+        而它真实消耗模型额度 —— 界面与真实行为相反。
     """
-    value = _read_config_value("aiAutoSubmit")
-    return True if value is None else bool(value)
+    global _last_auto_submit
+    raw = _read_config_raw()
+    if raw is None:
+        # 读不出来：不猜，用最后已知值（本次会话内读到过就一定是准的）。
+        return True if _last_auto_submit is None else _last_auto_submit
+    if "aiAutoSubmit" not in raw:
+        return True   # 键不存在 = 老配置，历史行为是自动
+    value = bool(raw["aiAutoSubmit"])
+    _last_auto_submit = value
+    return value
 
 
 def set_auto_submit(on: Any) -> bool | None:
@@ -631,7 +669,13 @@ def set_auto_submit(on: Any) -> bool | None:
     而磁盘上什么都没变 —— 界面显示的状态与真实行为相反。
     """
     result = _write_single_config_key("aiAutoSubmit", bool(on))
-    return None if result is None else bool(result)
+    if result is None:
+        return None
+    # 写成功即磁盘真值，同步进缓存：此后若文件被占用读不出来，
+    # load_auto_submit 用这个值兜底，手机看到的仍是刚切的那个状态。
+    global _last_auto_submit
+    _last_auto_submit = bool(result)
+    return bool(result)
 
 
 class SolveEngine:
@@ -1082,7 +1126,9 @@ class PhoneRelay:
         self._loop = asyncio.get_running_loop()
 
     async def handle(self, websocket: Any, sid: str, token: str) -> None:
-        config = load_phone_config()
+        # load_phone_config 会读写 phone_share.json（首次需生成 sid/token 并落盘），
+        # 放在线程池里跑：与 config.json 同理，文件 IO 不该占事件循环。
+        config = await asyncio.to_thread(load_phone_config)
         expected_sid = str(config.get("sid") or "")
         expected_token = str(config.get("token") or "")
         # 常量时间比较；用 UTF-8 字节避免 compare_digest 对非 ASCII 字符串抛 TypeError。
@@ -1100,28 +1146,28 @@ class PhoneRelay:
                 pass
         self._phones.add(websocket)
         try:
+            # 配置项读盘走线程：_read_config_raw 在文件被占用时会退避重试
+            # （最多 4 次 × 40ms），直接在事件循环上跑会把整个服务端卡住
+            # —— 手机重连每 2 秒一次，撞上杀软扫描就是「连一次卡半秒」的字幕顿挫。
+            # handle() 是协程，必须 await asyncio.to_thread 而不是直接调用。
+            hello_state = await asyncio.to_thread(self._hello_config_state)
             await websocket.send_json({
                 "type": "hello",
                 "sid": sid,
                 # 当前作答模式：手机端据此高亮切换按钮（core_code / acm）。
-                "visionMode": normalize_answer_mode(
-                    _read_config_value("visionAnswerMode")
-                ),
+                "visionMode": hello_state["visionMode"],
                 # 当前解题思考模式："" = 跟随字幕 AI / off / auto。
-                "visionThinking": normalize_vision_thinking_mode(
-                    _read_config_value("visionThinkingMode")
-                ),
+                "visionThinking": hello_state["visionThinking"],
                 # 待解截图张数与上限：重连后按钮上的计数要对得上。
                 "solvePending": len(self._pending_solve_images),
-                "solveImageLimit": load_vision_config().get("maxImages")
-                or DEFAULT_MAX_SOLVE_IMAGES,
+                "solveImageLimit": hello_state["solveImageLimit"],
                 # 自动提交的当前状态：重连后复选框与间隔下拉要显示服务端的实际值
                 # （勾选状态只存在于服务端循环里，刷新页面不会自己恢复）。
                 "autoSolve": self._auto_solve,
                 "autoIntervalSec": int(self._auto_interval_ms / 1000),
                 # 字幕 AI 的自动/手动模式（桌面 config.json 的 aiAutoSubmit）：
                 # 刷新页面后开关要显示实际值，否则界面与真实行为相反。
-                "aiAutoSubmit": load_auto_submit(),
+                "aiAutoSubmit": hello_state["aiAutoSubmit"],
             })
             latest = self._latest_jpeg
             if latest:
@@ -1153,7 +1199,9 @@ class PhoneRelay:
                     # 追加一张待解截图（题干跨屏时连点几次，再一次性提交）。
                     self._spawn(self._handle_solve_add())
                 elif kind == "solve_clear":
-                    self.clear_pending_solve_images()
+                    # 内部要读 visionMaxImages（load_vision_config），同样带重试退避，
+                    # 一并放到线程池，避免切模式时卡事件循环。
+                    await asyncio.to_thread(self.clear_pending_solve_images)
                 elif kind == "ask":
                     phone_text = str(payload.get("text", ""))[:4000]
                     if phone_text:
@@ -1177,7 +1225,11 @@ class PhoneRelay:
                 elif kind == "vision_mode":
                     # 手机端切写作答模式：只写 visionAnswerMode 一个键，白名单校验后
                     # 向所有手机广播当前值（多台手机时保持一致）。
-                    applied = set_vision_answer_mode(payload.get("mode"))
+                    # 三个 setter 都是「读盘（带退避重试）+ 写盘」，必须走线程池：
+                    # 直接在事件循环上跑，文件被占用时会卡住整个服务端上百毫秒。
+                    applied = await asyncio.to_thread(
+                        set_vision_answer_mode, payload.get("mode")
+                    )
                     if applied is None:
                         self._notify_config_write_failed()
                     else:
@@ -1185,7 +1237,9 @@ class PhoneRelay:
                 elif kind == "vision_thinking":
                     # 手机端切换解题思考模式：同样只写 visionThinkingMode 一个键。
                     # 三态 "" = 跟随字幕 AI / off / auto。
-                    applied = set_vision_thinking_mode(payload.get("mode"))
+                    applied = await asyncio.to_thread(
+                        set_vision_thinking_mode, payload.get("mode")
+                    )
                     if applied is None:
                         self._notify_config_write_failed()
                     else:
@@ -1201,7 +1255,7 @@ class PhoneRelay:
                     #
                     # applied 为 None 时绝不能回一帧 on:false：那等于告诉手机与桌面
                     # 「已成功切到手动」，而磁盘根本没动，界面显示与实际行为相反。
-                    applied = set_auto_submit(payload.get("on"))
+                    applied = await asyncio.to_thread(set_auto_submit, payload.get("on"))
                     if applied is None:
                         # 复选框是浏览器原生翻过去的（乐观更新），写盘失败必须让它
                         # 退回原值，否则手机显示的状态与实际相反。回退基准交给手机
@@ -1251,6 +1305,23 @@ class PhoneRelay:
         if revert:
             payload["revert"] = revert
         self.schedule_json(payload)
+
+    def _hello_config_state(self) -> dict:
+        """hello 帧里要从 config.json 读的四项（**同步函数，供 to_thread 调用**）。
+
+        单独拆出来是为了整块跑在线程池里：这四项分散在 send_json 的字面量中，
+        逐个 await 会让代码零碎且容易漏掉某一个（漏掉的那个就又回到事件循环上）。
+        一次 to_thread 把全部读盘带出去，事件循环全程不会被退避重试阻塞。
+        """
+        return {
+            "visionMode": normalize_answer_mode(_read_config_value("visionAnswerMode")),
+            "visionThinking": normalize_vision_thinking_mode(
+                _read_config_value("visionThinkingMode")
+            ),
+            "solveImageLimit": load_vision_config().get("maxImages")
+            or DEFAULT_MAX_SOLVE_IMAGES,
+            "aiAutoSubmit": load_auto_submit(),
+        }
 
     def _desktop_online(self) -> bool:
         """桌面（C# Overlay）是否连着。判断依据是 hub 的 WS 客户端数。
@@ -1305,7 +1376,8 @@ class PhoneRelay:
                 {"type": "ai", "text": "电脑端屏幕采集失败", "done": True, "source": "solve"}
             )
         elif added == 0:
-            limit = load_vision_config().get("maxImages") or DEFAULT_MAX_SOLVE_IMAGES
+            # 读上限走线程池：load_vision_config 会退避重试，不能压在事件循环上。
+            limit = (await asyncio.to_thread(load_vision_config)).get("maxImages") or DEFAULT_MAX_SOLVE_IMAGES
             self.schedule_json(
                 {
                     "type": "ai",
@@ -1325,7 +1397,9 @@ class PhoneRelay:
         if not api_key:
             self.schedule_json({"type": "ai", "text": "电脑端尚未配置 AI 接口 API Key", "done": True, "source": "ask"})
             return
-        prompt = effective_system_prompt()
+        # effective_system_prompt 内部会读 config.json（经 load_settings / 知识库拼接），
+        # 同样带重试退避，必须走线程池。
+        prompt = await asyncio.to_thread(effective_system_prompt)
         if not prompt:
             self.schedule_json({"type": "ai", "text": "系统提示词为空，请检查设置页", "done": True, "source": "ask"})
             return

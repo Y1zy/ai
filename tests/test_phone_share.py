@@ -1366,3 +1366,189 @@ class TestAutoSubmitStateBroadcast:
             f"局域网调用返回 {response.status_code}，应当被 require_local 拦下"
         )
 
+
+class TestEventLoopNotBlockedByConfigReads:
+    """带重试的读盘不得阻塞 asyncio 事件循环。
+
+    背景（2026-09-26 实测）：config.json 被占用时 _read_config_raw 会退避重试
+    （最多 4 次 × 40ms）。若在事件循环线程上直接调用，整个服务端会被卡住 ——
+    实测 hello 帧的 4 次读盘让事件循环停摆 500ms（心跳从 20ms 拉到 500ms）。
+    而手机断线后每 2 秒重连一次，撞上杀软扫描就表现为「连一次卡半秒」的字幕顿挫，
+    连 C# 的 /ws 与字幕转发一起停。
+
+    两条锁：行为（真实协程 + 真实独占锁测心跳间隔）与源码契约（防止将来有人
+    把 await asyncio.to_thread 改回同步调用 —— 那种改动行为用例要撞上时序才抓得到）。
+    """
+
+    def test_handle_hello_does_not_stall_the_loop(self, tmp_path, monkeypatch) -> None:
+        """真实路径：连上 /relay 收 hello 帧，期间事件循环心跳不能出现大空档。"""
+        import asyncio
+        import ctypes
+        import time
+        from ctypes import wintypes
+
+        fastapi_testclient = pytest.importorskip("fastapi.testclient")
+        pytest.importorskip("soundcard")
+        from system_audio_asr import server as server_module
+        from system_audio_asr.config import AppConfig
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps({"aiAutoSubmit": True, "visionAnswerMode": "core_code"}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(phone_share, "CONFIG_PATH", config_path)
+        monkeypatch.setattr(phone_share, "PHONE_CONFIG_PATH", tmp_path / "phone_share.json")
+        phone_share.set_enabled(True, tmp_path / "phone_share.json")
+
+        # 用真实独占句柄锁住 config.json：读盘必须走完 4 次退避才放弃。
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        handle = kernel32.CreateFileW(
+            str(config_path), 0x80000000, 0, None, 3, 0, None
+        )   # GENERIC_READ, 共享模式 0 = 独占, OPEN_EXISTING
+        assert handle != ctypes.c_void_p(-1).value, "无法独占锁定配置（测试前提不成立）"
+
+        try:
+            app = server_module.create_app(AppConfig())
+            phone_config = phone_share.load_phone_config(tmp_path / "phone_share.json")
+
+            # 与真实服务同构地测量：一个心跳协程持续打点，
+            # 期间在同一个事件循环上驱动真实的 handle() 协程（hello 帧会读 4 次配置）。
+            # 不用 TestClient 的 WS：它在别的线程里跑，量不到本循环的停摆。
+            loop_stalls: list[float] = []
+            transport: "_FakeWebSocket | None" = None
+
+            async def measure_real() -> None:
+                nonlocal transport
+                beats: list[float] = []
+                stop = False
+
+                async def heartbeat() -> None:
+                    while not stop:
+                        beats.append(time.monotonic())
+                        await asyncio.sleep(0.02)
+
+                heart = asyncio.create_task(heartbeat())
+                await asyncio.sleep(0.1)
+                transport = _FakeWebSocket()
+                await relay.handle(
+                    transport, str(phone_config["sid"]), str(phone_config["token"])
+                )
+                await asyncio.sleep(0.05)
+                stop = True
+                await heart
+                for previous, current in zip(beats, beats[1:]):
+                    loop_stalls.append((current - previous) * 1000)
+
+            relay = phone_share.PhoneRelay()
+            asyncio.run(measure_real())
+        finally:
+            kernel32.CloseHandle(handle)
+
+        worst = max(loop_stalls) if loop_stalls else 0
+        assert worst < 200, (
+            f"事件循环被阻塞了 {worst:.0f} ms（基线 20ms）：hello 帧的读盘"
+            "重试跑在了事件循环线程上，必须 await asyncio.to_thread 包出去"
+        )
+        assert transport.sent, "没有发出 hello 帧"
+
+    def test_no_async_context_calls_retrying_reads_directly(self) -> None:
+        """源码契约：带重试的读盘/写盘不得在 async 函数里被同步调用。
+
+        行为用例依赖线程时序才能暴露；这条把结构锁死 —— 将来新增 async 处理器
+        时若直接调用这些函数，测试会立刻失败。
+        """
+        import re as _re
+
+        retrying = (
+            "_read_config_raw", "_read_config_value", "load_vision_config",
+            "load_auto_submit", "set_auto_submit", "set_vision_answer_mode",
+            "set_vision_thinking_mode", "load_phone_config", "load_settings",
+            "public_settings", "effective_system_prompt",
+            # 这三个内部也会读 config.json（带退避重试），同样不能在事件循环上跑
+            "clear_pending_solve_images", "add_pending_solve_image", "request_solve",
+        )
+        checkout = "await "
+        for path in ("system_audio_asr/phone_share.py", "system_audio_asr/server.py"):
+            source = (Path(__file__).resolve().parents[1] / path).read_text(encoding="utf-8")
+            for match in _re.finditer(r"\n    async def (\w+)\(", source):
+                name, start = match.group(1), match.end()
+                nxt = _re.search(r"\n    (?:async )?def |\n@app\.", source[start:])
+                body = source[start : start + (nxt.start() if nxt else len(source))]
+                code = _re.sub(r"#[^\n]*", "", body)     # 去注释
+                code = _re.sub(r'"""(?:.|\n)*?"""', "", code)  # 去 docstring
+                for function in retrying:
+                    for call in _re.finditer(r"(?<![\w])" + function + r"\(", code):
+                        line_start = code.rfind("\n", 0, call.start()) + 1
+                        line_end = code.find("\n", call.start())
+                        line = code[line_start : line_end if line_end != -1 else len(code)]
+                        if "to_thread" in line:
+                            continue
+                        # 允许「整段交给线程池」的写法：函数里定义一个同步闭包，
+                        # 由 await asyncio.to_thread(闭包) 执行（如 hotwords_detected
+                        # 的 collect()、ai_ask 的 _ask_ai_blocking）。判定依据是
+                        # 这个调用所在的缩进块是否落在某个 def <闭包> 里，
+                        # 且该闭包被 to_thread 调用。
+                        if _call_is_inside_threadpool_closure(code, call.start()):
+                            continue
+                        raise AssertionError(
+                            f"{path} 的 async {name} 直接调用了 {function}："
+                            f"它会带退避重试地读盘，在事件循环上会卡住整个服务。"
+                            f"改写成 await asyncio.to_thread(...)。触发行：{line.strip()}"
+                        )
+
+
+def _call_is_inside_threadpool_closure(code: str, position: int) -> bool:
+    """判断调用点是否落在「被 to_thread 执行的同步闭包」里。
+
+    服务端有两种正确写法：
+      ① await asyncio.to_thread(load_settings)            —— 调用在 to_thread 参数里
+      ② def collect(): ... load_settings() ...             —— 先定义同步闭包，
+         return await asyncio.to_thread(collect)              再由 to_thread 执行
+    两种都让读盘离开事件循环。此函数识别第 ② 种：向上找到该调用所属的
+    最近的 def，再看这个闭包名是否出现在某个 to_thread(...) 调用里。
+    """
+    import re as _re
+
+    # 向上找到最近的、缩进小于等于调用点的 def
+    call_indent = len(code[:position].split("\n")[-1]) - len(code[:position].split("\n")[-1].lstrip())
+    enclosing: str | None = None
+    for definition in _re.finditer(r"^(\s*)def (\w+)\(", code, _re.MULTILINE):
+        if definition.start() >= position:
+            break
+        indent = len(definition.group(1))
+        if indent < call_indent:
+            enclosing = definition.group(2)
+    if enclosing is None:
+        return False
+    # 该闭包名必须出现在某个 to_thread 调用里
+    return bool(_re.search(r"to_thread\(\s*" + _re.escape(enclosing) + r"\b", code))
+
+
+class _FakeWebSocket:
+    """只实现 handle() 用到的接口，供事件循环阻塞用例驱动真实协程。"""
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def accept(self) -> None:
+        return None
+
+    async def close(self, code: int = 1000) -> None:
+        return None
+
+    async def send_json(self, payload: dict) -> None:
+        self.sent.append(payload)
+
+    async def send_bytes(self, data: bytes) -> None:
+        return None
+
+    async def receive(self) -> dict:
+        # 收一次即断：handle() 的循环会因 disconnect 退出。
+        return {"type": "websocket.disconnect"}
+
+

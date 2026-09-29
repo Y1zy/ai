@@ -1621,6 +1621,10 @@ namespace WasapiParaformerOverlay
                 throw new InvalidOperationException("接口地址必须以 http:// 或 https:// 开头");
             // 网关不认 thinking 字段时去掉它重试一次，避免开关导致完全不可用。
             // 注意：C# 5 不允许在 catch 块里 await，故用标志位在 catch 外重试。
+            // 判断与去除都用 HasThinkingField / StripThinkingFields（与 SendChatOnce
+            // 同一套），不写字面量 "thinking" —— 将来若给字幕 AI 加推理档
+            // （reasoning_effort），只认 thinking 的写法会漏掉它，用户换个网关就
+            // 每次请求都失败。
             bool downgrade = false;
             try
             {
@@ -1632,7 +1636,7 @@ namespace WasapiParaformerOverlay
             }
             if (downgrade)
             {
-                payload.Remove("thinking");
+                StripThinkingFields(payload);
                 return await StreamOnce(serializer, endpoint, apiKey, payload, onPartial, token);
             }
             throw new InvalidOperationException("AI 流式请求失败");
@@ -1662,7 +1666,8 @@ namespace WasapiParaformerOverlay
                     if (!response.IsSuccessStatusCode)
                     {
                         string errorBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                        if (payload.ContainsKey("thinking")
+                        // 与 SendChatOnce 同规则：按「全部思考字段」判断，不写字面量。
+                        if (HasThinkingField(payload)
                             && IsThinkingUnsupported((int)response.StatusCode, errorBody))
                             throw new ThinkingUnsupportedException();
                         throw new InvalidOperationException(

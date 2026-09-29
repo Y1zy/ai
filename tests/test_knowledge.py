@@ -211,3 +211,89 @@ def test_upsert_returns_written_entry(store) -> None:
     entry = kb.upsert_entry({"id": "y", "title": "目标", "content": "目标内容"})
     assert entry["id"] == "y"
     assert entry["content"] == "目标内容"
+
+
+class TestConcurrentWritesDoNotLoseEntries:
+    """并发写入不得丢条目（读-改-写必须在同一把锁内）。
+
+    真实事故（2026-09-26 实测复现）：upsert_entry 此前是「load_entries（取锁→放锁）
+    → 改内存 → save_entries（再取锁）」，两步之间文件无保护。两个并发调用各自
+    读到同一份列表、各自追加一条、各自整份写回 —— 后写的把先写的覆盖。
+    实测两线程各 upsert 6 次，最终只剩 6 条，且没有任何报错。
+
+    触发场景不需要恶意并发：设置页开两个标签、或一条还没保存完就点了另一条的
+    「启用/停用」，都会走到这里。
+    """
+
+    def test_parallel_upserts_keep_every_entry(self, store) -> None:
+        import threading
+
+        threads = []
+        for worker in range(4):
+            def run(worker=worker):
+                for index in range(5):
+                    kb.upsert_entry(
+                        {"title": f"t{worker}-{index}", "content": f"内容 {worker}-{index}"}
+                    )
+            threads.append(threading.Thread(target=run))
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        entries = kb.load_entries()
+        assert len(entries) == 20, (
+            f"并发 upsert 丢了条目：期望 20 条，实际 {len(entries)} 条"
+            "（读-改-写没有在同一把锁内完成）"
+        )
+        titles = {entry["title"] for entry in entries}
+        assert titles == {f"t{w}-{i}" for w in range(4) for i in range(5)}, "有条目被覆盖"
+
+    def test_parallel_mixed_upsert_and_delete(self, store) -> None:
+        """更新与删除交错时同样不能丢（delete 也是读-改-写）。"""
+        import threading
+
+        keep = kb.upsert_entry({"title": "保留", "content": "x"})
+        threads = []
+        for worker in range(3):
+            def run(worker=worker):
+                for index in range(4):
+                    kb.upsert_entry({"title": f"m{worker}-{index}", "content": "y"})
+                    # 删一个不存在的 id：只走读-改-写，不改动集合
+                    kb.delete_entry(f"missing-{worker}-{index}")
+            threads.append(threading.Thread(target=run))
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        entries = kb.load_entries()
+        assert len(entries) == 13, f"交错并发下丢了条目：期望 13 条，实际 {len(entries)}"
+        assert any(entry["id"] == keep["id"] for entry in entries), "保留条目被误删"
+
+    def test_lock_is_held_across_read_and_write(self) -> None:
+        """源码契约：upsert/delete 必须在同一个 with 块里完成读与写。
+
+        上面两条行为用例依赖线程调度才能暴露缺陷；这条直接在源码上锁死结构，
+        避免将来有人把 load/save 拆回两步、而并发用例恰好没触发。
+        """
+        import inspect
+        import re
+
+        for name in ("upsert_entry", "delete_entry"):
+            source = inspect.getsource(getattr(kb, name))
+            # 去掉 docstring 与 # 注释再断言：注释里会提到 load_entries() 作对比说明，
+            # 那是文字不是调用（第一版就是这样误报的）。
+            code = re.sub(r'"""(?:.|\n)*?"""', "", source)
+            code = re.sub(r"#[^\n]*", "", code)
+            assert "_load_entries_locked" in code, f"{name} 未使用无锁读（说明又拆成了两步）"
+            assert "_save_entries_locked" in code, f"{name} 未使用无锁写（说明又拆成了两步）"
+            assert "with _store_lock:" in code, f"{name} 没有持有锁"
+            # 不允许再调用会自行取锁的公开版本（那等于又变成两步）。
+            # 前缀不能写成 \b：`_load_entries_locked` 也含 `load_entries` 子串。
+            for public in ("load_entries", "save_entries"):
+                assert not re.search(r"(?<![\w])" + public + r"\(", code), (
+                    f"{name} 仍在调用会自行取锁的 {public}：读写不在同一把锁内"
+                )

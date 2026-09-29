@@ -336,10 +336,13 @@ def create_app(config: AppConfig) -> FastAPI:
             await restart_engine(saved.get("asrLanguage", "zh"))
         if saved.get("liveTranslateEnabled"):
             asyncio.create_task(asyncio.to_thread(translator.warmup))
+        # public_settings 会读盘（load_settings 带退避重试 + DPAPI 解密），
+        # 直接在事件循环上跑会阻塞整个服务端，必须走线程池。
+        key_set = (await asyncio.to_thread(public_settings))["apiKeySet"]
         return {
             "ok": True,
             "settings": saved,
-            "apiKeySet": public_settings()["apiKeySet"],
+            "apiKeySet": key_set,
             "asrRestarted": restarted,
         }
 
@@ -431,7 +434,8 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.get("/api/phone/status")
     async def phone_status() -> dict:
-        return {"enabled": phone_share.load_phone_config()["enabled"]}
+        # 读 phone_share.json 同样走线程池（无重试，但仍是文件 IO）。
+        return {"enabled": (await asyncio.to_thread(phone_share.load_phone_config))["enabled"]}
 
     @app.websocket("/relay")
     async def relay_endpoint(
@@ -445,27 +449,30 @@ def create_app(config: AppConfig) -> FastAPI:
     @app.get("/api/phone/info")
     async def phone_info(request: Request) -> dict:
         require_local(request)
-        phone_config = phone_share.load_phone_config()
+        # 二维码生成（SVG 序列化）与读 phone_share.json 都不宜占事件循环。
+        phone_config = await asyncio.to_thread(phone_share.load_phone_config)
         share_url = phone_share.build_share_url(config.port, phone_config)
+        qr = await asyncio.to_thread(phone_share.qr_svg_data_url, share_url)
         return {
             "enabled": phone_config["enabled"],
             "shareUrl": share_url,
             "lanIp": phone_share.lan_ipv4(),
             "port": config.port,
-            "qr": phone_share.qr_svg_data_url(share_url),
+            "qr": qr,
             "listeningLan": config.host == "0.0.0.0",
         }
 
     @app.post("/api/phone/toggle")
     async def phone_toggle(request: Request, payload: dict) -> dict:
         require_local(request)
-        saved = phone_share.set_enabled(bool(payload.get("enabled")))
+        saved = await asyncio.to_thread(phone_share.set_enabled, bool(payload.get("enabled")))
         return {"ok": True, "enabled": saved["enabled"]}
 
     @app.post("/api/phone/regenerate")
     async def phone_regenerate(request: Request) -> dict:
         require_local(request)
-        phone_share.regenerate_phone_config()
+        # regenerate 会读-改-写 phone_share.json，走线程池。
+        await asyncio.to_thread(phone_share.regenerate_phone_config)
         return {"ok": True}
 
     @app.post("/api/phone/ai")
@@ -549,7 +556,8 @@ def create_app(config: AppConfig) -> FastAPI:
             raise HTTPException(status_code=400, detail="请先输入测试问题")
         if len(question) > 4000:
             question = question[:4000]
-        prompt = effective_system_prompt()
+        # effective_system_prompt 内部读 config.json 与知识库（带重试退避），走线程池。
+        prompt = await asyncio.to_thread(effective_system_prompt)
         settings = await asyncio.to_thread(load_settings)
         api_key = await asyncio.to_thread(load_api_key)
         if not api_key:
@@ -708,8 +716,8 @@ def create_app(config: AppConfig) -> FastAPI:
     async def knowledge_import_legacy(request: Request) -> dict:
         """把旧的 extraContext 单字段导入为一条知识库条目（不删除原字段）。"""
         require_local(request)
-        settings = load_settings()
-        legacy = str(settings.get("extraContext") or "").strip()
+        # 读简历/JD 走线程池：load_settings 带退避重试，不能压在事件循环上。
+        legacy = str((await asyncio.to_thread(load_settings)).get("extraContext") or "").strip()
         if not legacy:
             raise HTTPException(status_code=400, detail="没有可导入的附加背景内容")
         existing = knowledge.load_entries()
@@ -739,12 +747,14 @@ def create_app(config: AppConfig) -> FastAPI:
     @app.get("/api/vision/status")
     async def vision_status(request: Request) -> dict:
         require_local(request)
-        vision = phone_share.load_vision_config()
+        # 两处读盘（config.json 带重试退避、DPAPI 解密）都走线程池。
+        vision = await asyncio.to_thread(phone_share.load_vision_config)
+        key_set = await asyncio.to_thread(phone_share.load_vision_key)
         return {
             "enabled": vision["enabled"],
             "baseUrlSet": bool(vision["baseUrl"]),
             "modelSet": bool(vision["model"]),
-            "apiKeySet": bool(phone_share.load_vision_key()),
+            "apiKeySet": bool(key_set),
         }
 
     return app
